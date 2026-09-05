@@ -26,6 +26,9 @@ var (
 	// ErrCommitNotFound indicates that a requested commit is not visible in the
 	// repository scoped by the current tenant context.
 	ErrCommitNotFound = errors.New("commit not found")
+	// ErrImmutableMetadataMismatch indicates a caller attempted to reuse an
+	// immutable commit or pack ID with different metadata.
+	ErrImmutableMetadataMismatch = errors.New("immutable metadata does not match existing content ID")
 	// ErrNoCommonAncestor indicates that two complete commit histories do not
 	// share an ancestor.
 	ErrNoCommonAncestor = errors.New("no common ancestor")
@@ -53,7 +56,22 @@ var (
 	ErrMergeLeaseMismatch = errors.New("postgres: merge apply does not match lease")
 	// ErrInvalidMergeLease indicates invalid lease acquisition input.
 	ErrInvalidMergeLease = errors.New("postgres: invalid target branch merge lease")
-	errNilContext        = errors.New("postgres: nil context")
+	// ErrRepositoryMigrationFrozen indicates a migration has frozen writes for
+	// a repository until it reaches cutover or rollback.
+	ErrRepositoryMigrationFrozen = errors.New("postgres: repository writes are frozen for snapshot migration")
+	// ErrSnapshotMigrationComplete indicates the current repository already
+	// points at its staged v2 history.
+	ErrSnapshotMigrationComplete = errors.New("postgres: snapshot migration already cut over")
+	// ErrSnapshotMigrationNotFound indicates no migration ledger exists for a
+	// requested repository.
+	ErrSnapshotMigrationNotFound = errors.New("postgres: snapshot migration not found")
+	// ErrSnapshotMigrationIncomplete indicates cutover was requested before
+	// every legacy artifact had a staged mapping.
+	ErrSnapshotMigrationIncomplete = errors.New("postgres: snapshot migration is incomplete")
+	// ErrSnapshotMigrationRollbackUnsafe indicates new writes have occurred
+	// after cutover, so resetting refs could discard reachable history.
+	ErrSnapshotMigrationRollbackUnsafe = errors.New("postgres: snapshot migration rollback is unsafe")
+	errNilContext                      = errors.New("postgres: nil context")
 
 	uuidV4Pattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 )
@@ -105,6 +123,9 @@ type Store interface {
 	// GetCommitSnapshotRoot returns the immutable snapshot root recorded for a
 	// commit, or ErrCommitNotFound when that commit is not visible in repoID.
 	GetCommitSnapshotRoot(ctx context.Context, repoID, commitID string) (string, error)
+	// GetCommitMetadata returns the immutable snapshot root and framing format
+	// for a commit visible in the tenant-scoped repository.
+	GetCommitMetadata(ctx context.Context, repoID, commitID string) (CommitMetadata, error)
 	// GetPackRanges returns the pack ranges required to reconstruct the
 	// history from headCommitID back to knownCommitID. Ranges are returned
 	// newest-first so callers can validate the chain and stream it in reverse.
@@ -130,6 +151,38 @@ type PackRange struct {
 	PackHash       string
 	BaseCommitID   string
 	TargetCommitID string
+	Format         uint32
+}
+
+// CommitMetadata is the storage identity returned for a commit without
+// exposing mutable branch state.
+type CommitMetadata struct {
+	ID           string
+	SnapshotRoot string
+	Format       uint32
+}
+
+// SnapshotMigration tracks a resumable tenant-scoped migration generation.
+type SnapshotMigration struct {
+	RepoID     string
+	Generation string
+	Status     string
+}
+
+// SnapshotMigrationCommit is the legacy DAG input staged by a migration.
+type SnapshotMigrationCommit struct {
+	ID           string
+	SnapshotRoot string
+	Author       string
+	Message      string
+	Parents      []string
+}
+
+// SnapshotMigrationPack is one opaque legacy pack and its old commit range.
+type SnapshotMigrationPack struct {
+	Hash     string
+	BaseID   string
+	TargetID string
 }
 
 // MergeLeaseRequest identifies the merge preview that is reserving a target
@@ -173,6 +226,8 @@ type ApplyMergeRequest struct {
 	Author         string
 	Message        string
 	PackHash       string
+	CommitFormat   uint32
+	PackFormat     uint32
 }
 
 // PGStore is a PostgreSQL-backed implementation of Store.
@@ -274,6 +329,9 @@ func (s *PGStore) CreateBranch(ctx context.Context, repoID, name, headCommitID s
 	}
 
 	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if err := assertRepositoryWritable(ctx, tx, repoID); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `INSERT INTO branches (tenant_id, repo_id, name, head_commit_id) VALUES ($1, $2, $3, $4)`, tenantID, repoID, name, headCommitID); err != nil {
 			return fmt.Errorf("postgres: create branch %q for repo %s: insert branch: %w", name, repoID, err)
 		}
@@ -288,6 +346,19 @@ func (s *PGStore) CreateBranch(ctx context.Context, repoID, name, headCommitID s
 // PutCommit inserts a content-addressed commit row scoped to the tenant
 // carried by ctx. Re-registering the same commitID is a no-op.
 func (s *PGStore) PutCommit(ctx context.Context, repoID, commitID, parentCommitID, snapshotRoot, author, message string) error {
+	return s.putCommit(ctx, repoID, commitID, parentCommitID, snapshotRoot, author, message, 1)
+}
+
+// PutCommitWithFormat records a commit using its explicit frame format. The
+// base Store interface remains legacy-compatible for existing JSON clients.
+func (s *PGStore) PutCommitWithFormat(ctx context.Context, repoID, commitID, parentCommitID, snapshotRoot, author, message string, format uint32) error {
+	if !validObjectFormat(format) {
+		return fmt.Errorf("postgres: put commit for repo %s: unsupported object format %d", repoID, format)
+	}
+	return s.putCommit(ctx, repoID, commitID, parentCommitID, snapshotRoot, author, message, normalizeObjectFormat(format))
+}
+
+func (s *PGStore) putCommit(ctx context.Context, repoID, commitID, parentCommitID, snapshotRoot, author, message string, format uint32) error {
 	tenantID, err := requireTenantID(ctx)
 	if err != nil {
 		return fmt.Errorf("postgres: put commit for repo %s: %w", repoID, err)
@@ -299,15 +370,46 @@ func (s *PGStore) PutCommit(ctx context.Context, repoID, commitID, parentCommitI
 	}
 
 	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if err := assertRepositoryWritable(ctx, tx, repoID); err != nil {
+			return err
+		}
 		result, err := tx.Exec(ctx, `
-			INSERT INTO commits (id, tenant_id, repo_id, parent_commit_id, snapshot_root, author, message)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			INSERT INTO commits (id, tenant_id, repo_id, parent_commit_id, snapshot_root, object_format, author, message)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 			ON CONFLICT (tenant_id, repo_id, id) DO NOTHING
-		`, commitID, tenantID, repoID, parent, snapshotRoot, author, message)
+		`, commitID, tenantID, repoID, parent, snapshotRoot, format, author, message)
 		if err != nil {
 			return fmt.Errorf("postgres: put commit for repo %s: insert commit: %w", repoID, err)
 		}
-		if parentCommitID != "" && result.RowsAffected() == 1 {
+		if result.RowsAffected() == 0 {
+			var existing struct {
+				parent       *string
+				snapshotRoot string
+				format       uint32
+				author       string
+				message      string
+			}
+			if err := tx.QueryRow(ctx, `
+				SELECT parent_commit_id, snapshot_root, object_format, author, message
+				FROM commits
+				WHERE tenant_id = $1 AND repo_id = $2 AND id = $3
+				FOR KEY SHARE
+			`, tenantID, repoID, commitID).Scan(
+				&existing.parent, &existing.snapshotRoot, &existing.format, &existing.author, &existing.message,
+			); err != nil {
+				return fmt.Errorf("postgres: put commit for repo %s: read existing commit: %w", repoID, err)
+			}
+			existingParent := ""
+			if existing.parent != nil {
+				existingParent = *existing.parent
+			}
+			if existingParent != parentCommitID || existing.snapshotRoot != snapshotRoot || existing.format != format ||
+				existing.author != author || existing.message != message {
+				return ErrImmutableMetadataMismatch
+			}
+			return nil
+		}
+		if parentCommitID != "" {
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO commit_parents (tenant_id, repo_id, commit_id, parent_position, parent_commit_id)
 				VALUES ($1, $2, $3, 1, $4)
@@ -316,8 +418,6 @@ func (s *PGStore) PutCommit(ctx context.Context, repoID, commitID, parentCommitI
 				return fmt.Errorf("postgres: put commit for repo %s: insert commit parent: %w", repoID, err)
 			}
 		}
-		// MVP note: if the same commitID is re-registered with different metadata,
-		// PostgreSQL keeps the first row and ignores the later insert.
 		return nil
 	}); err != nil {
 		return err
@@ -328,6 +428,18 @@ func (s *PGStore) PutCommit(ctx context.Context, repoID, commitID, parentCommitI
 
 // PutPackRange records the commit range carried by an immutable CAS pack.
 func (s *PGStore) PutPackRange(ctx context.Context, repoID, packHash, baseCommitID, targetCommitID string) error {
+	return s.putPackRange(ctx, repoID, packHash, baseCommitID, targetCommitID, 1)
+}
+
+// PutPackRangeWithFormat records an explicitly framed v2 pack range.
+func (s *PGStore) PutPackRangeWithFormat(ctx context.Context, repoID, packHash, baseCommitID, targetCommitID string, format uint32) error {
+	if !validObjectFormat(format) {
+		return fmt.Errorf("postgres: put pack range for repo %s: unsupported object format %d", repoID, format)
+	}
+	return s.putPackRange(ctx, repoID, packHash, baseCommitID, targetCommitID, normalizeObjectFormat(format))
+}
+
+func (s *PGStore) putPackRange(ctx context.Context, repoID, packHash, baseCommitID, targetCommitID string, format uint32) error {
 	tenantID, err := requireTenantID(ctx)
 	if err != nil {
 		return fmt.Errorf("postgres: put pack range for repo %s: %w", repoID, err)
@@ -339,12 +451,38 @@ func (s *PGStore) PutPackRange(ctx context.Context, repoID, packHash, baseCommit
 	}
 
 	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO pack_ranges (tenant_id, repo_id, pack_hash, base_commit_id, target_commit_id)
-			VALUES ($1, $2, $3, $4, $5)
+		if err := assertRepositoryWritable(ctx, tx, repoID); err != nil {
+			return err
+		}
+		result, err := tx.Exec(ctx, `
+			INSERT INTO pack_ranges (tenant_id, repo_id, pack_hash, object_format, base_commit_id, target_commit_id)
+			VALUES ($1, $2, $3, $4, $5, $6)
 			ON CONFLICT (tenant_id, repo_id, pack_hash) DO NOTHING
-		`, tenantID, repoID, packHash, base, targetCommitID); err != nil {
+		`, tenantID, repoID, packHash, format, base, targetCommitID)
+		if err != nil {
 			return fmt.Errorf("postgres: put pack range for repo %s: insert pack range: %w", repoID, err)
+		}
+		if result.RowsAffected() == 0 {
+			var existing struct {
+				base   *string
+				target string
+				format uint32
+			}
+			if err := tx.QueryRow(ctx, `
+				SELECT base_commit_id, target_commit_id, object_format
+				FROM pack_ranges
+				WHERE tenant_id = $1 AND repo_id = $2 AND pack_hash = $3
+				FOR KEY SHARE
+			`, tenantID, repoID, packHash).Scan(&existing.base, &existing.target, &existing.format); err != nil {
+				return fmt.Errorf("postgres: put pack range for repo %s: read existing pack range: %w", repoID, err)
+			}
+			existingBase := ""
+			if existing.base != nil {
+				existingBase = *existing.base
+			}
+			if existingBase != baseCommitID || existing.target != targetCommitID || existing.format != format {
+				return ErrImmutableMetadataMismatch
+			}
 		}
 		return nil
 	}); err != nil {
@@ -378,6 +516,9 @@ func (s *PGStore) AcquireMergeLease(ctx context.Context, request MergeLeaseReque
 		BaseCommitID: request.BaseCommitID,
 	}
 	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if err := assertRepositoryWritable(ctx, tx, request.RepoID); err != nil {
+			return err
+		}
 		head, err := branchHeadForUpdate(ctx, tx, request.RepoID, request.TargetBranch)
 		if err != nil {
 			return err
@@ -507,11 +648,15 @@ func (s *PGStore) ApplyMerge(ctx context.Context, request ApplyMergeRequest) err
 	if request.RepoID == "" || request.TargetBranch == "" || request.Subject == "" ||
 		request.LeaseToken == "" || request.SourceCommitID == "" || request.TargetCommitID == "" ||
 		request.BaseCommitID == "" || request.ResultCommitID == "" || request.SnapshotRoot == "" ||
-		request.Author == "" || request.Message == "" || request.PackHash == "" {
+		request.Author == "" || request.Message == "" || request.PackHash == "" ||
+		!validObjectFormat(request.CommitFormat) || !validObjectFormat(request.PackFormat) {
 		return fmt.Errorf("postgres: apply merge: %w", ErrInvalidMergeLease)
 	}
 
 	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if err := assertRepositoryWritable(ctx, tx, request.RepoID); err != nil {
+			return err
+		}
 		head, err := branchHeadForUpdate(ctx, tx, request.RepoID, request.TargetBranch)
 		if err != nil {
 			return err
@@ -547,10 +692,10 @@ func (s *PGStore) ApplyMerge(ctx context.Context, request ApplyMergeRequest) err
 		}
 
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO commits (id, tenant_id, repo_id, parent_commit_id, snapshot_root, author, message)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			INSERT INTO commits (id, tenant_id, repo_id, parent_commit_id, snapshot_root, object_format, author, message)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		`, request.ResultCommitID, tenantID, request.RepoID, request.TargetCommitID,
-			request.SnapshotRoot, request.Author, request.Message); err != nil {
+			request.SnapshotRoot, normalizeObjectFormat(request.CommitFormat), request.Author, request.Message); err != nil {
 			return fmt.Errorf("insert merge commit: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `
@@ -560,9 +705,9 @@ func (s *PGStore) ApplyMerge(ctx context.Context, request ApplyMergeRequest) err
 			return fmt.Errorf("insert merge parents: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO pack_ranges (tenant_id, repo_id, pack_hash, base_commit_id, target_commit_id)
-			VALUES ($1, $2, $3, $4, $5)
-		`, tenantID, request.RepoID, request.PackHash, request.TargetCommitID, request.ResultCommitID); err != nil {
+			INSERT INTO pack_ranges (tenant_id, repo_id, pack_hash, object_format, base_commit_id, target_commit_id)
+			VALUES ($1, $2, $3, $4, $5, $6)
+		`, tenantID, request.RepoID, request.PackHash, normalizeObjectFormat(request.PackFormat), request.TargetCommitID, request.ResultCommitID); err != nil {
 			return fmt.Errorf("insert merge pack range: %w", err)
 		}
 
@@ -763,6 +908,522 @@ func (s *PGStore) GetCommitSnapshotRoot(ctx context.Context, repoID, commitID st
 	return snapshotRoot, nil
 }
 
+// GetCommitMetadata resolves the immutable snapshot root and framing version
+// of a visible commit. It is optional for older store fakes, keeping existing
+// HTTP preview contracts compatible while allowing v2 frames to retain parent
+// identity formats.
+func (s *PGStore) GetCommitMetadata(ctx context.Context, repoID, commitID string) (CommitMetadata, error) {
+	if _, err := requireTenantID(ctx); err != nil {
+		return CommitMetadata{}, fmt.Errorf("postgres: get commit metadata: %w", err)
+	}
+
+	metadata := CommitMetadata{ID: commitID}
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, `
+			SELECT snapshot_root, object_format
+			FROM commits
+			WHERE repo_id = $1 AND id = $2
+		`, repoID, commitID).Scan(&metadata.SnapshotRoot, &metadata.Format); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("postgres: get commit metadata: %w", ErrCommitNotFound)
+			}
+			return fmt.Errorf("postgres: get commit metadata: query commit: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return CommitMetadata{}, err
+	}
+	return metadata, nil
+}
+
+// BeginSnapshotMigration freezes one repository's writers and creates, or
+// resumes, its durable migration ledger. Existing v2 history is never
+// overwritten; callers must explicitly roll it back before retrying.
+func (s *PGStore) BeginSnapshotMigration(ctx context.Context, repoID string) (SnapshotMigration, error) {
+	tenantID, err := requireTenantID(ctx)
+	if err != nil {
+		return SnapshotMigration{}, fmt.Errorf("postgres: begin snapshot migration: %w", err)
+	}
+	if repoID == "" {
+		return SnapshotMigration{}, fmt.Errorf("postgres: begin snapshot migration: repository ID is required")
+	}
+
+	migration := SnapshotMigration{RepoID: repoID}
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		var visibleRepo string
+		if err := tx.QueryRow(ctx, `SELECT id FROM repositories WHERE id = $1 FOR UPDATE`, repoID).Scan(&visibleRepo); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrRepositoryNotFound
+			}
+			return fmt.Errorf("lock repository: %w", err)
+		}
+		var activeLease bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM target_branch_merge_leases
+				WHERE repo_id = $1 AND expires_at > now()
+			)
+		`, repoID).Scan(&activeLease); err != nil {
+			return fmt.Errorf("check merge leases: %w", err)
+		}
+		if activeLease {
+			return fmt.Errorf("%w: active merge lease must expire or be released first", ErrRepositoryMigrationFrozen)
+		}
+
+		err := tx.QueryRow(ctx, `
+			SELECT generation::text, status
+			FROM review_snapshot_migrations
+			WHERE repo_id = $1
+			FOR UPDATE
+		`, repoID).Scan(&migration.Generation, &migration.Status)
+		if errors.Is(err, pgx.ErrNoRows) {
+			if err := tx.QueryRow(ctx, `
+				INSERT INTO review_snapshot_migrations (tenant_id, repo_id, status)
+				VALUES ($1, $2, 'frozen')
+				RETURNING generation::text, status
+			`, tenantID, repoID).Scan(&migration.Generation, &migration.Status); err != nil {
+				return fmt.Errorf("create migration ledger: %w", err)
+			}
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("load migration ledger: %w", err)
+		}
+		if migration.Status == "cutover" {
+			return ErrSnapshotMigrationComplete
+		}
+		if migration.Status == "rolled_back" {
+			if _, err := tx.Exec(ctx, `
+				UPDATE review_snapshot_migrations
+				SET status = 'frozen', updated_at = now(), cutover_at = NULL
+				WHERE repo_id = $1
+			`, repoID); err != nil {
+				return fmt.Errorf("resume rolled back migration: %w", err)
+			}
+			migration.Status = "frozen"
+		}
+		return nil
+	}); err != nil {
+		return SnapshotMigration{}, fmt.Errorf("postgres: begin snapshot migration: %w", err)
+	}
+	return migration, nil
+}
+
+// ListSnapshotMigrationCommits returns all frozen v1 commit DAG records,
+// including ordered parents. Migration code rebuilds their v2 identities
+// before a later atomic cutover.
+func (s *PGStore) ListSnapshotMigrationCommits(ctx context.Context, repoID string) ([]SnapshotMigrationCommit, error) {
+	if _, err := requireTenantID(ctx); err != nil {
+		return nil, fmt.Errorf("postgres: list snapshot migration commits: %w", err)
+	}
+
+	commits := make([]SnapshotMigrationCommit, 0)
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if err := assertMigrationFrozen(ctx, tx, repoID); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT id, snapshot_root, author, message
+			FROM commits
+			WHERE repo_id = $1 AND object_format = 1
+			ORDER BY created_at, id
+		`, repoID)
+		if err != nil {
+			return fmt.Errorf("list legacy commits: %w", err)
+		}
+		for rows.Next() {
+			var commit SnapshotMigrationCommit
+			if err := rows.Scan(&commit.ID, &commit.SnapshotRoot, &commit.Author, &commit.Message); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan legacy commit: %w", err)
+			}
+			commits = append(commits, commit)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("iterate legacy commits: %w", err)
+		}
+		rows.Close()
+		for i := range commits {
+			parents, err := commitParentIDs(ctx, tx, repoID, commits[i].ID)
+			if err != nil {
+				return fmt.Errorf("load legacy commit parents: %w", err)
+			}
+			commits[i].Parents = parents
+		}
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("postgres: list snapshot migration commits: %w", err)
+	}
+	return commits, nil
+}
+
+// AbortSnapshotMigration releases a frozen pre-cutover migration after a
+// failed preflight. Existing shadow objects and mapping rows are deliberately
+// retained for audit and inspection, but no branch ref is changed.
+func (s *PGStore) AbortSnapshotMigration(ctx context.Context, repoID string) error {
+	if _, err := requireTenantID(ctx); err != nil {
+		return fmt.Errorf("postgres: abort snapshot migration: %w", err)
+	}
+	return s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if err := assertMigrationFrozen(ctx, tx, repoID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE review_snapshot_migrations
+			SET status = 'rolled_back', updated_at = now()
+			WHERE repo_id = $1
+		`, repoID); err != nil {
+			return fmt.Errorf("release migration writer freeze: %w", err)
+		}
+		return nil
+	})
+}
+
+// ListSnapshotMigrationPacks returns opaque v1 pack ranges while the
+// repository is frozen. The migration copies their bytes verbatim into v2
+// frames rather than parsing legacy payloads.
+func (s *PGStore) ListSnapshotMigrationPacks(ctx context.Context, repoID string) ([]SnapshotMigrationPack, error) {
+	if _, err := requireTenantID(ctx); err != nil {
+		return nil, fmt.Errorf("postgres: list snapshot migration packs: %w", err)
+	}
+	packs := make([]SnapshotMigrationPack, 0)
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if err := assertMigrationFrozen(ctx, tx, repoID); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT pack_hash, COALESCE(base_commit_id, ''), target_commit_id
+			FROM pack_ranges
+			WHERE repo_id = $1 AND object_format = 1
+			ORDER BY created_at, pack_hash
+		`, repoID)
+		if err != nil {
+			return fmt.Errorf("list legacy packs: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var pack SnapshotMigrationPack
+			if err := rows.Scan(&pack.Hash, &pack.BaseID, &pack.TargetID); err != nil {
+				return fmt.Errorf("scan legacy pack: %w", err)
+			}
+			packs = append(packs, pack)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("iterate legacy packs: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("postgres: list snapshot migration packs: %w", err)
+	}
+	return packs, nil
+}
+
+// StageSnapshotObjectMapping persists the deterministic shadow object ID
+// after the caller durably writes it to tenant-scoped CAS.
+func (s *PGStore) StageSnapshotObjectMapping(ctx context.Context, repoID, legacyRoot, cborRoot string) error {
+	tenantID, err := requireTenantID(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres: stage snapshot object mapping: %w", err)
+	}
+	return s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if err := assertMigrationFrozen(ctx, tx, repoID); err != nil {
+			return err
+		}
+		result, err := tx.Exec(ctx, `
+			INSERT INTO review_snapshot_object_mappings
+				(tenant_id, repo_id, legacy_snapshot_root, cbor_snapshot_root)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (tenant_id, repo_id, legacy_snapshot_root) DO NOTHING
+		`, tenantID, repoID, legacyRoot, cborRoot)
+		if err != nil {
+			return fmt.Errorf("insert object mapping: %w", err)
+		}
+		if result.RowsAffected() == 0 {
+			var existing string
+			if err := tx.QueryRow(ctx, `
+				SELECT cbor_snapshot_root FROM review_snapshot_object_mappings
+				WHERE repo_id = $1 AND legacy_snapshot_root = $2
+			`, repoID, legacyRoot).Scan(&existing); err != nil {
+				return fmt.Errorf("load existing object mapping: %w", err)
+			}
+			if existing != cborRoot {
+				return fmt.Errorf("%w: legacy snapshot %s already maps to %s", ErrSnapshotMigrationIncomplete, legacyRoot, existing)
+			}
+		}
+		return nil
+	})
+}
+
+// StageSnapshotCommitMapping persists an old-to-new immutable commit mapping.
+func (s *PGStore) StageSnapshotCommitMapping(ctx context.Context, repoID, legacyID, v2ID, legacyRoot, cborRoot string) error {
+	tenantID, err := requireTenantID(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres: stage snapshot commit mapping: %w", err)
+	}
+	return s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if err := assertMigrationFrozen(ctx, tx, repoID); err != nil {
+			return err
+		}
+		result, err := tx.Exec(ctx, `
+			INSERT INTO review_snapshot_commit_mappings
+				(tenant_id, repo_id, legacy_commit_id, v2_commit_id, legacy_snapshot_root, cbor_snapshot_root)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (tenant_id, repo_id, legacy_commit_id) DO NOTHING
+		`, tenantID, repoID, legacyID, v2ID, legacyRoot, cborRoot)
+		if err != nil {
+			return fmt.Errorf("insert commit mapping: %w", err)
+		}
+		if result.RowsAffected() == 0 {
+			var existing string
+			if err := tx.QueryRow(ctx, `
+				SELECT v2_commit_id FROM review_snapshot_commit_mappings
+				WHERE repo_id = $1 AND legacy_commit_id = $2
+			`, repoID, legacyID).Scan(&existing); err != nil {
+				return fmt.Errorf("load existing commit mapping: %w", err)
+			}
+			if existing != v2ID {
+				return fmt.Errorf("%w: legacy commit %s already maps to %s", ErrSnapshotMigrationIncomplete, legacyID, existing)
+			}
+		}
+		return nil
+	})
+}
+
+// StageSnapshotPackMapping persists an old opaque pack to v2 frame mapping.
+func (s *PGStore) StageSnapshotPackMapping(ctx context.Context, repoID, legacyHash, v2Hash, legacyBase, legacyTarget, v2Base, v2Target string) error {
+	tenantID, err := requireTenantID(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres: stage snapshot pack mapping: %w", err)
+	}
+	var legacyBaseValue any
+	if legacyBase != "" {
+		legacyBaseValue = legacyBase
+	}
+	var v2BaseValue any
+	if v2Base != "" {
+		v2BaseValue = v2Base
+	}
+	return s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if err := assertMigrationFrozen(ctx, tx, repoID); err != nil {
+			return err
+		}
+		result, err := tx.Exec(ctx, `
+			INSERT INTO review_snapshot_pack_mappings
+				(tenant_id, repo_id, legacy_pack_hash, v2_pack_hash, legacy_base_commit_id,
+				 legacy_target_commit_id, v2_base_commit_id, v2_target_commit_id)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			ON CONFLICT (tenant_id, repo_id, legacy_pack_hash) DO NOTHING
+		`, tenantID, repoID, legacyHash, v2Hash, legacyBaseValue, legacyTarget, v2BaseValue, v2Target)
+		if err != nil {
+			return fmt.Errorf("insert pack mapping: %w", err)
+		}
+		if result.RowsAffected() == 0 {
+			var existing string
+			if err := tx.QueryRow(ctx, `
+				SELECT v2_pack_hash FROM review_snapshot_pack_mappings
+				WHERE repo_id = $1 AND legacy_pack_hash = $2
+			`, repoID, legacyHash).Scan(&existing); err != nil {
+				return fmt.Errorf("load existing pack mapping: %w", err)
+			}
+			if existing != v2Hash {
+				return fmt.Errorf("%w: legacy pack %s already maps to %s", ErrSnapshotMigrationIncomplete, legacyHash, existing)
+			}
+		}
+		return nil
+	})
+}
+
+// CompleteSnapshotMigration atomically materializes the staged v2 DAG and
+// pack ranges, repoints every branch, and leaves v1 rows and CAS objects
+// intact for rollback.
+func (s *PGStore) CompleteSnapshotMigration(ctx context.Context, repoID string) error {
+	if _, err := requireTenantID(ctx); err != nil {
+		return fmt.Errorf("postgres: complete snapshot migration: %w", err)
+	}
+	return s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if err := assertMigrationFrozen(ctx, tx, repoID); err != nil {
+			return err
+		}
+		var missing int
+		if err := tx.QueryRow(ctx, `
+			SELECT count(*)
+			FROM commits c
+			LEFT JOIN review_snapshot_commit_mappings m
+				ON m.repo_id = c.repo_id AND m.legacy_commit_id = c.id
+			WHERE c.repo_id = $1 AND c.object_format = 1 AND m.legacy_commit_id IS NULL
+		`, repoID).Scan(&missing); err != nil {
+			return fmt.Errorf("check commit mappings: %w", err)
+		}
+		if missing != 0 {
+			return fmt.Errorf("%w: %d legacy commits are not staged", ErrSnapshotMigrationIncomplete, missing)
+		}
+		if err := tx.QueryRow(ctx, `
+			SELECT count(*)
+			FROM pack_ranges p
+			LEFT JOIN review_snapshot_pack_mappings m
+				ON m.repo_id = p.repo_id AND m.legacy_pack_hash = p.pack_hash
+			WHERE p.repo_id = $1 AND p.object_format = 1 AND m.legacy_pack_hash IS NULL
+		`, repoID).Scan(&missing); err != nil {
+			return fmt.Errorf("check pack mappings: %w", err)
+		}
+		if missing != 0 {
+			return fmt.Errorf("%w: %d legacy packs are not staged", ErrSnapshotMigrationIncomplete, missing)
+		}
+		if err := tx.QueryRow(ctx, `
+			SELECT count(*)
+			FROM branches b
+			LEFT JOIN review_snapshot_commit_mappings m
+				ON m.repo_id = b.repo_id AND m.legacy_commit_id = b.head_commit_id
+			WHERE b.repo_id = $1 AND m.legacy_commit_id IS NULL
+		`, repoID).Scan(&missing); err != nil {
+			return fmt.Errorf("check branch mappings: %w", err)
+		}
+		if missing != 0 {
+			return fmt.Errorf("%w: %d branch heads are not staged", ErrSnapshotMigrationIncomplete, missing)
+		}
+		if err := tx.QueryRow(ctx, `
+			SELECT count(*)
+			FROM review_snapshot_commit_mappings mapping
+			JOIN commits existing
+				ON existing.tenant_id = mapping.tenant_id
+				AND existing.repo_id = mapping.repo_id
+				AND existing.id = mapping.v2_commit_id
+			WHERE mapping.repo_id = $1
+		`, repoID).Scan(&missing); err != nil {
+			return fmt.Errorf("check staged v2 commit collisions: %w", err)
+		}
+		if missing != 0 {
+			return fmt.Errorf("%w: %d staged v2 commit IDs already exist", ErrImmutableMetadataMismatch, missing)
+		}
+		if err := tx.QueryRow(ctx, `
+			SELECT count(*)
+			FROM review_snapshot_pack_mappings mapping
+			JOIN pack_ranges existing
+				ON existing.tenant_id = mapping.tenant_id
+				AND existing.repo_id = mapping.repo_id
+				AND existing.pack_hash = mapping.v2_pack_hash
+			WHERE mapping.repo_id = $1
+		`, repoID).Scan(&missing); err != nil {
+			return fmt.Errorf("check staged v2 pack collisions: %w", err)
+		}
+		if missing != 0 {
+			return fmt.Errorf("%w: %d staged v2 pack hashes already exist", ErrImmutableMetadataMismatch, missing)
+		}
+
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO commits (id, tenant_id, repo_id, parent_commit_id, snapshot_root, object_format, author, message)
+			SELECT mapping.v2_commit_id, legacy.tenant_id, legacy.repo_id,
+				first_parent.v2_commit_id, mapping.cbor_snapshot_root, 2, legacy.author, legacy.message
+			FROM review_snapshot_commit_mappings mapping
+			JOIN commits legacy ON legacy.repo_id = mapping.repo_id AND legacy.id = mapping.legacy_commit_id
+			LEFT JOIN commit_parents parents
+				ON parents.repo_id = legacy.repo_id AND parents.commit_id = legacy.id AND parents.parent_position = 1
+			LEFT JOIN review_snapshot_commit_mappings first_parent
+				ON first_parent.repo_id = legacy.repo_id
+				AND first_parent.legacy_commit_id = COALESCE(parents.parent_commit_id, legacy.parent_commit_id)
+			WHERE mapping.repo_id = $1
+			ON CONFLICT (tenant_id, repo_id, id) DO NOTHING
+		`, repoID); err != nil {
+			return fmt.Errorf("create v2 commits: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO commit_parents (tenant_id, repo_id, commit_id, parent_position, parent_commit_id)
+			SELECT mapping.tenant_id, mapping.repo_id, mapping.v2_commit_id, parents.parent_position, parent_mapping.v2_commit_id
+			FROM review_snapshot_commit_mappings mapping
+			JOIN commit_parents parents
+				ON parents.repo_id = mapping.repo_id AND parents.commit_id = mapping.legacy_commit_id
+			JOIN review_snapshot_commit_mappings parent_mapping
+				ON parent_mapping.repo_id = parents.repo_id
+				AND parent_mapping.legacy_commit_id = parents.parent_commit_id
+			WHERE mapping.repo_id = $1
+			ON CONFLICT (tenant_id, repo_id, commit_id, parent_position) DO NOTHING
+		`, repoID); err != nil {
+			return fmt.Errorf("create v2 commit parents: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO pack_ranges (tenant_id, repo_id, pack_hash, object_format, base_commit_id, target_commit_id)
+			SELECT tenant_id, repo_id, v2_pack_hash, 2, v2_base_commit_id, v2_target_commit_id
+			FROM review_snapshot_pack_mappings
+			WHERE repo_id = $1
+			ON CONFLICT (tenant_id, repo_id, pack_hash) DO NOTHING
+		`, repoID); err != nil {
+			return fmt.Errorf("create v2 pack ranges: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE branches branch
+			SET head_commit_id = mapping.v2_commit_id, updated_at = now()
+			FROM review_snapshot_commit_mappings mapping
+			WHERE branch.repo_id = $1
+				AND mapping.repo_id = branch.repo_id
+				AND mapping.legacy_commit_id = branch.head_commit_id
+		`, repoID); err != nil {
+			return fmt.Errorf("repoint branches: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE review_snapshot_migrations
+			SET status = 'cutover', updated_at = now(), cutover_at = now()
+			WHERE repo_id = $1
+		`, repoID); err != nil {
+			return fmt.Errorf("mark migration cutover: %w", err)
+		}
+		return nil
+	})
+}
+
+// RollbackSnapshotMigration atomically repoints refs to their retained v1
+// commits when no new post-cutover history has been introduced.
+func (s *PGStore) RollbackSnapshotMigration(ctx context.Context, repoID string) error {
+	if _, err := requireTenantID(ctx); err != nil {
+		return fmt.Errorf("postgres: rollback snapshot migration: %w", err)
+	}
+	return s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		var status string
+		if err := tx.QueryRow(ctx, `
+			SELECT status FROM review_snapshot_migrations WHERE repo_id = $1 FOR UPDATE
+		`, repoID).Scan(&status); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrSnapshotMigrationNotFound
+			}
+			return fmt.Errorf("lock migration ledger: %w", err)
+		}
+		if status != "cutover" {
+			return fmt.Errorf("%w: migration status is %s", ErrSnapshotMigrationRollbackUnsafe, status)
+		}
+		var unsafeHeads int
+		if err := tx.QueryRow(ctx, `
+			SELECT count(*)
+			FROM branches branch
+			LEFT JOIN review_snapshot_commit_mappings mapping
+				ON mapping.repo_id = branch.repo_id AND mapping.v2_commit_id = branch.head_commit_id
+			WHERE branch.repo_id = $1 AND mapping.v2_commit_id IS NULL
+		`, repoID).Scan(&unsafeHeads); err != nil {
+			return fmt.Errorf("check rollback branch heads: %w", err)
+		}
+		if unsafeHeads != 0 {
+			return fmt.Errorf("%w: %d branch heads advanced after cutover", ErrSnapshotMigrationRollbackUnsafe, unsafeHeads)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE branches branch
+			SET head_commit_id = mapping.legacy_commit_id, updated_at = now()
+			FROM review_snapshot_commit_mappings mapping
+			WHERE branch.repo_id = $1
+				AND mapping.repo_id = branch.repo_id
+				AND mapping.v2_commit_id = branch.head_commit_id
+		`, repoID); err != nil {
+			return fmt.Errorf("restore legacy branches: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE review_snapshot_migrations
+			SET status = 'rolled_back', updated_at = now()
+			WHERE repo_id = $1
+		`, repoID); err != nil {
+			return fmt.Errorf("mark migration rolled back: %w", err)
+		}
+		return nil
+	})
+}
+
 func collectMergeAncestry(ctx context.Context, tx pgx.Tx, repoID, commitID string) (map[string]int, error) {
 	type queuedCommit struct {
 		id    string
@@ -859,16 +1520,16 @@ func (s *PGStore) GetPackRanges(ctx context.Context, repoID, headCommitID, known
 	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			WITH RECURSIVE pack_chain AS (
-				SELECT pack_hash, base_commit_id, target_commit_id, 0 AS depth
+				SELECT pack_hash, base_commit_id, target_commit_id, object_format, 0 AS depth
 				FROM pack_ranges
 				WHERE repo_id = $1 AND target_commit_id = $2
 				UNION ALL
-				SELECT p.pack_hash, p.base_commit_id, p.target_commit_id, c.depth + 1
+				SELECT p.pack_hash, p.base_commit_id, p.target_commit_id, p.object_format, c.depth + 1
 				FROM pack_ranges p
 				JOIN pack_chain c ON p.target_commit_id = c.base_commit_id
 				WHERE p.repo_id = $1 AND c.base_commit_id IS NOT NULL AND c.base_commit_id <> $3
 			)
-			SELECT pack_hash, COALESCE(base_commit_id, ''), target_commit_id
+			SELECT pack_hash, COALESCE(base_commit_id, ''), target_commit_id, object_format
 			FROM pack_chain
 			ORDER BY depth ASC
 		`, repoID, headCommitID, knownCommitID)
@@ -879,7 +1540,7 @@ func (s *PGStore) GetPackRanges(ctx context.Context, repoID, headCommitID, known
 
 		for rows.Next() {
 			var pack PackRange
-			if err := rows.Scan(&pack.PackHash, &pack.BaseCommitID, &pack.TargetCommitID); err != nil {
+			if err := rows.Scan(&pack.PackHash, &pack.BaseCommitID, &pack.TargetCommitID, &pack.Format); err != nil {
 				return fmt.Errorf("postgres: get pack ranges: scan pack range: %w", err)
 			}
 			ranges = append(ranges, pack)
@@ -904,6 +1565,9 @@ func (s *PGStore) CompareAndSwapBranchRef(ctx context.Context, repoID, branch, e
 	}
 
 	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if err := assertRepositoryWritable(ctx, tx, repoID); err != nil {
+			return err
+		}
 		head, err := branchHeadForUpdate(ctx, tx, repoID, branch)
 		if err != nil {
 			return err
@@ -948,6 +1612,68 @@ func (s *PGStore) CompareAndSwapBranchRef(ctx context.Context, repoID, branch, e
 func (s *PGStore) withTenantTx(ctx context.Context, fn func(ctx context.Context, tx pgx.Tx) error) error {
 	tenantID, _ := tenantIDFromContext(ctx)
 	return s.withConfiguredTenantTx(ctx, tenantID, fn)
+}
+
+func assertRepositoryWritable(ctx context.Context, tx pgx.Tx, repoID string) error {
+	var repository string
+	if err := tx.QueryRow(ctx, `
+		SELECT id
+		FROM repositories
+		WHERE id = $1
+		FOR SHARE
+	`, repoID).Scan(&repository); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrRepositoryNotFound
+		}
+		return fmt.Errorf("lock repository: %w", err)
+	}
+	var status string
+	err := tx.QueryRow(ctx, `
+		SELECT status
+		FROM review_snapshot_migrations
+		WHERE repo_id = $1
+		FOR SHARE
+	`, repoID).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) || status == "cutover" || status == "rolled_back" {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("check snapshot migration state: %w", err)
+	}
+	if status == "frozen" {
+		return ErrRepositoryMigrationFrozen
+	}
+	return fmt.Errorf("%w: unknown migration state %q", ErrRepositoryMigrationFrozen, status)
+}
+
+func assertMigrationFrozen(ctx context.Context, tx pgx.Tx, repoID string) error {
+	var status string
+	if err := tx.QueryRow(ctx, `
+		SELECT status
+		FROM review_snapshot_migrations
+		WHERE repo_id = $1
+		FOR UPDATE
+	`, repoID).Scan(&status); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrSnapshotMigrationNotFound
+		}
+		return fmt.Errorf("lock migration ledger: %w", err)
+	}
+	if status != "frozen" {
+		return fmt.Errorf("%w: migration status is %s", ErrSnapshotMigrationIncomplete, status)
+	}
+	return nil
+}
+
+func validObjectFormat(format uint32) bool {
+	return format == 0 || format == 1 || format == 2
+}
+
+func normalizeObjectFormat(format uint32) uint32 {
+	if format == 0 {
+		return 1
+	}
+	return format
 }
 
 func (s *PGStore) withConfiguredTenantTx(ctx context.Context, tenantID string, fn func(ctx context.Context, tx pgx.Tx) error) error {

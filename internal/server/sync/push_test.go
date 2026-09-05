@@ -123,6 +123,195 @@ func TestPushEngineHandlePush_FastForwardSuccess(t *testing.T) {
 	}
 }
 
+func TestPushEngineHandlePushAcceptsOnlyCanonicalV2PackFrames(t *testing.T) {
+	t.Parallel()
+
+	driver, err := cas.NewLocalDriver(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := hashString("legacy-base")
+	object := []byte("canonical v2 snapshot object")
+	frameCommit := CommitFrameV2{
+		Version:      CommitFormatV2,
+		Parents:      []CommitIdentity{LegacyCommitIdentity(base)},
+		SnapshotRoot: ContentID(object),
+		Author:       "Ada",
+		Message:      "v2 push",
+	}
+	target, err := frameCommit.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	packData, err := MarshalPackFrameV2(PackFrameV2{
+		Version: PackFormatV2,
+		Base:    LegacyCommitIdentity(base),
+		Target:  target,
+		Commits: []CommitFrameV2{frameCommit},
+		Objects: []PackObjectV2{{ID: ContentID(object), Data: object}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeBranchStore{branchHeads: map[string]string{"main": base}}
+	req := PushRequest{
+		TenantID: "tenant-123", RepoID: "repo-456", Branch: "main",
+		BaseCommit: base, TargetCommit: target.ID,
+		Commits: []CommitRecord{{
+			ID: target.ID, Identity: &target, ParentID: base, SnapshotRoot: ContentID(object), Author: "Ada", Message: "v2 push",
+		}},
+		PackHash: ContentID(packData), PackFormat: PackFormatV2, PackStream: bytes.NewReader(packData),
+	}
+	validator := func(data []byte) error {
+		if !bytes.Equal(data, object) {
+			return errors.New("invalid canonical snapshot")
+		}
+		return nil
+	}
+	if err := NewPushEngine(driver, store, validator).HandlePush(context.Background(), req); err != nil {
+		t.Fatalf("HandlePush(v2) error = %v", err)
+	}
+	scope, _ := cas.NewScope(req.TenantID, req.RepoID)
+	pack, err := driver.OpenPack(context.Background(), scope, req.PackHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pack.Close() }()
+	stored, err := io.ReadAll(pack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UnmarshalPackFrameV2(stored); err != nil {
+		t.Fatalf("stored v2 frame failed canonical verification: %v", err)
+	}
+	if storedObject, err := driver.Get(context.Background(), scope, ContentID(object)); err != nil || !bytes.Equal(storedObject, object) {
+		t.Fatalf("v2 frame object was not persisted: %q, %v", storedObject, err)
+	}
+
+	req.Commits[0].Message = "tampered metadata"
+	req.PackStream = bytes.NewReader(packData)
+	err = NewPushEngine(driver, &fakeBranchStore{branchHeads: map[string]string{"main": base}}, validator).HandlePush(context.Background(), req)
+	if !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("HandlePush(tampered v2 metadata) error = %v, want frame error", err)
+	}
+	req.Commits[0].Message = "v2 push"
+
+	noncanonical := append([]byte{0xb8, 0x07}, packData[1:]...)
+	req.PackHash = ContentID(noncanonical)
+	req.PackStream = bytes.NewReader(noncanonical)
+	store = &fakeBranchStore{branchHeads: map[string]string{"main": base}}
+	err = NewPushEngine(driver, store, validator).HandlePush(context.Background(), req)
+	if !errors.Is(err, ErrInvalidCanonicalFrame) {
+		t.Fatalf("HandlePush(noncanonical v2) error = %v, want canonical frame error", err)
+	}
+}
+
+func TestPushEngineHandlePushRejectsInvalidV2Snapshot(t *testing.T) {
+	t.Parallel()
+
+	driver, err := cas.NewLocalDriver(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := hashString("legacy-base")
+	object := []byte("not a Rack CBOR snapshot")
+	commit := CommitFrameV2{
+		Version:      CommitFormatV2,
+		Parents:      []CommitIdentity{LegacyCommitIdentity(base)},
+		SnapshotRoot: ContentID(object),
+		Author:       "Ada",
+		Message:      "invalid snapshot",
+	}
+	target, err := commit.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pack, err := MarshalPackFrameV2(PackFrameV2{
+		Version: PackFormatV2, Base: LegacyCommitIdentity(base), Target: target,
+		Commits: []CommitFrameV2{commit}, Objects: []PackObjectV2{{ID: ContentID(object), Data: object}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeBranchStore{branchHeads: map[string]string{"main": base}}
+	req := PushRequest{
+		TenantID: "tenant-123", RepoID: "repo-456", Branch: "main", BaseCommit: base, TargetCommit: target.ID,
+		Commits:  []CommitRecord{{ID: target.ID, Identity: &target, ParentID: base, SnapshotRoot: ContentID(object), Author: "Ada", Message: "invalid snapshot"}},
+		PackHash: ContentID(pack), PackFormat: PackFormatV2, PackStream: bytes.NewReader(pack),
+	}
+	err = NewPushEngine(driver, store, func([]byte) error {
+		return errors.New("not a canonical Rack CBOR snapshot")
+	}).HandlePush(context.Background(), req)
+	if !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("HandlePush(invalid v2 snapshot) error = %v, want invalid frame", err)
+	}
+	if len(store.putCommitCalls) != 0 || store.compareAndSwapCalls != 0 {
+		t.Fatalf("invalid snapshot mutated metadata: commits=%d branch updates=%d", len(store.putCommitCalls), store.compareAndSwapCalls)
+	}
+}
+
+func TestPushEngineHandlePushRejectsV2BaseFormatMismatch(t *testing.T) {
+	t.Parallel()
+
+	driver, err := cas.NewLocalDriver(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := hashString("legacy-base")
+	object := []byte("canonical v2 snapshot object")
+	commit := CommitFrameV2{
+		Version:      CommitFormatV2,
+		Parents:      []CommitIdentity{V2CommitIdentity(base)},
+		SnapshotRoot: ContentID(object),
+		Author:       "Ada",
+		Message:      "mismatched parent format",
+	}
+	target, err := commit.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pack, err := MarshalPackFrameV2(PackFrameV2{
+		Version: PackFormatV2, Base: V2CommitIdentity(base), Target: target,
+		Commits: []CommitFrameV2{commit}, Objects: []PackObjectV2{{ID: ContentID(object), Data: object}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeBranchStore{branchHeads: map[string]string{"main": base}}
+	req := PushRequest{
+		TenantID: "tenant-123", RepoID: "repo-456", Branch: "main", BaseCommit: base, TargetCommit: target.ID,
+		Commits:  []CommitRecord{{ID: target.ID, Identity: &target, ParentID: base, SnapshotRoot: ContentID(object), Author: "Ada", Message: "mismatched parent format"}},
+		PackHash: ContentID(pack), PackFormat: PackFormatV2, PackStream: bytes.NewReader(pack),
+	}
+	err = NewPushEngine(driver, store, func([]byte) error { return nil }).HandlePush(context.Background(), req)
+	if !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("HandlePush(v2 base format mismatch) error = %v, want invalid frame", err)
+	}
+	if len(store.putCommitCalls) != 0 || store.compareAndSwapCalls != 0 {
+		t.Fatalf("mismatched base format mutated metadata: commits=%d branch updates=%d", len(store.putCommitCalls), store.compareAndSwapCalls)
+	}
+}
+
+func TestPushEngineHandlePushRejectsV2CommitInLegacyPack(t *testing.T) {
+	t.Parallel()
+
+	base := hashString("legacy-base")
+	target := V2CommitIdentity(hashString("v2-target"))
+	store := &fakeBranchStore{branchHeads: map[string]string{"main": base}}
+	driver := &fakeCASDriver{}
+	err := NewPushEngine(driver, store).HandlePush(context.Background(), PushRequest{
+		TenantID: "tenant-123", RepoID: "repo-456", Branch: "main", BaseCommit: base, TargetCommit: target.ID,
+		Commits:  []CommitRecord{{ID: target.ID, Identity: &target, ParentID: base, SnapshotRoot: hashString("snapshot"), Author: "Ada", Message: "downgrade"}},
+		PackHash: hashString("opaque legacy pack"), PackStream: bytes.NewReader([]byte("opaque legacy pack")),
+	})
+	if !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("HandlePush(v2 identity in legacy pack) error = %v, want invalid frame", err)
+	}
+	if driver.writePackCalls != 0 || len(store.putCommitCalls) != 0 || store.compareAndSwapCalls != 0 {
+		t.Fatalf("downgrade attempt mutated state: pack=%d commits=%d branch updates=%d", driver.writePackCalls, len(store.putCommitCalls), store.compareAndSwapCalls)
+	}
+}
+
 func TestPushEngineHandlePush_DivergentPushRejected(t *testing.T) {
 	t.Parallel()
 
@@ -316,8 +505,9 @@ func TestPushEngineHandlePush_CommitRegistrationFailureStopsBeforeBranchLookup(t
 }
 
 type fakeBranchStore struct {
-	branchHeads map[string]string
-	parentOf    map[string]string
+	branchHeads  map[string]string
+	parentOf     map[string]string
+	commitFormat map[string]uint32
 
 	putCommitErr        error
 	putCommitErrFor     string
@@ -371,6 +561,14 @@ func (f *fakeBranchStore) PutCommit(_ context.Context, repoID, commitID, parentC
 func (f *fakeBranchStore) PutPackRange(context.Context, string, string, string, string) error {
 	f.callOrder = append(f.callOrder, "pack")
 	return nil
+}
+
+func (f *fakeBranchStore) GetCommitMetadata(_ context.Context, _ string, commitID string) (postgres.CommitMetadata, error) {
+	format := CommitFormatLegacy
+	if f.commitFormat != nil {
+		format = f.commitFormat[commitID]
+	}
+	return postgres.CommitMetadata{ID: commitID, Format: format}, nil
 }
 
 func (f *fakeBranchStore) GetPackRanges(context.Context, string, string, string) ([]postgres.PackRange, error) {

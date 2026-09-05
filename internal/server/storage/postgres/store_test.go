@@ -307,7 +307,7 @@ func TestPutCommit_Idempotent(t *testing.T) {
 	if err := store.PutCommit(tenantCtx, repoID, commitID, "", "snap-a", "alice", "initial"); err != nil {
 		t.Fatalf("PutCommit first call: %v", err)
 	}
-	if err := store.PutCommit(tenantCtx, repoID, commitID, "ignored-parent", "snap-b", "bob", "replayed"); err != nil {
+	if err := store.PutCommit(tenantCtx, repoID, commitID, "", "snap-a", "alice", "initial"); err != nil {
 		t.Fatalf("PutCommit second call: %v", err)
 	}
 
@@ -486,10 +486,8 @@ func TestFindLowestCommonAncestor_HistoryErrorsAndBound(t *testing.T) {
 
 	otherRepoID := mustCreateRepository(t, store, tenantCtx, "repo-other-history")
 	foreignParent := mustPutCommit(t, store, tenantCtx, otherRepoID, "", "snap-foreign", "alice", "foreign")
-	incomplete := mustPutCommit(t, store, tenantCtx, repoID, foreignParent, "snap-incomplete", "alice", "incomplete")
-	_, err = store.FindLowestCommonAncestor(tenantCtx, repoID, incomplete, incomplete)
-	if !errors.Is(err, ErrCommitHistoryIncomplete) {
-		t.Fatalf("FindLowestCommonAncestor(incomplete): expected ErrCommitHistoryIncomplete, got %v", err)
+	if err := store.PutCommit(tenantCtx, repoID, testCommitID(t.Name(), "cross-repo-parent"), foreignParent, "snap-incomplete", "alice", "incomplete"); err == nil {
+		t.Fatal("PutCommit(cross-repository parent) error = nil, want scoped foreign-key rejection")
 	}
 
 	tip := root
@@ -587,6 +585,138 @@ func TestGetPackRanges(t *testing.T) {
 		if ranges[i].PackHash != want {
 			t.Fatalf("GetPackRanges(full)[%d] = %q, want %q", i, ranges[i].PackHash, want)
 		}
+	}
+}
+
+func TestCommitIdentityIsRepositoryScopedAndImmutable(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-scoped-v2-identity")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoA := mustCreateRepository(t, store, tenantCtx, "repo-v2-a")
+	repoB := mustCreateRepository(t, store, tenantCtx, "repo-v2-b")
+	commitID := testCommitID(t.Name(), "same-v2-frame")
+	if err := store.PutCommitWithFormat(tenantCtx, repoA, commitID, "", "snapshot", "Ada", "same frame", 2); err != nil {
+		t.Fatalf("PutCommitWithFormat(repo A): %v", err)
+	}
+	if err := store.PutCommitWithFormat(tenantCtx, repoB, commitID, "", "snapshot", "Ada", "same frame", 2); err != nil {
+		t.Fatalf("PutCommitWithFormat(repo B): %v", err)
+	}
+	if err := store.PutCommitWithFormat(tenantCtx, repoA, commitID, "", "snapshot", "Mallory", "poisoned frame", 1); !errors.Is(err, ErrImmutableMetadataMismatch) {
+		t.Fatalf("PutCommitWithFormat(conflicting ID) error = %v, want immutable metadata mismatch", err)
+	}
+	for _, repoID := range []string{repoA, repoB} {
+		metadata, err := store.GetCommitMetadata(tenantCtx, repoID, commitID)
+		if err != nil || metadata.Format != 2 || metadata.SnapshotRoot != "snapshot" {
+			t.Fatalf("GetCommitMetadata(%s) = %+v, %v; want scoped v2 commit", repoID, metadata, err)
+		}
+	}
+}
+
+func TestSnapshotMigrationFreezesWritersMapsMergeDAGAndRollsBack(t *testing.T) {
+	store, ctx := newTestStore(t)
+	tenantAID := mustCreateTenant(t, store, ctx, "tenant-snapshot-migration-a")
+	tenantBID := mustCreateTenant(t, store, ctx, "tenant-snapshot-migration-b")
+	tenantACtx := mustTenantContext(t, store, ctx, tenantAID)
+	tenantBCtx := mustTenantContext(t, store, ctx, tenantBID)
+	repoID := mustCreateRepository(t, store, tenantACtx, "repo-snapshot-migration")
+
+	root := mustPutCommit(t, store, tenantACtx, repoID, "", "legacy-snapshot-root", "Ada", "root")
+	target := mustPutCommit(t, store, tenantACtx, repoID, root, "legacy-snapshot-target", "Ada", "target")
+	source := mustPutCommit(t, store, tenantACtx, repoID, root, "legacy-snapshot-source", "Ada", "source")
+	merge := mustPutCommit(t, store, tenantACtx, repoID, target, "legacy-snapshot-merge", "Ada", "merge")
+	if err := store.withTenantTx(tenantACtx, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO commit_parents (tenant_id, repo_id, commit_id, parent_position, parent_commit_id)
+			VALUES ($1, $2, $3, 2, $4)
+		`, tenantAID, repoID, merge, source)
+		return err
+	}); err != nil {
+		t.Fatalf("add merge second parent: %v", err)
+	}
+	mustCreateBranch(t, store, tenantACtx, repoID, "main", merge)
+
+	packs := []struct{ hash, base, target string }{
+		{"legacy-pack-root", "", root},
+		{"legacy-pack-target", root, target},
+		{"legacy-pack-source", root, source},
+		{"legacy-pack-merge", target, merge},
+	}
+	for _, pack := range packs {
+		if err := store.PutPackRange(tenantACtx, repoID, pack.hash, pack.base, pack.target); err != nil {
+			t.Fatalf("PutPackRange(%s): %v", pack.hash, err)
+		}
+	}
+
+	migration, err := store.BeginSnapshotMigration(tenantACtx, repoID)
+	if err != nil {
+		t.Fatalf("BeginSnapshotMigration() error = %v", err)
+	}
+	resumed, err := store.BeginSnapshotMigration(tenantACtx, repoID)
+	if err != nil || migration.Generation == "" || resumed.Generation != migration.Generation || migration.Status != "frozen" {
+		t.Fatalf("migration/resume = %+v/%+v/%v", migration, resumed, err)
+	}
+	if err := store.PutCommit(tenantACtx, repoID, testCommitID(t.Name(), "blocked"), merge, "blocked", "Ada", "blocked"); !errors.Is(err, ErrRepositoryMigrationFrozen) {
+		t.Fatalf("PutCommit while frozen error = %v, want writer freeze", err)
+	}
+
+	legacyRoots := map[string]string{root: "legacy-snapshot-root", target: "legacy-snapshot-target", source: "legacy-snapshot-source", merge: "legacy-snapshot-merge"}
+	v2IDs := map[string]string{root: testCommitID(t.Name(), "v2-root"), target: testCommitID(t.Name(), "v2-target"), source: testCommitID(t.Name(), "v2-source"), merge: testCommitID(t.Name(), "v2-merge")}
+	for legacyID, legacyRoot := range legacyRoots {
+		cborRoot := "cbor-" + legacyRoot
+		if err := store.StageSnapshotObjectMapping(tenantACtx, repoID, legacyRoot, cborRoot); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.StageSnapshotCommitMapping(tenantACtx, repoID, legacyID, v2IDs[legacyID], legacyRoot, cborRoot); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, pack := range packs {
+		v2Base := ""
+		if pack.base != "" {
+			v2Base = v2IDs[pack.base]
+		}
+		if err := store.StageSnapshotPackMapping(tenantACtx, repoID, pack.hash, "v2-"+pack.hash, pack.base, pack.target, v2Base, v2IDs[pack.target]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := store.withTenantTx(tenantBCtx, func(ctx context.Context, tx pgx.Tx) error {
+		var mappings int
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM review_snapshot_commit_mappings WHERE repo_id = $1`, repoID).Scan(&mappings); err != nil {
+			return err
+		}
+		if mappings != 0 {
+			return fmt.Errorf("foreign tenant saw %d migration mappings", mappings)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("migration ledger RLS: %v", err)
+	}
+
+	if err := store.CompleteSnapshotMigration(tenantACtx, repoID); err != nil {
+		t.Fatalf("CompleteSnapshotMigration() error = %v", err)
+	}
+	head, err := store.GetBranchRef(tenantACtx, repoID, "main")
+	if err != nil || head != v2IDs[merge] {
+		t.Fatalf("v2 branch head = %q, %v; want %q", head, err, v2IDs[merge])
+	}
+	if ancestor, err := store.IsAncestor(tenantACtx, repoID, v2IDs[source], v2IDs[merge]); err != nil || !ancestor {
+		t.Fatalf("v2 merge second parent ancestry = %t, %v; want true, nil", ancestor, err)
+	}
+	metadata, err := store.GetCommitMetadata(tenantACtx, repoID, v2IDs[merge])
+	if err != nil || metadata.Format != 2 || metadata.SnapshotRoot != "cbor-legacy-snapshot-merge" {
+		t.Fatalf("v2 metadata = %+v, %v", metadata, err)
+	}
+	ranges, err := store.GetPackRanges(tenantACtx, repoID, v2IDs[merge], v2IDs[target])
+	if err != nil || len(ranges) != 1 || ranges[0].PackHash != "v2-legacy-pack-merge" || ranges[0].Format != 2 {
+		t.Fatalf("v2 pack range = %+v, %v", ranges, err)
+	}
+	if err := store.RollbackSnapshotMigration(tenantACtx, repoID); err != nil {
+		t.Fatalf("RollbackSnapshotMigration() error = %v", err)
+	}
+	if head, err := store.GetBranchRef(tenantACtx, repoID, "main"); err != nil || head != merge {
+		t.Fatalf("rolled back branch head = %q, %v; want %q", head, err, merge)
 	}
 }
 

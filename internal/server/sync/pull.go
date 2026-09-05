@@ -31,8 +31,8 @@ func (e *PullDivergedError) Unwrap() error {
 	return ErrPullDiverged
 }
 
-// UpToDateError is a sentinel result allowing HTTP to return 204 cleanly.
-var UpToDateError = errors.New("sync: already up to date")
+// ErrUpToDate is a sentinel result allowing HTTP to return 204 cleanly.
+var ErrUpToDate = errors.New("sync: already up to date")
 
 // PullEngine negotiates and streams tenant-fenced pack ranges from CAS.
 type PullEngine struct {
@@ -68,7 +68,7 @@ func (e *PullEngine) PreparePull(ctx context.Context, req PullRequest) (PullPlan
 		return PullPlan{}, fmt.Errorf("sync: pull: get branch ref: %w", err)
 	}
 	if req.KnownCommit == head {
-		return PullPlan{Head: head}, UpToDateError
+		return PullPlan{Head: head}, ErrUpToDate
 	}
 	if req.KnownCommit != "" {
 		isAncestor, err := e.store.IsAncestor(ctx, req.RepoID, req.KnownCommit, head)

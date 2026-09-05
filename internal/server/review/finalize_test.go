@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"testing"
 	"time"
 
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/cas"
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/postgres"
+	serversync "github.com/autonomous-bits/spool-rack/internal/server/sync"
 )
 
 func TestFinalizeEngineRequiresExactConflictResolutions(t *testing.T) {
@@ -53,14 +55,29 @@ func TestFinalizeEngineFinalizesResolvedMergeAfterCASWrites(t *testing.T) {
 		t.Fatalf("ApplyMerge() request = %+v, want result metadata", store.apply)
 	}
 	scope, _ := cas.NewScope("tenant-1", "repo-1")
-	if _, err := driver.Get(context.Background(), scope, result.SnapshotRoot); err != nil {
+	snapshotData, err := driver.Get(context.Background(), scope, result.SnapshotRoot)
+	if err != nil {
 		t.Fatalf("merged snapshot was not written before store apply: %v", err)
+	}
+	if _, err := DecodeSnapshotCBOR(snapshotData); err != nil {
+		t.Fatalf("merged snapshot must use canonical CBOR: %v", err)
 	}
 	pack, err := driver.OpenPack(context.Background(), scope, result.PackHash)
 	if err != nil {
 		t.Fatalf("merged pack was not written before store apply: %v", err)
 	}
-	_ = pack.Close()
+	packData, readErr := io.ReadAll(pack)
+	closeErr := pack.Close()
+	if readErr != nil || closeErr != nil {
+		t.Fatalf("read merged pack: %v / %v", readErr, closeErr)
+	}
+	frame, err := serversync.UnmarshalPackFrameV2(packData)
+	if err != nil {
+		t.Fatalf("merged pack must use a canonical v2 frame: %v", err)
+	}
+	if frame.Target.ID != result.HeadCommit || frame.Objects[0].ID != result.SnapshotRoot {
+		t.Fatalf("merged frame = %+v, want commit %q and snapshot %q", frame, result.HeadCommit, result.SnapshotRoot)
+	}
 }
 
 func TestFinalizeEngineFastForwardsWithoutLease(t *testing.T) {

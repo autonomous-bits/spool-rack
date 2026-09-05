@@ -34,10 +34,17 @@ type MetadataStore interface {
 
 var _ MetadataStore = (postgres.Store)(nil)
 
+type commitMetadataStore interface {
+	GetCommitMetadata(ctx context.Context, repoID, commitID string) (postgres.CommitMetadata, error)
+}
+
 // CommitIdentity identifies an immutable commit and its immutable graph root.
 type CommitIdentity struct {
 	ID           string `json:"id"`
 	SnapshotRoot string `json:"snapshotRoot"`
+	// Format is intentionally not exposed in existing HTTP JSON responses.
+	// It is only needed inside Rack's v2 commit framing.
+	Format uint32 `json:"-"`
 }
 
 // ChangeKind identifies the portion of a graph affected by a clean change.
@@ -187,28 +194,28 @@ func (e *PreviewEngine) PreviewMerge(ctx context.Context, tenantID, repoID, sour
 		}
 	}
 
-	baseRoot, err := e.store.GetCommitSnapshotRoot(tenantCtx, repoID, baseID)
+	baseCommit, err := e.resolveCommitIdentity(tenantCtx, repoID, baseID)
 	if err != nil {
 		return nil, fmt.Errorf("review: resolve base snapshot %s: %w", baseID, err)
 	}
-	sourceRoot, err := e.store.GetCommitSnapshotRoot(tenantCtx, repoID, sourceID)
+	sourceCommit, err := e.resolveCommitIdentity(tenantCtx, repoID, sourceID)
 	if err != nil {
 		return nil, fmt.Errorf("review: resolve source snapshot %s: %w", sourceID, err)
 	}
-	targetRoot, err := e.store.GetCommitSnapshotRoot(tenantCtx, repoID, targetID)
+	targetCommit, err := e.resolveCommitIdentity(tenantCtx, repoID, targetID)
 	if err != nil {
 		return nil, fmt.Errorf("review: resolve target snapshot %s: %w", targetID, err)
 	}
 
-	base, err := DecodeSnapshot(tenantCtx, e.objects, scope, baseRoot)
+	base, err := DecodeSnapshot(tenantCtx, e.objects, scope, baseCommit.SnapshotRoot)
 	if err != nil {
 		return nil, fmt.Errorf("review: load base snapshot: %w", err)
 	}
-	source, err := DecodeSnapshot(tenantCtx, e.objects, scope, sourceRoot)
+	source, err := DecodeSnapshot(tenantCtx, e.objects, scope, sourceCommit.SnapshotRoot)
 	if err != nil {
 		return nil, fmt.Errorf("review: load source snapshot: %w", err)
 	}
-	target, err := DecodeSnapshot(tenantCtx, e.objects, scope, targetRoot)
+	target, err := DecodeSnapshot(tenantCtx, e.objects, scope, targetCommit.SnapshotRoot)
 	if err != nil {
 		return nil, fmt.Errorf("review: load target snapshot: %w", err)
 	}
@@ -216,11 +223,26 @@ func (e *PreviewEngine) PreviewMerge(ctx context.Context, tenantID, repoID, sour
 	preview := mergeSnapshots(base, source, target)
 	preview.SourceBranch = sourceBranch
 	preview.TargetBranch = targetBranch
-	preview.BaseCommit = CommitIdentity{ID: baseID, SnapshotRoot: baseRoot}
-	preview.SourceCommit = CommitIdentity{ID: sourceID, SnapshotRoot: sourceRoot}
-	preview.TargetCommit = CommitIdentity{ID: targetID, SnapshotRoot: targetRoot}
+	preview.BaseCommit = baseCommit
+	preview.SourceCommit = sourceCommit
+	preview.TargetCommit = targetCommit
 	preview.CanFastForward = canFastForward
 	return &preview, nil
+}
+
+func (e *PreviewEngine) resolveCommitIdentity(ctx context.Context, repoID, commitID string) (CommitIdentity, error) {
+	if metadataStore, ok := e.store.(commitMetadataStore); ok {
+		metadata, err := metadataStore.GetCommitMetadata(ctx, repoID, commitID)
+		if err != nil {
+			return CommitIdentity{}, err
+		}
+		return CommitIdentity{ID: metadata.ID, SnapshotRoot: metadata.SnapshotRoot, Format: metadata.Format}, nil
+	}
+	root, err := e.store.GetCommitSnapshotRoot(ctx, repoID, commitID)
+	if err != nil {
+		return CommitIdentity{}, err
+	}
+	return CommitIdentity{ID: commitID, SnapshotRoot: root}, nil
 }
 
 func mergeSnapshots(base, source, target Snapshot) MergePreview {

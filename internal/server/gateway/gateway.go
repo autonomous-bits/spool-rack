@@ -77,7 +77,10 @@ func New(opts ...Option) *Gateway {
 		g.verifier = auth.PermissiveVerifier{}
 	}
 	if g.casDriver != nil && g.branchStore != nil {
-		g.pushEngine = serversync.NewPushEngine(g.casDriver, g.branchStore)
+		g.pushEngine = serversync.NewPushEngine(g.casDriver, g.branchStore, func(data []byte) error {
+			_, err := review.DecodeSnapshotCBOR(data)
+			return err
+		})
 		g.pullEngine = serversync.NewPullEngine(g.casDriver, g.branchStore)
 		if g.previewEngine == nil {
 			if metadataStore, ok := g.branchStore.(review.MetadataStore); ok {
@@ -347,7 +350,7 @@ func (g *Gateway) handlePull(w http.ResponseWriter, r *http.Request) {
 	}
 
 	plan, err := g.pullEngine.PreparePull(r.Context(), req)
-	if errors.Is(err, serversync.UpToDateError) {
+	if errors.Is(err, serversync.ErrUpToDate) {
 		w.Header().Set("X-Spool-Head-Commit", plan.Head)
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -432,6 +435,7 @@ type pushMetadata struct {
 	BaseCommit   string                    `json:"baseCommit"`
 	TargetCommit string                    `json:"targetCommit"`
 	PackHash     string                    `json:"packHash"`
+	PackFormat   uint32                    `json:"packFormat,omitempty"`
 	Commits      []serversync.CommitRecord `json:"commits,omitempty"`
 }
 
@@ -500,6 +504,7 @@ func (g *Gateway) handlePush(w http.ResponseWriter, r *http.Request) {
 				TargetCommit: meta.TargetCommit,
 				Commits:      meta.Commits,
 				PackHash:     meta.PackHash,
+				PackFormat:   meta.PackFormat,
 				PackStream:   part,
 			}
 			err := g.pushEngine.HandlePush(r.Context(), req)

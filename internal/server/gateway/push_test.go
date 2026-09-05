@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/autonomous-bits/spool-rack/internal/server/auth"
+	"github.com/autonomous-bits/spool-rack/internal/server/review"
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/cas"
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/postgres"
 	serversync "github.com/autonomous-bits/spool-rack/internal/server/sync"
@@ -329,6 +330,136 @@ func TestPushReturnsNotImplementedWhenUnconfigured(t *testing.T) {
 	assertErrorCode(t, rec, ErrorCodeNotImplemented)
 }
 
+func TestPushRejectsNonCanonicalV2Snapshot(t *testing.T) {
+	t.Parallel()
+
+	driver, err := cas.NewLocalDriver(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := hashCommitString("legacy-base")
+	snapshot := []byte("not a Rack canonical CBOR snapshot")
+	commit := serversync.CommitFrameV2{
+		Version:      serversync.CommitFormatV2,
+		Parents:      []serversync.CommitIdentity{serversync.LegacyCommitIdentity(base)},
+		SnapshotRoot: serversync.ContentID(snapshot),
+		Author:       "Ada",
+		Message:      "reject invalid snapshot",
+	}
+	target, err := commit.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pack, err := serversync.MarshalPackFrameV2(serversync.PackFrameV2{
+		Version: serversync.PackFormatV2,
+		Base:    serversync.LegacyCommitIdentity(base),
+		Target:  target,
+		Commits: []serversync.CommitFrameV2{commit},
+		Objects: []serversync.PackObjectV2{{ID: serversync.ContentID(snapshot), Data: snapshot}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeGatewayBranchStore{branchHeads: map[gatewayBranchKey]string{{repoID: "repo-1", branch: "main"}: base}}
+	gw := New(
+		WithCASDriver(driver),
+		WithBranchStore(store),
+		WithVerifier(auth.NewStaticVerifier(map[string]auth.Claims{
+			"contributor-token": {Role: auth.RoleContributor, Subject: "u1"},
+		})),
+	)
+	req := newPushRequest(t, pushRequestFixture{
+		token: "contributor-token", tenantID: "tenant-1", repoID: "repo-1",
+		metadata: pushMetadata{
+			Branch: "main", BaseCommit: base, TargetCommit: target.ID, PackHash: serversync.ContentID(pack),
+			PackFormat: serversync.PackFormatV2,
+			Commits: []serversync.CommitRecord{{
+				ID: target.ID, Identity: &target, ParentID: base, SnapshotRoot: serversync.ContentID(snapshot),
+				Author: "Ada", Message: "reject invalid snapshot",
+			}},
+		},
+		packData: pack,
+	})
+	rec := httptest.NewRecorder()
+
+	gw.Routes().ServeHTTP(rec, req)
+
+	assertStatus(t, rec, http.StatusBadRequest)
+	assertErrorCode(t, rec, ErrorCodeBadRequest)
+	if len(store.putCommitCalls) != 0 || store.compareAndSwapCalls != 0 {
+		t.Fatalf("invalid v2 snapshot mutated metadata: commits=%d branch updates=%d", len(store.putCommitCalls), store.compareAndSwapCalls)
+	}
+}
+
+func TestPushAcceptsCanonicalV2Snapshot(t *testing.T) {
+	t.Parallel()
+
+	driver, err := cas.NewLocalDriver(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := hashCommitString("legacy-base")
+	snapshot, err := review.MarshalSnapshotCBOR(review.Snapshot{
+		Version: review.SnapshotVersion,
+		Schema: review.Schema{
+			NodeLabels: []review.LabelRule{}, EdgeLabels: []review.LabelRule{}, Cardinalities: []review.CardinalityRule{},
+		},
+		Nodes: []review.Node{}, Edges: []review.Edge{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit := serversync.CommitFrameV2{
+		Version:      serversync.CommitFormatV2,
+		Parents:      []serversync.CommitIdentity{serversync.LegacyCommitIdentity(base)},
+		SnapshotRoot: serversync.ContentID(snapshot),
+		Author:       "Ada",
+		Message:      "accept canonical snapshot",
+	}
+	target, err := commit.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pack, err := serversync.MarshalPackFrameV2(serversync.PackFrameV2{
+		Version: serversync.PackFormatV2,
+		Base:    serversync.LegacyCommitIdentity(base),
+		Target:  target,
+		Commits: []serversync.CommitFrameV2{commit},
+		Objects: []serversync.PackObjectV2{{ID: serversync.ContentID(snapshot), Data: snapshot}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeGatewayBranchStore{branchHeads: map[gatewayBranchKey]string{{repoID: "repo-1", branch: "main"}: base}}
+	gw := New(
+		WithCASDriver(driver),
+		WithBranchStore(store),
+		WithVerifier(auth.NewStaticVerifier(map[string]auth.Claims{
+			"contributor-token": {Role: auth.RoleContributor, Subject: "u1"},
+		})),
+	)
+	req := newPushRequest(t, pushRequestFixture{
+		token: "contributor-token", tenantID: "tenant-1", repoID: "repo-1",
+		metadata: pushMetadata{
+			Branch: "main", BaseCommit: base, TargetCommit: target.ID, PackHash: serversync.ContentID(pack),
+			PackFormat: serversync.PackFormatV2,
+			Commits: []serversync.CommitRecord{{
+				ID: target.ID, Identity: &target, ParentID: base, SnapshotRoot: serversync.ContentID(snapshot),
+				Author: "Ada", Message: "accept canonical snapshot",
+			}},
+		},
+		packData: pack,
+	})
+	rec := httptest.NewRecorder()
+
+	gw.Routes().ServeHTTP(rec, req)
+
+	assertStatus(t, rec, http.StatusOK)
+	if got := store.branchHeads[gatewayBranchKey{repoID: "repo-1", branch: "main"}]; got != target.ID {
+		t.Fatalf("branch head = %s, want %s", got, target.ID)
+	}
+}
+
 type pushRequestFixture struct {
 	token    string
 	tenantID string
@@ -386,8 +517,9 @@ type gatewayCASArgs struct {
 }
 
 type fakeGatewayBranchStore struct {
-	branchHeads map[gatewayBranchKey]string
-	parentOf    map[string]string
+	branchHeads  map[gatewayBranchKey]string
+	parentOf     map[string]string
+	commitFormat map[string]uint32
 
 	putCommitErr        error
 	getBranchRefErr     error
@@ -429,6 +561,14 @@ func (f *fakeGatewayBranchStore) PutCommit(_ context.Context, repoID, commitID, 
 
 func (f *fakeGatewayBranchStore) PutPackRange(context.Context, string, string, string, string) error {
 	return nil
+}
+
+func (f *fakeGatewayBranchStore) GetCommitMetadata(_ context.Context, _ string, commitID string) (postgres.CommitMetadata, error) {
+	format := serversync.CommitFormatLegacy
+	if f.commitFormat != nil {
+		format = f.commitFormat[commitID]
+	}
+	return postgres.CommitMetadata{ID: commitID, Format: format}, nil
 }
 
 func (f *fakeGatewayBranchStore) GetPackRanges(_ context.Context, _ string, _ string, knownCommit string) ([]postgres.PackRange, error) {
