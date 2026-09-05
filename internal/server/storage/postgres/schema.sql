@@ -65,16 +65,18 @@ CREATE TABLE IF NOT EXISTS repositories (
 	UNIQUE (tenant_id, name)
 );
 
--- Commits belong to both a tenant and a repository. Storing tenant_id directly
+-- Commits belong to both a tenant and a repository. Their primary key is the
+-- caller-supplied 64-character BLAKE3 hex digest used everywhere else in the
+-- system as the content-addressed commit identity. Storing tenant_id directly
 -- lets RLS decisions remain local to this table instead of requiring a join
 -- through repositories to prove tenancy for every read or write. The scoped
 -- foreign key and composite uniqueness keep that denormalised tenant_id honest
 -- so a commit cannot claim one tenant while pointing at another tenant's repo.
 CREATE TABLE IF NOT EXISTS commits (
-	id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+	id text PRIMARY KEY,
 	tenant_id uuid NOT NULL REFERENCES tenants(id),
 	repo_id uuid NOT NULL REFERENCES repositories(id),
-	parent_commit_id uuid REFERENCES commits(id),
+	parent_commit_id text REFERENCES commits(id),
 	snapshot_root text NOT NULL,
 	author text NOT NULL,
 	message text NOT NULL,
@@ -96,7 +98,7 @@ CREATE TABLE IF NOT EXISTS branches (
 	tenant_id uuid NOT NULL REFERENCES tenants(id),
 	repo_id uuid NOT NULL REFERENCES repositories(id),
 	name text NOT NULL,
-	head_commit_id uuid NOT NULL REFERENCES commits(id),
+	head_commit_id text NOT NULL REFERENCES commits(id),
 	updated_at timestamptz NOT NULL DEFAULT now(),
 	CONSTRAINT branches_repository_scope_fk
 		FOREIGN KEY (tenant_id, repo_id)
@@ -106,6 +108,49 @@ CREATE TABLE IF NOT EXISTS branches (
 		REFERENCES commits(tenant_id, repo_id, id),
 	PRIMARY KEY (repo_id, name)
 );
+
+ALTER TABLE branches DROP CONSTRAINT IF EXISTS branches_head_commit_scope_fk;
+ALTER TABLE branches DROP CONSTRAINT IF EXISTS branches_head_commit_id_fkey;
+ALTER TABLE commits DROP CONSTRAINT IF EXISTS commits_parent_commit_id_fkey;
+ALTER TABLE commits ALTER COLUMN id DROP DEFAULT;
+ALTER TABLE commits ALTER COLUMN id TYPE text USING id::text;
+ALTER TABLE commits ALTER COLUMN parent_commit_id TYPE text USING parent_commit_id::text;
+ALTER TABLE branches ALTER COLUMN head_commit_id TYPE text USING head_commit_id::text;
+
+DO $$
+BEGIN
+	IF NOT EXISTS (
+		SELECT 1
+		FROM pg_constraint
+		WHERE conname = 'commits_parent_commit_id_fkey'
+	) THEN
+		ALTER TABLE commits
+			ADD CONSTRAINT commits_parent_commit_id_fkey
+			FOREIGN KEY (parent_commit_id)
+			REFERENCES commits(id);
+	END IF;
+	IF NOT EXISTS (
+		SELECT 1
+		FROM pg_constraint
+		WHERE conname = 'branches_head_commit_id_fkey'
+	) THEN
+		ALTER TABLE branches
+			ADD CONSTRAINT branches_head_commit_id_fkey
+			FOREIGN KEY (head_commit_id)
+			REFERENCES commits(id);
+	END IF;
+	IF NOT EXISTS (
+		SELECT 1
+		FROM pg_constraint
+		WHERE conname = 'branches_head_commit_scope_fk'
+	) THEN
+		ALTER TABLE branches
+			ADD CONSTRAINT branches_head_commit_scope_fk
+			FOREIGN KEY (tenant_id, repo_id, head_commit_id)
+			REFERENCES commits(tenant_id, repo_id, id);
+	END IF;
+END
+$$;
 
 ALTER TABLE tenants ENABLE ROW LEVEL SECURITY;
 ALTER TABLE repositories ENABLE ROW LEVEL SECURITY;

@@ -3,13 +3,17 @@ package postgres
 import (
 	"context"
 	_ "embed"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"lukechampine.com/blake3"
 )
 
 const (
@@ -19,6 +23,8 @@ const (
 
 //go:embed schema.sql
 var schemaSQL string
+
+var putCommitCounter uint64
 
 func newTestStore(t *testing.T) (*PGStore, context.Context) {
 	t.Helper()
@@ -119,11 +125,28 @@ func mustCreateRepository(t *testing.T, store *PGStore, ctx context.Context, nam
 func mustPutCommit(t *testing.T, store *PGStore, ctx context.Context, repoID, parentCommitID, snapshotRoot, author, message string) string {
 	t.Helper()
 
-	commitID, err := store.PutCommit(ctx, repoID, parentCommitID, snapshotRoot, author, message)
-	if err != nil {
+	commitID := testCommitID(t.Name(), repoID, parentCommitID, snapshotRoot, author, message)
+	if err := store.PutCommit(ctx, repoID, commitID, parentCommitID, snapshotRoot, author, message); err != nil {
 		t.Fatalf("PutCommit(repo=%q, parent=%q): %v", repoID, parentCommitID, err)
 	}
 	return commitID
+}
+
+func testCommitID(parts ...string) string {
+	seq := atomic.AddUint64(&putCommitCounter, 1)
+	sum := blake3.Sum256([]byte(fmt.Sprintf("%s\x00%d", joinWithNUL(parts...), seq)))
+	return hex.EncodeToString(sum[:])
+}
+
+func joinWithNUL(parts ...string) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	out := parts[0]
+	for _, part := range parts[1:] {
+		out += "\x00" + part
+	}
+	return out
 }
 
 func mustCreateBranch(t *testing.T, store *PGStore, ctx context.Context, repoID, name, headCommitID string) {
@@ -221,6 +244,55 @@ func TestCompareAndSwapBranchRef_NotFound(t *testing.T) {
 	}
 }
 
+func TestPutCommit_Idempotent(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-put-commit-idempotent")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoID := mustCreateRepository(t, store, tenantCtx, "repo-put-commit-idempotent")
+
+	commitID := testCommitID(t.Name(), "commit")
+	if err := store.PutCommit(tenantCtx, repoID, commitID, "", "snap-a", "alice", "initial"); err != nil {
+		t.Fatalf("PutCommit first call: %v", err)
+	}
+	if err := store.PutCommit(tenantCtx, repoID, commitID, "ignored-parent", "snap-b", "bob", "replayed"); err != nil {
+		t.Fatalf("PutCommit second call: %v", err)
+	}
+
+	var (
+		parent       *string
+		snapshotRoot string
+		author       string
+		message      string
+		count        int
+	)
+	if err := store.withTenantTx(tenantCtx, func(ctx context.Context, tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, `
+			SELECT parent_commit_id, snapshot_root, author, message
+			FROM commits
+			WHERE repo_id = $1 AND id = $2
+		`, repoID, commitID).Scan(&parent, &snapshotRoot, &author, &message); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM commits WHERE repo_id = $1 AND id = $2`, repoID, commitID).Scan(&count); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("query commit row: %v", err)
+	}
+
+	if count != 1 {
+		t.Fatalf("commit row count = %d, want 1", count)
+	}
+	if parent != nil {
+		t.Fatalf("parent_commit_id = %q, want NULL", *parent)
+	}
+	if snapshotRoot != "snap-a" || author != "alice" || message != "initial" {
+		t.Fatalf("stored metadata = (%q, %q, %q), want (%q, %q, %q)", snapshotRoot, author, message, "snap-a", "alice", "initial")
+	}
+}
+
 func TestGetBranchRef_NotFound(t *testing.T) {
 	store, ctx := newTestStore(t)
 
@@ -234,6 +306,69 @@ func TestGetBranchRef_NotFound(t *testing.T) {
 	}
 	if gotHead != "" {
 		t.Fatalf("GetBranchRef missing branch: got head %q, want empty string", gotHead)
+	}
+}
+
+func TestIsAncestor(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-is-ancestor")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoID := mustCreateRepository(t, store, tenantCtx, "repo-is-ancestor")
+
+	rootCommit := mustPutCommit(t, store, tenantCtx, repoID, "", "snap-root", "alice", "root")
+	childCommit := mustPutCommit(t, store, tenantCtx, repoID, rootCommit, "snap-child", "alice", "child")
+	grandchildCommit := mustPutCommit(t, store, tenantCtx, repoID, childCommit, "snap-grandchild", "alice", "grandchild")
+	sideRootCommit := mustPutCommit(t, store, tenantCtx, repoID, "", "snap-side-root", "alice", "side root")
+
+	tests := []struct {
+		name           string
+		ancestorCommit string
+		commit         string
+		want           bool
+	}{
+		{
+			name:           "direct parent",
+			ancestorCommit: childCommit,
+			commit:         grandchildCommit,
+			want:           true,
+		},
+		{
+			name:           "multi hop ancestor",
+			ancestorCommit: rootCommit,
+			commit:         grandchildCommit,
+			want:           true,
+		},
+		{
+			name:           "self",
+			ancestorCommit: grandchildCommit,
+			commit:         grandchildCommit,
+			want:           true,
+		},
+		{
+			name:           "unrelated commit",
+			ancestorCommit: sideRootCommit,
+			commit:         grandchildCommit,
+			want:           false,
+		},
+		{
+			name:           "missing start commit",
+			ancestorCommit: rootCommit,
+			commit:         testCommitID(t.Name(), "missing-start-commit"),
+			want:           false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := store.IsAncestor(tenantCtx, repoID, tt.ancestorCommit, tt.commit)
+			if err != nil {
+				t.Fatalf("IsAncestor(%q, %q): %v", tt.ancestorCommit, tt.commit, err)
+			}
+			if got != tt.want {
+				t.Fatalf("IsAncestor(%q, %q) = %t, want %t", tt.ancestorCommit, tt.commit, got, tt.want)
+			}
+		})
 	}
 }
 

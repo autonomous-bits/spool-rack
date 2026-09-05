@@ -51,11 +51,20 @@ type Store interface {
 	// CreateBranch creates a branch ref within the tenant carried by ctx pointing
 	// at the supplied head commit.
 	CreateBranch(ctx context.Context, repoID, name, headCommitID string) error
-	// PutCommit persists an immutable commit within the tenant carried by ctx and
-	// returns its generated UUID.
-	PutCommit(ctx context.Context, repoID, parentCommitID, snapshotRoot, author, message string) (string, error)
+	// PutCommit inserts a content-addressed commit row (commitID is a caller-
+	// supplied BLAKE3 hex hash, not server-generated) scoped to the tenant
+	// carried by ctx. It is idempotent: re-registering an already-known
+	// commitID (e.g. a retried push) is a no-op rather than an error.
+	PutCommit(ctx context.Context, repoID, commitID, parentCommitID, snapshotRoot, author, message string) error
 	// GetBranchRef resolves the commit identifier for a named branch.
 	GetBranchRef(ctx context.Context, repoID, branch string) (string, error)
+	// IsAncestor reports whether ancestorCommit is reachable by walking the
+	// parent_commit_id chain starting at commit (inclusive — a commit is
+	// considered its own ancestor), scoped to repoID within the tenant
+	// carried by ctx. Used to verify fast-forward reachability during push,
+	// per req-ancestry-verified-remote-fast-forward. If commit does not exist
+	// in the repository, IsAncestor returns false, nil.
+	IsAncestor(ctx context.Context, repoID, ancestorCommit, commit string) (bool, error)
 	// CompareAndSwapBranchRef updates a branch ref only if current matches expected.
 	CompareAndSwapBranchRef(ctx context.Context, repoID, branch, expectedCommit, newCommit string) error
 }
@@ -170,17 +179,12 @@ func (s *PGStore) CreateBranch(ctx context.Context, repoID, name, headCommitID s
 	return nil
 }
 
-// PutCommit inserts a commit row scoped to the tenant carried by ctx and
-// returns its generated UUID.
-func (s *PGStore) PutCommit(ctx context.Context, repoID, parentCommitID, snapshotRoot, author, message string) (string, error) {
+// PutCommit inserts a content-addressed commit row scoped to the tenant
+// carried by ctx. Re-registering the same commitID is a no-op.
+func (s *PGStore) PutCommit(ctx context.Context, repoID, commitID, parentCommitID, snapshotRoot, author, message string) error {
 	tenantID, err := requireTenantID(ctx)
 	if err != nil {
-		return "", fmt.Errorf("postgres: put commit for repo %s: %w", repoID, err)
-	}
-
-	commitID, err := newUUIDv4()
-	if err != nil {
-		return "", fmt.Errorf("postgres: put commit for repo %s: %w", repoID, err)
+		return fmt.Errorf("postgres: put commit for repo %s: %w", repoID, err)
 	}
 
 	var parent any
@@ -192,15 +196,18 @@ func (s *PGStore) PutCommit(ctx context.Context, repoID, parentCommitID, snapsho
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO commits (id, tenant_id, repo_id, parent_commit_id, snapshot_root, author, message)
 			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (tenant_id, repo_id, id) DO NOTHING
 		`, commitID, tenantID, repoID, parent, snapshotRoot, author, message); err != nil {
 			return fmt.Errorf("postgres: put commit for repo %s: insert commit: %w", repoID, err)
 		}
+		// MVP note: if the same commitID is re-registered with different metadata,
+		// PostgreSQL keeps the first row and ignores the later insert.
 		return nil
 	}); err != nil {
-		return "", err
+		return err
 	}
 
-	return commitID, nil
+	return nil
 }
 
 // GetBranchRef resolves the current head commit for branch in repoID.
@@ -223,6 +230,40 @@ func (s *PGStore) GetBranchRef(ctx context.Context, repoID, branch string) (stri
 	}
 
 	return headCommitID, nil
+}
+
+// IsAncestor reports whether ancestorCommit is reachable from commit by walking
+// the parent_commit_id chain within repoID for the tenant carried by ctx. A
+// commit is considered its own ancestor. If commit does not exist in the
+// repository, IsAncestor returns false, nil.
+func (s *PGStore) IsAncestor(ctx context.Context, repoID, ancestorCommit, commit string) (bool, error) {
+	if _, err := requireTenantID(ctx); err != nil {
+		return false, fmt.Errorf("postgres: is ancestor: %w", err)
+	}
+
+	var found bool
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, `
+			WITH RECURSIVE ancestry AS (
+				SELECT id, parent_commit_id
+				FROM commits
+				WHERE repo_id = $1 AND id = $2
+				UNION ALL
+				SELECT c.id, c.parent_commit_id
+				FROM commits c
+				JOIN ancestry a ON c.id = a.parent_commit_id
+				WHERE c.repo_id = $1
+			)
+			SELECT EXISTS (SELECT 1 FROM ancestry WHERE id = $3)
+		`, repoID, commit, ancestorCommit).Scan(&found); err != nil {
+			return fmt.Errorf("postgres: is ancestor: query ancestry: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return false, err
+	}
+
+	return found, nil
 }
 
 // CompareAndSwapBranchRef updates a branch head only when it still points at

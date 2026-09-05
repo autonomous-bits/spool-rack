@@ -2,17 +2,24 @@ package gateway
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 
 	"github.com/autonomous-bits/spool-rack/internal/server/auth"
+	"github.com/autonomous-bits/spool-rack/internal/server/storage/cas"
+	serversync "github.com/autonomous-bits/spool-rack/internal/server/sync"
 )
 
 // Gateway routes incoming requests, extracts tenant context, and manages endpoints.
 type Gateway struct {
-	logger   *slog.Logger
-	verifier auth.Verifier
-	mux      *http.ServeMux
+	logger      *slog.Logger
+	verifier    auth.Verifier
+	casDriver   cas.Driver
+	branchStore serversync.BranchStore
+	pushEngine  *serversync.PushEngine
+	mux         *http.ServeMux
 }
 
 // Option configures a Gateway during construction.
@@ -29,6 +36,16 @@ func WithVerifier(verifier auth.Verifier) Option {
 	return func(g *Gateway) { g.verifier = verifier }
 }
 
+// WithCASDriver configures the Gateway's CAS driver for push handling.
+func WithCASDriver(driver cas.Driver) Option {
+	return func(g *Gateway) { g.casDriver = driver }
+}
+
+// WithBranchStore configures the Gateway's branch store for push handling.
+func WithBranchStore(store serversync.BranchStore) Option {
+	return func(g *Gateway) { g.branchStore = store }
+}
+
 // New constructs an initialized API Gateway. When no verifier is provided,
 // it defaults to auth.PermissiveVerifier{} for zero-config local development
 // and MVP wiring; this MUST be overridden with WithVerifier before any
@@ -43,6 +60,9 @@ func New(opts ...Option) *Gateway {
 	if g.verifier == nil {
 		g.verifier = auth.PermissiveVerifier{}
 	}
+	if g.casDriver != nil && g.branchStore != nil {
+		g.pushEngine = serversync.NewPushEngine(g.casDriver, g.branchStore)
+	}
 	g.registerRoutes()
 	return g
 }
@@ -56,6 +76,13 @@ func (g *Gateway) registerRoutes() {
 	g.mux.HandleFunc("GET /healthz", g.handleHealthz)
 	g.mux.Handle("GET /v1/whoami", Authenticate(g.logger, g.verifier)(http.HandlerFunc(g.handleWhoami)))
 	g.mux.Handle("GET /api/v1/repos/{repo}/whoami", Authenticate(g.logger, g.verifier)(RequireRepoScope(g.logger)(http.HandlerFunc(g.handleRepoWhoami))))
+	g.mux.Handle("POST /api/v1/repos/{repo}/push",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleContributor)(http.HandlerFunc(g.handlePush)),
+			),
+		),
+	)
 }
 
 func (g *Gateway) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -94,4 +121,102 @@ func (g *Gateway) handleRepoWhoami(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+type pushMetadata struct {
+	Branch       string                    `json:"branch"`
+	BaseCommit   string                    `json:"baseCommit"`
+	TargetCommit string                    `json:"targetCommit"`
+	PackHash     string                    `json:"packHash"`
+	Commits      []serversync.CommitRecord `json:"commits,omitempty"`
+}
+
+func (g *Gateway) handlePush(w http.ResponseWriter, r *http.Request) {
+	if g.pushEngine == nil {
+		writeJSONError(w, r, g.logger, http.StatusNotImplemented, ErrorCodeNotImplemented, "push is not configured on this server")
+		return
+	}
+
+	tenantID, _ := TenantIDFromContext(r.Context())
+	scope, _ := ScopeFromContext(r.Context())
+
+	mr, err := r.MultipartReader()
+	if err != nil {
+		writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "request must be multipart/form-data")
+		return
+	}
+
+	var (
+		meta            pushMetadata
+		sawMetadataPart bool
+	)
+
+	for {
+		part, err := mr.NextPart()
+		if errors.Is(err, io.EOF) {
+			writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "request must include metadata and pack parts")
+			return
+		}
+		if err != nil {
+			writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "failed to read multipart body")
+			return
+		}
+
+		switch part.FormName() {
+		case "metadata":
+			dec := json.NewDecoder(part)
+			if err := dec.Decode(&meta); err != nil {
+				_ = part.Close()
+				writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "metadata part must contain valid JSON")
+				return
+			}
+			sawMetadataPart = true
+			_ = part.Close()
+		case "pack":
+			// The metadata part must precede the pack part so the handler can pass
+			// the multipart stream directly into PushEngine without buffering.
+			if !sawMetadataPart {
+				_ = part.Close()
+				writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "metadata part must precede pack part")
+				return
+			}
+
+			req := serversync.PushRequest{
+				TenantID:     tenantID,
+				RepoID:       scope.RepoID(),
+				Branch:       meta.Branch,
+				BaseCommit:   meta.BaseCommit,
+				TargetCommit: meta.TargetCommit,
+				Commits:      meta.Commits,
+				PackHash:     meta.PackHash,
+				PackStream:   part,
+			}
+			err := g.pushEngine.HandlePush(r.Context(), req)
+			_ = part.Close()
+			if err != nil {
+				var nffErr *serversync.NonFastForwardError
+				if errors.As(err, &nffErr) {
+					writeJSONErrorEnvelope(w, r, g.logger, http.StatusConflict, errorEnvelope{
+						Error:       ErrorCodeConflict,
+						Message:     nffErr.Guidance,
+						CurrentHead: nffErr.ActualHead,
+					})
+					return
+				}
+
+				writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, err.Error())
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"branch":     meta.Branch,
+				"headCommit": meta.TargetCommit,
+			})
+			return
+		default:
+			_ = part.Close()
+		}
+	}
 }
