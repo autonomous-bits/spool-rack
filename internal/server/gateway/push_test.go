@@ -392,12 +392,18 @@ type fakeGatewayBranchStore struct {
 	putCommitErr        error
 	getBranchRefErr     error
 	isAncestorErr       error
+	getPackRangesErr    error
 	compareAndSwapErr   error
+	packRanges          []postgres.PackRange
 	putCommitCalls      []gatewayPutCommitCall
 	getBranchRefCalls   int
 	isAncestorCalls     int
 	compareAndSwapCalls int
 	compareAndSwapArgs  gatewayCASArgs
+}
+
+func (f *fakeGatewayBranchStore) SetTenantContext(ctx context.Context, _ string) (context.Context, error) {
+	return ctx, nil
 }
 
 type gatewayPutCommitCall struct {
@@ -419,6 +425,22 @@ func (f *fakeGatewayBranchStore) PutCommit(_ context.Context, repoID, commitID, 
 		message:      message,
 	})
 	return f.putCommitErr
+}
+
+func (f *fakeGatewayBranchStore) PutPackRange(context.Context, string, string, string, string) error {
+	return nil
+}
+
+func (f *fakeGatewayBranchStore) GetPackRanges(_ context.Context, _ string, _ string, knownCommit string) ([]postgres.PackRange, error) {
+	if f.getPackRangesErr != nil {
+		return nil, f.getPackRangesErr
+	}
+	for i, pack := range f.packRanges {
+		if pack.BaseCommitID == knownCommit {
+			return f.packRanges[:i+1], nil
+		}
+	}
+	return f.packRanges, nil
 }
 
 func (f *fakeGatewayBranchStore) GetBranchRef(_ context.Context, repoID, branch string) (string, error) {

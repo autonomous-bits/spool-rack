@@ -17,9 +17,12 @@ var ErrNonFastForward = errors.New("sync: non-fast-forward push rejected")
 // kept separate so unit tests can supply a lightweight fake instead of a real
 // PostgreSQL-backed Store.
 type BranchStore interface {
+	SetTenantContext(ctx context.Context, tenantID string) (context.Context, error)
 	PutCommit(ctx context.Context, repoID, commitID, parentCommitID, snapshotRoot, author, message string) error
+	PutPackRange(ctx context.Context, repoID, packHash, baseCommitID, targetCommitID string) error
 	GetBranchRef(ctx context.Context, repoID, branch string) (string, error)
 	IsAncestor(ctx context.Context, repoID, ancestorCommit, commit string) (bool, error)
+	GetPackRanges(ctx context.Context, repoID, headCommitID, knownCommitID string) ([]postgres.PackRange, error)
 	CompareAndSwapBranchRef(ctx context.Context, repoID, branch, expectedCommit, newCommit string) error
 }
 
@@ -70,6 +73,10 @@ func (e *PushEngine) HandlePush(ctx context.Context, req PushRequest) error {
 	if err := validatePushRequest(req); err != nil {
 		return err
 	}
+	ctx, err := e.store.SetTenantContext(ctx, req.TenantID)
+	if err != nil {
+		return fmt.Errorf("sync: push: set tenant context: %w", err)
+	}
 
 	scope, err := cas.NewScope(req.TenantID, req.RepoID)
 	if err != nil {
@@ -84,6 +91,9 @@ func (e *PushEngine) HandlePush(ctx context.Context, req PushRequest) error {
 		if err := e.store.PutCommit(ctx, req.RepoID, c.ID, c.ParentID, c.SnapshotRoot, c.Author, c.Message); err != nil {
 			return fmt.Errorf("sync: push: register commit %s: %w", c.ID, err)
 		}
+	}
+	if err := e.store.PutPackRange(ctx, req.RepoID, req.PackHash, req.BaseCommit, req.TargetCommit); err != nil {
+		return fmt.Errorf("sync: push: register pack range: %w", err)
 	}
 
 	actualHead, err := e.store.GetBranchRef(ctx, req.RepoID, req.Branch)

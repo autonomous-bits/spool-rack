@@ -372,6 +372,55 @@ func TestIsAncestor(t *testing.T) {
 	}
 }
 
+func TestGetPackRanges(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-pack-ranges")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoID := mustCreateRepository(t, store, tenantCtx, "repo-pack-ranges")
+	root := mustPutCommit(t, store, tenantCtx, repoID, "", "snap-root", "alice", "root")
+	middle := mustPutCommit(t, store, tenantCtx, repoID, root, "snap-middle", "alice", "middle")
+	head := mustPutCommit(t, store, tenantCtx, repoID, middle, "snap-head", "alice", "head")
+
+	rootPack := testCommitID(t.Name(), "root-pack")
+	middlePack := testCommitID(t.Name(), "middle-pack")
+	headPack := testCommitID(t.Name(), "head-pack")
+	for _, pack := range []struct {
+		hash   string
+		base   string
+		target string
+	}{
+		{hash: rootPack, base: "", target: root},
+		{hash: middlePack, base: root, target: middle},
+		{hash: headPack, base: middle, target: head},
+	} {
+		if err := store.PutPackRange(tenantCtx, repoID, pack.hash, pack.base, pack.target); err != nil {
+			t.Fatalf("PutPackRange(%q): %v", pack.hash, err)
+		}
+	}
+
+	ranges, err := store.GetPackRanges(tenantCtx, repoID, head, middle)
+	if err != nil {
+		t.Fatalf("GetPackRanges(delta): %v", err)
+	}
+	if len(ranges) != 1 || ranges[0].PackHash != headPack {
+		t.Fatalf("GetPackRanges(delta) = %+v, want only head pack", ranges)
+	}
+
+	ranges, err = store.GetPackRanges(tenantCtx, repoID, head, "")
+	if err != nil {
+		t.Fatalf("GetPackRanges(full): %v", err)
+	}
+	if len(ranges) != 3 {
+		t.Fatalf("GetPackRanges(full) length = %d, want 3", len(ranges))
+	}
+	for i, want := range []string{headPack, middlePack, rootPack} {
+		if ranges[i].PackHash != want {
+			t.Fatalf("GetPackRanges(full)[%d] = %q, want %q", i, ranges[i].PackHash, want)
+		}
+	}
+}
+
 func TestCreateRepository_RequiresTenantContext(t *testing.T) {
 	store, _ := newTestStore(t)
 

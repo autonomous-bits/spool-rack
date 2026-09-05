@@ -89,6 +89,31 @@ CREATE TABLE IF NOT EXISTS commits (
 
 CREATE INDEX IF NOT EXISTS commits_repo_id_idx ON commits (repo_id);
 
+-- Pack ranges connect the immutable CAS payload created by a push to the
+-- commit interval it contains. Pull traverses these ranges backwards from a
+-- branch head, then streams them oldest-to-newest.
+CREATE TABLE IF NOT EXISTS pack_ranges (
+	tenant_id uuid NOT NULL REFERENCES tenants(id),
+	repo_id uuid NOT NULL REFERENCES repositories(id),
+	pack_hash text NOT NULL,
+	base_commit_id text REFERENCES commits(id),
+	target_commit_id text NOT NULL REFERENCES commits(id),
+	created_at timestamptz NOT NULL DEFAULT now(),
+	CONSTRAINT pack_ranges_repository_scope_fk
+		FOREIGN KEY (tenant_id, repo_id)
+		REFERENCES repositories(tenant_id, id),
+	CONSTRAINT pack_ranges_target_scope_fk
+		FOREIGN KEY (tenant_id, repo_id, target_commit_id)
+		REFERENCES commits(tenant_id, repo_id, id),
+	CONSTRAINT pack_ranges_base_scope_fk
+		FOREIGN KEY (tenant_id, repo_id, base_commit_id)
+		REFERENCES commits(tenant_id, repo_id, id),
+	UNIQUE (tenant_id, repo_id, pack_hash),
+	UNIQUE (tenant_id, repo_id, target_commit_id)
+);
+
+CREATE INDEX IF NOT EXISTS pack_ranges_repo_target_idx ON pack_ranges (repo_id, target_commit_id);
+
 -- Branch heads are mutable refs pointing at immutable commits. The primary key
 -- is scoped by repository because branch names only need to be unique within a
 -- single repository, not globally or per tenant. Extra scoped foreign keys
@@ -116,6 +141,9 @@ ALTER TABLE commits ALTER COLUMN id DROP DEFAULT;
 ALTER TABLE commits ALTER COLUMN id TYPE text USING id::text;
 ALTER TABLE commits ALTER COLUMN parent_commit_id TYPE text USING parent_commit_id::text;
 ALTER TABLE branches ALTER COLUMN head_commit_id TYPE text USING head_commit_id::text;
+ALTER TABLE pack_ranges ALTER COLUMN pack_hash TYPE text USING pack_hash::text;
+ALTER TABLE pack_ranges ALTER COLUMN base_commit_id TYPE text USING base_commit_id::text;
+ALTER TABLE pack_ranges ALTER COLUMN target_commit_id TYPE text USING target_commit_id::text;
 
 DO $$
 BEGIN
@@ -155,6 +183,7 @@ $$;
 ALTER TABLE tenants ENABLE ROW LEVEL SECURITY;
 ALTER TABLE repositories ENABLE ROW LEVEL SECURITY;
 ALTER TABLE commits ENABLE ROW LEVEL SECURITY;
+ALTER TABLE pack_ranges ENABLE ROW LEVEL SECURITY;
 ALTER TABLE branches ENABLE ROW LEVEL SECURITY;
 
 -- current_setting(..., true) returns NULL instead of raising if the tenant
@@ -179,6 +208,12 @@ CREATE POLICY tenant_isolation ON commits
 	USING (tenant_id = current_setting('app.current_tenant_id', true)::uuid)
 	WITH CHECK (tenant_id = current_setting('app.current_tenant_id', true)::uuid);
 
+DROP POLICY IF EXISTS tenant_isolation ON pack_ranges;
+CREATE POLICY tenant_isolation ON pack_ranges
+	FOR ALL
+	USING (tenant_id = current_setting('app.current_tenant_id', true)::uuid)
+	WITH CHECK (tenant_id = current_setting('app.current_tenant_id', true)::uuid);
+
 DROP POLICY IF EXISTS tenant_isolation ON branches;
 CREATE POLICY tenant_isolation ON branches
 	FOR ALL
@@ -190,4 +225,4 @@ CREATE POLICY tenant_isolation ON branches
 -- remain with the migration/admin role, which keeps the blast radius of an
 -- application credential compromise as small as this control plane allows.
 GRANT USAGE ON SCHEMA public TO spool_app;
-GRANT SELECT, INSERT, UPDATE, DELETE ON tenants, repositories, commits, branches TO spool_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON tenants, repositories, commits, pack_ranges, branches TO spool_app;
