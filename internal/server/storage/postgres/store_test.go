@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/autonomous-bits/spool/graphcontract"
 	"github.com/jackc/pgx/v5"
 	"lukechampine.com/blake3"
 )
@@ -133,7 +134,14 @@ func mustPutCommit(t *testing.T, store *PGStore, ctx context.Context, repoID, pa
 	t.Helper()
 
 	commitID := testCommitID(t.Name(), repoID, parentCommitID, snapshotRoot, author, message)
-	if err := store.PutCommit(ctx, repoID, commitID, parentCommitID, snapshotRoot, author, message); err != nil {
+	commit := graphcontract.Commit{
+		Snapshot: graphcontract.ObjectID(snapshotRoot), Author: author, Message: message,
+		Time: time.Unix(0, 0),
+	}
+	if parentCommitID != "" {
+		commit.Parents = []graphcontract.ObjectID{graphcontract.ObjectID(parentCommitID)}
+	}
+	if err := store.PutCommit(ctx, repoID, graphcontract.ObjectID(commitID), commit); err != nil {
 		t.Fatalf("PutCommit(repo=%q, parent=%q): %v", repoID, parentCommitID, err)
 	}
 	return commitID
@@ -350,15 +358,15 @@ func TestPutCommit_Idempotent(t *testing.T) {
 	repoID := mustCreateRepository(t, store, tenantCtx, "repo-put-commit-idempotent")
 
 	commitID := testCommitID(t.Name(), "commit")
-	if err := store.PutCommit(tenantCtx, repoID, commitID, "", "snap-a", "alice", "initial"); err != nil {
+	commit := graphcontract.Commit{Snapshot: "snap-a", Author: "alice", Message: "initial", Time: time.Unix(0, 0)}
+	if err := store.PutCommit(tenantCtx, repoID, graphcontract.ObjectID(commitID), commit); err != nil {
 		t.Fatalf("PutCommit first call: %v", err)
 	}
-	if err := store.PutCommit(tenantCtx, repoID, commitID, "", "snap-a", "alice", "initial"); err != nil {
+	if err := store.PutCommit(tenantCtx, repoID, graphcontract.ObjectID(commitID), commit); err != nil {
 		t.Fatalf("PutCommit second call: %v", err)
 	}
 
 	var (
-		parent       *string
 		snapshotRoot string
 		author       string
 		message      string
@@ -366,10 +374,10 @@ func TestPutCommit_Idempotent(t *testing.T) {
 	)
 	if err := store.withTenantTx(tenantCtx, func(ctx context.Context, tx pgx.Tx) error {
 		if err := tx.QueryRow(ctx, `
-			SELECT parent_commit_id, snapshot_root, author, message
+			SELECT snapshot_root, author, message
 			FROM commits
 			WHERE repo_id = $1 AND id = $2
-		`, repoID, commitID).Scan(&parent, &snapshotRoot, &author, &message); err != nil {
+		`, repoID, commitID).Scan(&snapshotRoot, &author, &message); err != nil {
 			return err
 		}
 		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM commits WHERE repo_id = $1 AND id = $2`, repoID, commitID).Scan(&count); err != nil {
@@ -383,11 +391,75 @@ func TestPutCommit_Idempotent(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("commit row count = %d, want 1", count)
 	}
-	if parent != nil {
-		t.Fatalf("parent_commit_id = %q, want NULL", *parent)
-	}
 	if snapshotRoot != "snap-a" || author != "alice" || message != "initial" {
 		t.Fatalf("stored metadata = (%q, %q, %q), want (%q, %q, %q)", snapshotRoot, author, message, "snap-a", "alice", "initial")
+	}
+}
+
+func TestPutCommit_PreservesCompleteOrderedParents(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantAID := mustCreateTenant(t, store, ctx, "tenant-ordered-parents-a")
+	tenantBID := mustCreateTenant(t, store, ctx, "tenant-ordered-parents-b")
+	tenantACtx := mustTenantContext(t, store, ctx, tenantAID)
+	tenantBCtx := mustTenantContext(t, store, ctx, tenantBID)
+	repoID := mustCreateRepository(t, store, tenantACtx, "repo-ordered-parents")
+
+	root := mustPutCommit(t, store, tenantACtx, repoID, "", "root", "alice", "root")
+	first := mustPutCommit(t, store, tenantACtx, repoID, root, "first", "alice", "first")
+	second := mustPutCommit(t, store, tenantACtx, repoID, root, "second", "alice", "second")
+	third := mustPutCommit(t, store, tenantACtx, repoID, root, "third", "alice", "third")
+	mergeID := graphcontract.ObjectID(testCommitID(t.Name(), "merge"))
+	merge := graphcontract.Commit{
+		Snapshot: "merge", Parents: []graphcontract.ObjectID{
+			graphcontract.ObjectID(second), graphcontract.ObjectID(first), graphcontract.ObjectID(third),
+		},
+		Author: "alice", Message: "external native merge", Time: time.Unix(0, 0),
+	}
+	if err := store.PutCommitWithFormat(tenantACtx, repoID, mergeID, merge, 2); err != nil {
+		t.Fatalf("PutCommitWithFormat(native merge): %v", err)
+	}
+
+	var parents []string
+	if err := store.withTenantTx(tenantACtx, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT parent_commit_id FROM commit_parents
+			WHERE repo_id = $1 AND commit_id = $2
+			ORDER BY parent_position
+		`, repoID, string(mergeID))
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var parent string
+			if err := rows.Scan(&parent); err != nil {
+				return err
+			}
+			parents = append(parents, parent)
+		}
+		return rows.Err()
+	}); err != nil {
+		t.Fatalf("query ordered parents: %v", err)
+	}
+	want := []string{second, first, third}
+	if fmt.Sprint(parents) != fmt.Sprint(want) {
+		t.Fatalf("stored parent order = %v, want %v", parents, want)
+	}
+	if got, err := store.IsAncestor(tenantACtx, repoID, first, string(mergeID)); err != nil || !got {
+		t.Fatalf("IsAncestor(first, merge) = (%t, %v), want (true, nil)", got, err)
+	}
+	if got, err := store.FindLowestCommonAncestor(tenantACtx, repoID, string(mergeID), second); err != nil || got != second {
+		t.Fatalf("FindLowestCommonAncestor(merge, second) = (%q, %v), want (%q, nil)", got, err, second)
+	}
+	if _, err := store.GetCommitMetadata(tenantBCtx, repoID, string(mergeID)); !errors.Is(err, ErrCommitNotFound) {
+		t.Fatalf("GetCommitMetadata foreign tenant error = %v, want ErrCommitNotFound", err)
+	}
+
+	reordered := merge.Clone()
+	reordered.Parents[0], reordered.Parents[1] = reordered.Parents[1], reordered.Parents[0]
+	if err := store.PutCommitWithFormat(tenantACtx, repoID, mergeID, reordered, 2); !errors.Is(err, ErrImmutableMetadataMismatch) {
+		t.Fatalf("PutCommitWithFormat(reordered parents) error = %v, want immutable metadata mismatch", err)
 	}
 }
 
@@ -532,7 +604,10 @@ func TestFindLowestCommonAncestor_HistoryErrorsAndBound(t *testing.T) {
 
 	otherRepoID := mustCreateRepository(t, store, tenantCtx, "repo-other-history")
 	foreignParent := mustPutCommit(t, store, tenantCtx, otherRepoID, "", "snap-foreign", "alice", "foreign")
-	if err := store.PutCommit(tenantCtx, repoID, testCommitID(t.Name(), "cross-repo-parent"), foreignParent, "snap-incomplete", "alice", "incomplete"); err == nil {
+	if err := store.PutCommit(tenantCtx, repoID, graphcontract.ObjectID(testCommitID(t.Name(), "cross-repo-parent")), graphcontract.Commit{
+		Snapshot: "snap-incomplete", Parents: []graphcontract.ObjectID{graphcontract.ObjectID(foreignParent)},
+		Author: "alice", Message: "incomplete", Time: time.Unix(0, 0),
+	}); err == nil {
 		t.Fatal("PutCommit(cross-repository parent) error = nil, want scoped foreign-key rejection")
 	}
 
@@ -642,13 +717,16 @@ func TestCommitIdentityIsRepositoryScopedAndImmutable(t *testing.T) {
 	repoA := mustCreateRepository(t, store, tenantCtx, "repo-v2-a")
 	repoB := mustCreateRepository(t, store, tenantCtx, "repo-v2-b")
 	commitID := testCommitID(t.Name(), "same-v2-frame")
-	if err := store.PutCommitWithFormat(tenantCtx, repoA, commitID, "", "snapshot", "Ada", "same frame", 2); err != nil {
+	commit := graphcontract.Commit{Snapshot: "snapshot", Author: "Ada", Message: "same frame", Time: time.Unix(0, 0)}
+	if err := store.PutCommitWithFormat(tenantCtx, repoA, graphcontract.ObjectID(commitID), commit, 2); err != nil {
 		t.Fatalf("PutCommitWithFormat(repo A): %v", err)
 	}
-	if err := store.PutCommitWithFormat(tenantCtx, repoB, commitID, "", "snapshot", "Ada", "same frame", 2); err != nil {
+	if err := store.PutCommitWithFormat(tenantCtx, repoB, graphcontract.ObjectID(commitID), commit, 2); err != nil {
 		t.Fatalf("PutCommitWithFormat(repo B): %v", err)
 	}
-	if err := store.PutCommitWithFormat(tenantCtx, repoA, commitID, "", "snapshot", "Mallory", "poisoned frame", 1); !errors.Is(err, ErrImmutableMetadataMismatch) {
+	if err := store.PutCommitWithFormat(tenantCtx, repoA, graphcontract.ObjectID(commitID), graphcontract.Commit{
+		Snapshot: "snapshot", Author: "Mallory", Message: "poisoned frame", Time: time.Unix(0, 0),
+	}, 1); !errors.Is(err, ErrImmutableMetadataMismatch) {
 		t.Fatalf("PutCommitWithFormat(conflicting ID) error = %v, want immutable metadata mismatch", err)
 	}
 	for _, repoID := range []string{repoA, repoB} {
@@ -870,15 +948,11 @@ func TestApplyMerge_RegistersDAGAndConsumesOwnedLease(t *testing.T) {
 		t.Fatalf("ValidateMergeLease consumed lease: expected ErrMergeLeaseNotFound, got %v", err)
 	}
 	var (
-		legacyParent string
-		parents      []string
-		packBase     string
-		packTarget   string
+		parents    []string
+		packBase   string
+		packTarget string
 	)
 	if err := store.withTenantTx(tenantCtx, func(ctx context.Context, tx pgx.Tx) error {
-		if err := tx.QueryRow(ctx, `SELECT parent_commit_id FROM commits WHERE repo_id = $1 AND id = $2`, repoID, result).Scan(&legacyParent); err != nil {
-			return err
-		}
 		rows, err := tx.Query(ctx, `
 			SELECT parent_commit_id FROM commit_parents
 			WHERE repo_id = $1 AND commit_id = $2
@@ -904,9 +978,6 @@ func TestApplyMerge_RegistersDAGAndConsumesOwnedLease(t *testing.T) {
 		`, repoID, apply.PackHash).Scan(&packBase, &packTarget)
 	}); err != nil {
 		t.Fatalf("query ApplyMerge records: %v", err)
-	}
-	if legacyParent != target {
-		t.Fatalf("legacy merge parent = %q, want target %q", legacyParent, target)
 	}
 	if len(parents) != 2 || parents[0] != target || parents[1] != source {
 		t.Fatalf("ordered merge parents = %q, want [%q %q]", parents, target, source)

@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
+	"github.com/autonomous-bits/spool/graphcontract"
 	"github.com/fxamacker/cbor/v2"
 	"lukechampine.com/blake3"
 )
@@ -42,31 +44,25 @@ var (
 	}.DecMode()
 )
 
-// CommitIdentity is a universal reference to either an opaque legacy commit
-// or a deterministic v2 commit frame. IDs are never inferred from their
-// spelling: their format travels with the reference wherever a v2 frame
-// needs to distinguish a legacy parent from a v2 one.
+// ObjectID is the canonical content-derived identifier for a graph object.
+type ObjectID = graphcontract.ObjectID
+
+// CommitIdentity retains the explicit object framing marker used by Rack's
+// outer pack envelope. The canonical commit itself is graphcontract.Commit.
 type CommitIdentity struct {
 	Format uint32 `json:"format,omitempty" cbor:"1,keyasint"`
 	ID     string `json:"id" cbor:"2,keyasint"`
 }
 
-// LegacyCommitIdentity names an opaque v1 commit without re-deriving it.
 func LegacyCommitIdentity(id string) CommitIdentity {
 	return CommitIdentity{Format: CommitFormatLegacy, ID: id}
 }
 
-// V2CommitIdentity names a deterministic v2 commit frame.
 func V2CommitIdentity(id string) CommitIdentity {
 	return CommitIdentity{Format: CommitFormatV2, ID: id}
 }
 
-// Validate verifies an explicitly framed commit reference.
 func (id CommitIdentity) Validate() error {
-	return id.validate()
-}
-
-func (id CommitIdentity) validate() error {
 	if id.ID == "" {
 		return fmt.Errorf("%w: commit ID is required", ErrInvalidFrame)
 	}
@@ -79,56 +75,53 @@ func (id CommitIdentity) validate() error {
 	return nil
 }
 
-// CommitFrameV2 is the canonical preimage of a v2 commit ID. Parent identity
-// formats are explicit so frame validation never infers an ID's meaning.
+// CommitFrameV2 carries the Rack pack envelope's explicit framing metadata.
+// Its identity is always derived from the equivalent graphcontract.Commit.
 type CommitFrameV2 struct {
 	Version      uint32           `cbor:"1,keyasint"`
 	Parents      []CommitIdentity `cbor:"2,keyasint"`
 	SnapshotRoot string           `cbor:"3,keyasint"`
 	Author       string           `cbor:"4,keyasint"`
 	Message      string           `cbor:"5,keyasint"`
+	Time         time.Time        `cbor:"6,keyasint"`
 }
 
-// CanonicalCommitFrameV2 returns the unique CBOR preimage for a v2 commit.
-func CanonicalCommitFrameV2(frame CommitFrameV2) ([]byte, error) {
-	if err := frame.validate(); err != nil {
-		return nil, err
+// Commit returns the authoritative graphcontract record without changing
+// parent order.
+func (f CommitFrameV2) Commit() (graphcontract.Commit, error) {
+	parents := make([]graphcontract.ObjectID, len(f.Parents))
+	for i, parent := range f.Parents {
+		if err := parent.Validate(); err != nil {
+			return graphcontract.Commit{}, fmt.Errorf("%w: parent %d: %v", ErrInvalidFrame, i, err)
+		}
+		parents[i] = graphcontract.ObjectID(parent.ID)
 	}
-	data, err := frameCanonicalCBOR.Marshal(frame)
+	return graphcontract.NewCommit(
+		graphcontract.ObjectID(f.SnapshotRoot), parents, f.Author, f.Message, f.Time,
+	)
+}
+
+// CommitObjectID derives the Rack object identifier from Spool's canonical
+// encoding, preserving graphcontract's parent order exactly.
+func CommitObjectID(commit graphcontract.Commit) (graphcontract.ObjectID, error) {
+	data, err := graphcontract.MarshalCommit(commit)
 	if err != nil {
-		return nil, fmt.Errorf("%w: encode commit: %v", ErrInvalidFrame, err)
+		return "", err
 	}
-	return data, nil
+	return graphcontract.ObjectID(ContentID(data)), nil
 }
 
-// Identity returns the deterministic v2 ID derived from this frame.
+// Identity derives the v2 reference from the canonical graphcontract record.
 func (f CommitFrameV2) Identity() (CommitIdentity, error) {
-	data, err := CanonicalCommitFrameV2(f)
+	commit, err := f.Commit()
 	if err != nil {
 		return CommitIdentity{}, err
 	}
-	return V2CommitIdentity(ContentID(data)), nil
-}
-
-func (f CommitFrameV2) validate() error {
-	if f.Version != CommitFormatV2 {
-		return fmt.Errorf("%w: unsupported commit frame version %d", ErrInvalidFrame, f.Version)
+	id, err := CommitObjectID(commit)
+	if err != nil {
+		return CommitIdentity{}, err
 	}
-	if !validContentID(f.SnapshotRoot) {
-		return fmt.Errorf("%w: snapshot root must be a BLAKE3-256 content ID", ErrInvalidFrame)
-	}
-	if f.Author == "" || f.Message == "" {
-		return fmt.Errorf("%w: commit author and message are required", ErrInvalidFrame)
-	}
-	if len(f.Parents) > 2 {
-		return fmt.Errorf("%w: commits may have at most two parents", ErrInvalidFrame)
-	}
-	for i, parent := range f.Parents {
-		if err := parent.validate(); err != nil {
-			return fmt.Errorf("%w: parent %d: %v", ErrInvalidFrame, i, err)
-		}
-	}
-	return nil
+	return V2CommitIdentity(string(id)), nil
 }
 
 // PackObjectV2 is one immutable CAS object carried by a new v2 pack.
@@ -188,11 +181,11 @@ func (f PackFrameV2) validate() error {
 		return fmt.Errorf("%w: unsupported pack frame version %d", ErrInvalidFrame, f.Version)
 	}
 	if f.Base.ID != "" || f.Base.Format != 0 {
-		if err := f.Base.validate(); err != nil {
+		if err := f.Base.Validate(); err != nil {
 			return fmt.Errorf("%w: base commit: %v", ErrInvalidFrame, err)
 		}
 	}
-	if err := f.Target.validate(); err != nil {
+	if err := f.Target.Validate(); err != nil {
 		return fmt.Errorf("%w: target commit: %v", ErrInvalidFrame, err)
 	}
 	if len(f.Commits) == 0 {
@@ -200,7 +193,7 @@ func (f PackFrameV2) validate() error {
 	}
 	previous := f.Base
 	for i, commit := range f.Commits {
-		if err := commit.validate(); err != nil {
+		if _, err := commit.Commit(); err != nil {
 			return fmt.Errorf("%w: commit %d: %v", ErrInvalidFrame, i, err)
 		}
 		if len(commit.Parents) == 0 {

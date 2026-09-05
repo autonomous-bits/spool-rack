@@ -3,19 +3,15 @@ package sync
 import (
 	"context"
 	"io"
+
+	"github.com/autonomous-bits/spool/graphcontract"
 )
 
 // CommitRecord describes one commit to register in the remote metadata store
 // as part of a push, keyed by its BLAKE3 content-addressed ID.
 type CommitRecord struct {
-	ID string `json:"id"`
-	// Identity is optional for the JSON v1 bridge. When supplied, it makes the
-	// framing of a v2 commit explicit without changing the established ID field.
-	Identity     *CommitIdentity `json:"identity,omitempty"`
-	ParentID     string          `json:"parentId,omitempty"`
-	SnapshotRoot string          `json:"snapshotRoot"`
-	Author       string          `json:"author"`
-	Message      string          `json:"message"`
+	ID     graphcontract.ObjectID `json:"id"`
+	Commit graphcontract.Commit   `json:"commit"`
 }
 
 // PushRequest contains parameters for an incoming branch push.
@@ -27,7 +23,7 @@ type PushRequest struct {
 	BaseCommit   string
 	// Commits are the commit rows to register in PostgreSQL before advancing
 	// the branch ref. Callers should supply them oldest-ancestor-first so each
-	// record's parent is already registered by the time its row is inserted.
+	// record's parents are already registered by the time its row is inserted.
 	Commits []CommitRecord
 	// PackHash is the content-addressed hash of the raw packfile bytes written
 	// to CAS. It names and verifies the pack payload itself, unlike

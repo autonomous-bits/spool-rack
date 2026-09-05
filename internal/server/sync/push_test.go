@@ -12,6 +12,7 @@ import (
 
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/cas"
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/postgres"
+	"github.com/autonomous-bits/spool/graphcontract"
 	"lukechampine.com/blake3"
 )
 
@@ -94,9 +95,7 @@ func TestPushEngineHandlePushAcceptsOnlyCanonicalV2PackFrames(t *testing.T) {
 	req := PushRequest{
 		TenantID: "tenant-123", RepoID: "repo-456", Branch: "main",
 		BaseCommit: base, TargetCommit: target.ID,
-		Commits: []CommitRecord{{
-			ID: target.ID, Identity: &target, ParentID: base, SnapshotRoot: ContentID(object), Author: "Ada", Message: "v2 push",
-		}},
+		Commits:  []CommitRecord{mustCommitRecord(t, frameCommit)},
 		PackHash: ContentID(packData), PackFormat: PackFormatV2, PackStream: bytes.NewReader(packData),
 	}
 	validator := func(data []byte) error {
@@ -125,13 +124,13 @@ func TestPushEngineHandlePushAcceptsOnlyCanonicalV2PackFrames(t *testing.T) {
 		t.Fatalf("v2 frame object was not persisted: %q, %v", storedObject, err)
 	}
 
-	req.Commits[0].Message = "tampered metadata"
+	req.Commits[0].Commit.Message = "tampered metadata"
 	req.PackStream = bytes.NewReader(packData)
 	err = NewPushEngine(driver, &fakeBranchStore{branchHeads: map[string]string{"main": base}, commitFormat: map[string]uint32{base: CommitFormatV2}}, validator).HandlePush(context.Background(), req)
 	if !errors.Is(err, ErrInvalidFrame) {
 		t.Fatalf("HandlePush(tampered v2 metadata) error = %v, want frame error", err)
 	}
-	req.Commits[0].Message = "v2 push"
+	req.Commits[0].Commit.Message = "v2 push"
 
 	noncanonical := append([]byte{0xb8, 0x07}, packData[1:]...)
 	req.PackHash = ContentID(noncanonical)
@@ -140,6 +139,66 @@ func TestPushEngineHandlePushAcceptsOnlyCanonicalV2PackFrames(t *testing.T) {
 	err = NewPushEngine(driver, store, validator).HandlePush(context.Background(), req)
 	if !errors.Is(err, ErrInvalidCanonicalFrame) {
 		t.Fatalf("HandlePush(noncanonical v2) error = %v, want canonical frame error", err)
+	}
+}
+
+func TestPushEngineHandlePushRejectsMismatchedMergeParentMetadataAtomically(t *testing.T) {
+	t.Parallel()
+
+	base := hashString("merge base")
+	side := hashString("merge side")
+	snapshot := []byte("merge snapshot")
+	frameCommit := CommitFrameV2{
+		Version:      CommitFormatV2,
+		Parents:      []CommitIdentity{V2CommitIdentity(base), V2CommitIdentity(side)},
+		SnapshotRoot: ContentID(snapshot),
+		Author:       "Ada",
+		Message:      "native merge",
+	}
+	target, err := frameCommit.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pack, err := MarshalPackFrameV2(PackFrameV2{
+		Version: PackFormatV2, Base: V2CommitIdentity(base), Target: target,
+		Commits: []CommitFrameV2{frameCommit},
+		Objects: []PackObjectV2{{ID: ContentID(snapshot), Data: snapshot}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical := mustCommitRecord(t, frameCommit)
+	for _, test := range []struct {
+		name    string
+		parents []graphcontract.ObjectID
+	}{
+		{name: "reordered", parents: []graphcontract.ObjectID{graphcontract.ObjectID(side), graphcontract.ObjectID(base)}},
+		{name: "missing", parents: []graphcontract.ObjectID{graphcontract.ObjectID(base)}},
+		{name: "extra", parents: []graphcontract.ObjectID{graphcontract.ObjectID(base), graphcontract.ObjectID(side), graphcontract.ObjectID(hashString("extra parent"))}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			record := canonical
+			record.Commit = record.Commit.Clone()
+			record.Commit.Parents = test.parents
+			store := &fakeBranchStore{
+				branchHeads:  map[string]string{"main": base},
+				commitFormat: map[string]uint32{base: CommitFormatV2},
+			}
+			err := NewPushEngine(&fakeCASDriver{}, store, func([]byte) error { return nil }).HandlePush(context.Background(), PushRequest{
+				TenantID: "tenant-123", RepoID: "repo-456", Branch: "main",
+				BaseCommit: base, TargetCommit: target.ID, Commits: []CommitRecord{record},
+				PackHash: ContentID(pack), PackFormat: PackFormatV2, PackStream: bytes.NewReader(pack),
+			})
+			if !errors.Is(err, ErrInvalidFrame) {
+				t.Fatalf("HandlePush(%s parent metadata) error = %v, want invalid frame", test.name, err)
+			}
+			if len(store.putCommitCalls) != 0 || store.compareAndSwapCalls != 0 {
+				t.Fatalf("%s parent metadata mutated state: commits=%d branch updates=%d", test.name, len(store.putCommitCalls), store.compareAndSwapCalls)
+			}
+			if got := store.branchHeads["main"]; got != base {
+				t.Fatalf("%s parent metadata advanced branch to %q, want %q", test.name, got, base)
+			}
+		})
 	}
 }
 
@@ -173,7 +232,7 @@ func TestPushEngineHandlePushRejectsInvalidV2Snapshot(t *testing.T) {
 	store := &fakeBranchStore{branchHeads: map[string]string{"main": base}, commitFormat: map[string]uint32{base: CommitFormatV2}}
 	req := PushRequest{
 		TenantID: "tenant-123", RepoID: "repo-456", Branch: "main", BaseCommit: base, TargetCommit: target.ID,
-		Commits:  []CommitRecord{{ID: target.ID, Identity: &target, ParentID: base, SnapshotRoot: ContentID(object), Author: "Ada", Message: "invalid snapshot"}},
+		Commits:  []CommitRecord{mustCommitRecord(t, commit)},
 		PackHash: ContentID(pack), PackFormat: PackFormatV2, PackStream: bytes.NewReader(pack),
 	}
 	err = NewPushEngine(driver, store, func([]byte) error {
@@ -217,7 +276,7 @@ func TestPushEngineHandlePushRejectsV2BaseFormatMismatch(t *testing.T) {
 	store := &fakeBranchStore{branchHeads: map[string]string{"main": base}}
 	req := PushRequest{
 		TenantID: "tenant-123", RepoID: "repo-456", Branch: "main", BaseCommit: base, TargetCommit: target.ID,
-		Commits:  []CommitRecord{{ID: target.ID, Identity: &target, ParentID: base, SnapshotRoot: ContentID(object), Author: "Ada", Message: "mismatched parent format"}},
+		Commits:  []CommitRecord{mustCommitRecord(t, commit)},
 		PackHash: ContentID(pack), PackFormat: PackFormatV2, PackStream: bytes.NewReader(pack),
 	}
 	err = NewPushEngine(driver, store, func([]byte) error { return nil }).HandlePush(context.Background(), req)
@@ -238,7 +297,7 @@ func TestPushEngineHandlePushRejectsV2CommitInLegacyPack(t *testing.T) {
 	driver := &fakeCASDriver{}
 	err := NewPushEngine(driver, store).HandlePush(context.Background(), PushRequest{
 		TenantID: "tenant-123", RepoID: "repo-456", Branch: "main", BaseCommit: base, TargetCommit: target.ID,
-		Commits:  []CommitRecord{{ID: target.ID, Identity: &target, ParentID: base, SnapshotRoot: hashString("snapshot"), Author: "Ada", Message: "downgrade"}},
+		Commits:  []CommitRecord{{ID: graphcontract.ObjectID(target.ID)}},
 		PackHash: hashString("opaque legacy pack"), PackStream: bytes.NewReader([]byte("opaque legacy pack")),
 	})
 	if !errors.Is(err, ErrInvalidFrame) {
@@ -435,25 +494,19 @@ type casCallArgs struct {
 }
 
 type putCommitCall struct {
-	repoID       string
-	commitID     string
-	parentID     string
-	snapshotRoot string
-	author       string
-	message      string
+	repoID   string
+	commitID graphcontract.ObjectID
+	commit   graphcontract.Commit
 }
 
-func (f *fakeBranchStore) PutCommit(_ context.Context, repoID, commitID, parentCommitID, snapshotRoot, author, message string) error {
+func (f *fakeBranchStore) PutCommit(_ context.Context, repoID string, commitID graphcontract.ObjectID, commit graphcontract.Commit) error {
 	f.putCommitCalls = append(f.putCommitCalls, putCommitCall{
-		repoID:       repoID,
-		commitID:     commitID,
-		parentID:     parentCommitID,
-		snapshotRoot: snapshotRoot,
-		author:       author,
-		message:      message,
+		repoID:   repoID,
+		commitID: commitID,
+		commit:   commit,
 	})
-	f.callOrder = append(f.callOrder, "put:"+commitID)
-	if f.putCommitErr != nil && (f.putCommitErrFor == "" || f.putCommitErrFor == commitID) {
+	f.callOrder = append(f.callOrder, "put:"+string(commitID))
+	if f.putCommitErr != nil && (f.putCommitErrFor == "" || f.putCommitErrFor == string(commitID)) {
 		return f.putCommitErr
 	}
 	return nil
@@ -614,12 +667,22 @@ func nativePushRequest(t *testing.T, base, message string) PushRequest {
 	return PushRequest{
 		TenantID: "tenant-123", RepoID: "repo-456", Branch: "main",
 		BaseCommit: base, TargetCommit: target.ID,
-		Commits: []CommitRecord{{
-			ID: target.ID, Identity: &target, ParentID: base, SnapshotRoot: ContentID(snapshot),
-			Author: "alice", Message: message,
-		}},
+		Commits:  []CommitRecord{mustCommitRecord(t, commit)},
 		PackHash: ContentID(pack), PackStream: bytes.NewReader(pack),
 	}
+}
+
+func mustCommitRecord(t *testing.T, frame CommitFrameV2) CommitRecord {
+	t.Helper()
+	commit, err := frame.Commit()
+	if err != nil {
+		t.Fatalf("CommitFrameV2.Commit() error = %v", err)
+	}
+	id, err := CommitObjectID(commit)
+	if err != nil {
+		t.Fatalf("CommitObjectID() error = %v", err)
+	}
+	return CommitRecord{ID: id, Commit: commit}
 }
 
 func hashString(data string) string {

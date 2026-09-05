@@ -15,6 +15,7 @@ import (
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/cas"
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/postgres"
 	serversync "github.com/autonomous-bits/spool-rack/internal/server/sync"
+	"github.com/autonomous-bits/spool/graphcontract"
 	"lukechampine.com/blake3"
 )
 
@@ -317,10 +318,7 @@ func TestPushRejectsNonCanonicalV2Snapshot(t *testing.T) {
 		metadata: pushMetadata{
 			Branch: "main", BaseCommit: base, TargetCommit: target.ID, PackHash: serversync.ContentID(pack),
 			PackFormat: serversync.PackFormatV2,
-			Commits: []serversync.CommitRecord{{
-				ID: target.ID, Identity: &target, ParentID: base, SnapshotRoot: serversync.ContentID(snapshot),
-				Author: "Ada", Message: "reject invalid snapshot",
-			}},
+			Commits:    []serversync.CommitRecord{mustGatewayCommitRecord(t, commit)},
 		},
 		packData: pack,
 	})
@@ -390,10 +388,7 @@ func TestPushAcceptsCanonicalV2Snapshot(t *testing.T) {
 		metadata: pushMetadata{
 			Branch: "main", BaseCommit: base, TargetCommit: target.ID, PackHash: serversync.ContentID(pack),
 			PackFormat: serversync.PackFormatV2,
-			Commits: []serversync.CommitRecord{{
-				ID: target.ID, Identity: &target, ParentID: base, SnapshotRoot: serversync.ContentID(snapshot),
-				Author: "Ada", Message: "accept canonical snapshot",
-			}},
+			Commits:    []serversync.CommitRecord{mustGatewayCommitRecord(t, commit)},
 		},
 		packData: pack,
 	})
@@ -486,22 +481,16 @@ func (f *fakeGatewayBranchStore) SetTenantContext(ctx context.Context, _ string)
 }
 
 type gatewayPutCommitCall struct {
-	repoID       string
-	commitID     string
-	parentID     string
-	snapshotRoot string
-	author       string
-	message      string
+	repoID   string
+	commitID graphcontract.ObjectID
+	commit   graphcontract.Commit
 }
 
-func (f *fakeGatewayBranchStore) PutCommit(_ context.Context, repoID, commitID, parentCommitID, snapshotRoot, author, message string) error {
+func (f *fakeGatewayBranchStore) PutCommit(_ context.Context, repoID string, commitID graphcontract.ObjectID, commit graphcontract.Commit) error {
 	f.putCommitCalls = append(f.putCommitCalls, gatewayPutCommitCall{
-		repoID:       repoID,
-		commitID:     commitID,
-		parentID:     parentCommitID,
-		snapshotRoot: snapshotRoot,
-		author:       author,
-		message:      message,
+		repoID:   repoID,
+		commitID: commitID,
+		commit:   commit,
 	})
 	return f.putCommitErr
 }
@@ -590,6 +579,19 @@ func (f *fakeGatewayBranchStore) CompareAndSwapBranchRef(_ context.Context, repo
 }
 
 var _ serversync.BranchStore = (*fakeGatewayBranchStore)(nil)
+
+func mustGatewayCommitRecord(t *testing.T, frame serversync.CommitFrameV2) serversync.CommitRecord {
+	t.Helper()
+	commit, err := frame.Commit()
+	if err != nil {
+		t.Fatalf("CommitFrameV2.Commit() error = %v", err)
+	}
+	id, err := serversync.CommitObjectID(commit)
+	if err != nil {
+		t.Fatalf("CommitObjectID() error = %v", err)
+	}
+	return serversync.CommitRecord{ID: id, Commit: commit}
+}
 
 func hashPackBytes(data []byte) string {
 	sum := blake3.Sum256(data)

@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/autonomous-bits/spool/graphcontract"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -81,11 +82,9 @@ type Store interface {
 	// CreateBranch creates a branch ref within the tenant carried by ctx pointing
 	// at the supplied head commit.
 	CreateBranch(ctx context.Context, repoID, name, headCommitID string) error
-	// PutCommit inserts a content-addressed commit row (commitID is a caller-
-	// supplied BLAKE3 hex hash, not server-generated) scoped to the tenant
-	// carried by ctx. It is idempotent: re-registering an already-known
-	// commitID (e.g. a retried push) is a no-op rather than an error.
-	PutCommit(ctx context.Context, repoID, commitID, parentCommitID, snapshotRoot, author, message string) error
+	// PutCommit registers a canonical Spool commit and its complete ordered
+	// parent collection. It is idempotent only for identical immutable metadata.
+	PutCommit(ctx context.Context, repoID string, commitID graphcontract.ObjectID, commit graphcontract.Commit) error
 	// PutPackRange registers the immutable CAS pack created by a successful
 	// push and the contiguous commit range that it contains.
 	PutPackRange(ctx context.Context, repoID, packHash, baseCommitID, targetCommitID string) error
@@ -190,6 +189,7 @@ type ApplyMergeRequest struct {
 	PackHash       string
 	CommitFormat   uint32
 	PackFormat     uint32
+	CommitTime     time.Time
 }
 
 // PGStore is a PostgreSQL-backed implementation of Store.
@@ -304,75 +304,91 @@ func (s *PGStore) CreateBranch(ctx context.Context, repoID, name, headCommitID s
 
 // PutCommit inserts a content-addressed commit row scoped to the tenant
 // carried by ctx. Re-registering the same commitID is a no-op.
-func (s *PGStore) PutCommit(ctx context.Context, repoID, commitID, parentCommitID, snapshotRoot, author, message string) error {
-	return s.putCommit(ctx, repoID, commitID, parentCommitID, snapshotRoot, author, message, 1)
+func (s *PGStore) PutCommit(ctx context.Context, repoID string, commitID graphcontract.ObjectID, commit graphcontract.Commit) error {
+	return s.putCommit(ctx, repoID, commitID, commit, 1)
 }
 
-// PutCommitWithFormat records a commit using its explicit frame format. The
-// base Store interface remains legacy-compatible for existing JSON clients.
-func (s *PGStore) PutCommitWithFormat(ctx context.Context, repoID, commitID, parentCommitID, snapshotRoot, author, message string, format uint32) error {
+// PutCommitWithFormat records a commit using its explicit frame format.
+func (s *PGStore) PutCommitWithFormat(ctx context.Context, repoID string, commitID graphcontract.ObjectID, commit graphcontract.Commit, format uint32) error {
 	if !validObjectFormat(format) {
 		return fmt.Errorf("postgres: put commit for repo %s: unsupported object format %d", repoID, format)
 	}
-	return s.putCommit(ctx, repoID, commitID, parentCommitID, snapshotRoot, author, message, normalizeObjectFormat(format))
+	return s.putCommit(ctx, repoID, commitID, commit, normalizeObjectFormat(format))
 }
 
-func (s *PGStore) putCommit(ctx context.Context, repoID, commitID, parentCommitID, snapshotRoot, author, message string, format uint32) error {
+func (s *PGStore) putCommit(ctx context.Context, repoID string, commitID graphcontract.ObjectID, commit graphcontract.Commit, format uint32) error {
 	tenantID, err := requireTenantID(ctx)
 	if err != nil {
 		return fmt.Errorf("postgres: put commit for repo %s: %w", repoID, err)
 	}
-
-	var parent any
-	if parentCommitID != "" {
-		parent = parentCommitID
+	normalized, err := commit.Normalize()
+	if err != nil {
+		return fmt.Errorf("postgres: put commit for repo %s: canonical commit: %w", repoID, err)
 	}
 
 	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		result, err := tx.Exec(ctx, `
-			INSERT INTO commits (id, tenant_id, repo_id, parent_commit_id, snapshot_root, object_format, author, message)
+			INSERT INTO commits (id, tenant_id, repo_id, snapshot_root, object_format, author, message, commit_time)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 			ON CONFLICT (tenant_id, repo_id, id) DO NOTHING
-		`, commitID, tenantID, repoID, parent, snapshotRoot, format, author, message)
+		`, string(commitID), tenantID, repoID, string(normalized.Snapshot), format, normalized.Author, normalized.Message, normalized.Time)
 		if err != nil {
 			return fmt.Errorf("postgres: put commit for repo %s: insert commit: %w", repoID, err)
 		}
-		if result.RowsAffected() == 0 {
+		existingCommit := result.RowsAffected() == 0
+		if existingCommit {
 			var existing struct {
-				parent       *string
 				snapshotRoot string
 				format       uint32
 				author       string
 				message      string
+				time         time.Time
 			}
 			if err := tx.QueryRow(ctx, `
-				SELECT parent_commit_id, snapshot_root, object_format, author, message
+				SELECT snapshot_root, object_format, author, message, commit_time
 				FROM commits
 				WHERE tenant_id = $1 AND repo_id = $2 AND id = $3
 				FOR KEY SHARE
-			`, tenantID, repoID, commitID).Scan(
-				&existing.parent, &existing.snapshotRoot, &existing.format, &existing.author, &existing.message,
+			`, tenantID, repoID, string(commitID)).Scan(
+				&existing.snapshotRoot, &existing.format, &existing.author, &existing.message, &existing.time,
 			); err != nil {
 				return fmt.Errorf("postgres: put commit for repo %s: read existing commit: %w", repoID, err)
 			}
-			existingParent := ""
-			if existing.parent != nil {
-				existingParent = *existing.parent
-			}
-			if existingParent != parentCommitID || existing.snapshotRoot != snapshotRoot || existing.format != format ||
-				existing.author != author || existing.message != message {
+			if existing.snapshotRoot != string(normalized.Snapshot) || existing.format != format ||
+				existing.author != normalized.Author || existing.message != normalized.Message ||
+				!existing.time.Equal(normalized.Time) {
 				return ErrImmutableMetadataMismatch
+			}
+		}
+
+		existingParents, err := commitParentIDs(ctx, tx, repoID, string(commitID))
+		if err != nil {
+			return fmt.Errorf("postgres: put commit for repo %s: read existing parents: %w", repoID, err)
+		}
+		if existingCommit {
+			if len(existingParents) != len(normalized.Parents) {
+				return ErrImmutableMetadataMismatch
+			}
+			for i, parent := range normalized.Parents {
+				if existingParents[i] != string(parent) {
+					return ErrImmutableMetadataMismatch
+				}
 			}
 			return nil
 		}
-		if parentCommitID != "" {
-			if _, err := tx.Exec(ctx, `
-				INSERT INTO commit_parents (tenant_id, repo_id, commit_id, parent_position, parent_commit_id)
-				VALUES ($1, $2, $3, 1, $4)
-				ON CONFLICT (tenant_id, repo_id, commit_id, parent_position) DO NOTHING
-			`, tenantID, repoID, commitID, parentCommitID); err != nil {
-				return fmt.Errorf("postgres: put commit for repo %s: insert commit parent: %w", repoID, err)
-			}
+		if len(normalized.Parents) == 0 {
+			return nil
+		}
+		parentIDs := make([]string, len(normalized.Parents))
+		for i, parent := range normalized.Parents {
+			parentIDs[i] = string(parent)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO commit_parents (tenant_id, repo_id, commit_id, parent_position, parent_commit_id)
+			SELECT $1, $2, $3, parent_position, parent_commit_id
+			FROM unnest($4::text[]) WITH ORDINALITY AS parent(parent_commit_id, parent_position)
+		`, tenantID, repoID, string(commitID), parentIDs); err != nil {
+			return fmt.Errorf("postgres: put commit for repo %s: insert commit parents: %w", repoID, err)
 		}
 		return nil
 	}); err != nil {
@@ -639,10 +655,10 @@ func (s *PGStore) ApplyMerge(ctx context.Context, request ApplyMergeRequest) err
 		}
 
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO commits (id, tenant_id, repo_id, parent_commit_id, snapshot_root, object_format, author, message)
+			INSERT INTO commits (id, tenant_id, repo_id, snapshot_root, object_format, author, message, commit_time)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		`, request.ResultCommitID, tenantID, request.RepoID, request.TargetCommitID,
-			request.SnapshotRoot, normalizeObjectFormat(request.CommitFormat), request.Author, request.Message); err != nil {
+		`, request.ResultCommitID, tenantID, request.RepoID, request.SnapshotRoot,
+			normalizeObjectFormat(request.CommitFormat), request.Author, request.Message, request.CommitTime.UTC().Truncate(time.Second)); err != nil {
 			return fmt.Errorf("insert merge commit: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `
@@ -738,33 +754,16 @@ func (s *PGStore) IsAncestor(ctx context.Context, repoID, ancestorCommit, commit
 	var found bool
 	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		if err := tx.QueryRow(ctx, `
-			WITH RECURSIVE parent_links AS (
-				SELECT commit_id, parent_commit_id
-				FROM commit_parents
-				WHERE repo_id = $1
-				UNION ALL
-				SELECT c.id, c.parent_commit_id
-				FROM commits c
-				WHERE c.repo_id = $1
-					AND c.parent_commit_id IS NOT NULL
-					AND NOT EXISTS (
-						SELECT 1
-						FROM commit_parents cp
-						WHERE cp.tenant_id = c.tenant_id
-							AND cp.repo_id = c.repo_id
-							AND cp.commit_id = c.id
-							AND cp.parent_position = 1
-					)
-			), ancestry AS (
-				SELECT id, ARRAY[id]::text[] AS path
-				FROM commits
-				WHERE repo_id = $1 AND id = $2
-				UNION ALL
-				SELECT c.id, a.path || c.id
-				FROM ancestry a
-				JOIN parent_links p ON p.commit_id = a.id
-				JOIN commits c ON c.id = p.parent_commit_id
-				WHERE c.repo_id = $1
+				WITH RECURSIVE ancestry AS (
+					SELECT id, ARRAY[id]::text[] AS path
+					FROM commits
+					WHERE repo_id = $1 AND id = $2
+					UNION ALL
+					SELECT c.id, a.path || c.id
+					FROM ancestry a
+					JOIN commit_parents p ON p.commit_id = a.id
+					JOIN commits c ON c.id = p.parent_commit_id
+					WHERE p.repo_id = $1 AND c.repo_id = $1
 					AND NOT c.id = ANY(a.path)
 			)
 			SELECT EXISTS (SELECT 1 FROM ancestry WHERE id = $3)
@@ -940,7 +939,7 @@ func commitParentIDs(ctx context.Context, tx pgx.Tx, repoID, commitID string) ([
 	}
 	defer rows.Close()
 
-	parents := make([]string, 0, 2)
+	parents := make([]string, 0)
 	for rows.Next() {
 		var parentID string
 		if err := rows.Scan(&parentID); err != nil {
@@ -951,22 +950,7 @@ func commitParentIDs(ctx context.Context, tx pgx.Tx, repoID, commitID string) ([
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate commit parents: %w", err)
 	}
-	if len(parents) != 0 {
-		return parents, nil
-	}
-
-	var parent *string
-	if err := tx.QueryRow(ctx, `
-		SELECT parent_commit_id
-		FROM commits
-		WHERE repo_id = $1 AND id = $2
-	`, repoID, commitID).Scan(&parent); err != nil {
-		return nil, fmt.Errorf("query legacy parent: %w", err)
-	}
-	if parent == nil {
-		return parents, nil
-	}
-	return append(parents, *parent), nil
+	return parents, nil
 }
 
 func (s *PGStore) GetPackRanges(ctx context.Context, repoID, headCommitID, knownCommitID string) ([]PackRange, error) {

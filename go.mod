@@ -3,7 +3,7 @@ module github.com/autonomous-bits/spool-rack
 go 1.26.1
 
 require (
-	github.com/autonomous-bits/spool v1.3.0
+	github.com/autonomous-bits/spool v1.3.1-0.20260905220021-0a76e81d2988
 	github.com/fxamacker/cbor/v2 v2.9.3
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/klauspost/compress v1.20.0
