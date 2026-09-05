@@ -118,7 +118,7 @@ func TestPushEngineHandlePush_FastForwardSuccess(t *testing.T) {
 	}
 
 	if !packExistsUnderScopedLayout(t, rootDir, req.TenantID, req.RepoID) {
-		t.Fatalf("expected pack file somewhere under tenants/%s/repos/%s/packs/", req.TenantID, req.RepoID)
+		t.Fatalf("expected pack file somewhere under the scoped pack storage layout for tenant %q repo %q", req.TenantID, req.RepoID)
 	}
 }
 
@@ -476,7 +476,7 @@ func hashString(data string) string {
 func packExistsUnderScopedLayout(t *testing.T, rootDir, tenantID, repoID string) bool {
 	t.Helper()
 
-	expectedFragment := filepath.Join("tenants", tenantID, "repos", repoID, "packs") + string(filepath.Separator)
+	expectedFragment := filepath.Join("tenants", hashString(tenantID), "repos", hashString(repoID), "packs") + string(filepath.Separator)
 	found := false
 	err := filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {

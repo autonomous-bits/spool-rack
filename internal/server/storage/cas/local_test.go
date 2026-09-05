@@ -191,7 +191,7 @@ func TestInvalidHashRejected(t *testing.T) {
 // TestScopeTenantIsolation verifies that two distinct scopes never see each
 // other's objects, even when writing byte-identical content under the same
 // hash, and that each scope's data is physically partitioned on disk under
-// its own tenant/repository directory.
+// its own deterministic tenant/repository storage key.
 func TestScopeTenantIsolation(t *testing.T) {
 	d := newTestDriver(t)
 	ctx := context.Background()
@@ -241,11 +241,13 @@ func TestScopeTenantIsolation(t *testing.T) {
 	if pathA == pathB {
 		t.Fatal("scopes must resolve to distinct on-disk paths")
 	}
-	if !strings.Contains(pathA, filepath.Join("tenants", "tenant-a", "repos", "repo-1")) {
-		t.Fatalf("scopeA path %q does not contain expected tenant/repo partition", pathA)
+	expectedA := filepath.Join("tenants", scopeStorageKey("tenant-a"), "repos", scopeStorageKey("repo-1"))
+	if !strings.Contains(pathA, expectedA) {
+		t.Fatalf("scopeA path %q does not contain expected tenant/repo partition %q", pathA, expectedA)
 	}
-	if !strings.Contains(pathB, filepath.Join("tenants", "tenant-b", "repos", "repo-1")) {
-		t.Fatalf("scopeB path %q does not contain expected tenant/repo partition", pathB)
+	expectedB := filepath.Join("tenants", scopeStorageKey("tenant-b"), "repos", scopeStorageKey("repo-1"))
+	if !strings.Contains(pathB, expectedB) {
+		t.Fatalf("scopeB path %q does not contain expected tenant/repo partition %q", pathB, expectedB)
 	}
 }
 
