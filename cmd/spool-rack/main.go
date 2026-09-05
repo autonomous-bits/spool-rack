@@ -55,9 +55,9 @@ func main() {
 	addr := fmt.Sprintf(":%s", port)
 	log.Printf("Starting Spool Rack server v%s on %s...", version, addr)
 	if casRoot != "" && postgresDSN != "" {
-		log.Printf("Push endpoint enabled (CAS_ROOT=%s)", casRoot)
+		log.Printf("Push and pull endpoints enabled (CAS_ROOT=%s)", casRoot)
 	} else {
-		log.Printf("Push endpoint disabled: CAS_ROOT/POSTGRES_DSN not both configured")
+		log.Printf("Push and pull endpoints disabled: CAS_ROOT/POSTGRES_DSN not both configured")
 	}
 
 	if err := http.ListenAndServe(addr, gw.Routes()); err != nil && err != http.ErrServerClosed {

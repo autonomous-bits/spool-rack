@@ -45,5 +45,5 @@ type PullRequest struct {
 // Engine coordinates push and pull operations between local clients and remote storage.
 type Engine interface {
 	HandlePush(ctx context.Context, req PushRequest) error
-	HandlePull(ctx context.Context, req PullRequest, w io.Writer) error
+	HandlePull(ctx context.Context, req PullRequest, w io.Writer) (string, error)
 }

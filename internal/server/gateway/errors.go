@@ -18,6 +18,10 @@ const (
 	ErrorCodeConflict = "conflict"
 	// ErrorCodeNotImplemented identifies features not configured on this server.
 	ErrorCodeNotImplemented = "not_implemented"
+	// ErrorCodeNotFound identifies a requested branch or resource that does not exist.
+	ErrorCodeNotFound = "not_found"
+	// ErrorCodeInternal identifies an unexpected server-side failure.
+	ErrorCodeInternal = "internal_error"
 )
 
 type errorEnvelope struct {

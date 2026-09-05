@@ -10,6 +10,7 @@ import (
 
 	"github.com/autonomous-bits/spool-rack/internal/server/auth"
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/cas"
+	"github.com/autonomous-bits/spool-rack/internal/server/storage/postgres"
 	serversync "github.com/autonomous-bits/spool-rack/internal/server/sync"
 )
 
@@ -20,6 +21,7 @@ type Gateway struct {
 	casDriver   cas.Driver
 	branchStore serversync.BranchStore
 	pushEngine  *serversync.PushEngine
+	pullEngine  *serversync.PullEngine
 	mux         *http.ServeMux
 }
 
@@ -63,6 +65,7 @@ func New(opts ...Option) *Gateway {
 	}
 	if g.casDriver != nil && g.branchStore != nil {
 		g.pushEngine = serversync.NewPushEngine(g.casDriver, g.branchStore)
+		g.pullEngine = serversync.NewPullEngine(g.casDriver, g.branchStore)
 	}
 	g.registerRoutes()
 	return g
@@ -84,6 +87,78 @@ func (g *Gateway) registerRoutes() {
 			),
 		),
 	)
+	g.mux.Handle("GET /api/v1/repos/{repo}/pull",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleViewer)(http.HandlerFunc(g.handlePull)),
+			),
+		),
+	)
+}
+
+func (g *Gateway) handlePull(w http.ResponseWriter, r *http.Request) {
+	if g.pullEngine == nil {
+		writeJSONError(w, r, g.logger, http.StatusNotImplemented, ErrorCodeNotImplemented, "pull is not configured on this server")
+		return
+	}
+
+	branch := r.URL.Query().Get("branch")
+	knownCommit := r.URL.Query().Get("knownCommit")
+	if branch == "" {
+		writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "branch query parameter is required")
+		return
+	}
+
+	tenantID, _ := TenantIDFromContext(r.Context())
+	scope, _ := ScopeFromContext(r.Context())
+	req := serversync.PullRequest{
+		TenantID:    tenantID,
+		RepoID:      scope.RepoID(),
+		Branch:      branch,
+		KnownCommit: knownCommit,
+	}
+
+	plan, err := g.pullEngine.PreparePull(r.Context(), req)
+	if errors.Is(err, serversync.UpToDateError) {
+		w.Header().Set("X-Spool-Head-Commit", plan.Head)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if errors.Is(err, serversync.ErrPullDiverged) {
+		w.Header().Del("Content-Encoding")
+		var divergence *serversync.PullDivergedError
+		if errors.As(err, &divergence) {
+			writeJSONErrorEnvelope(w, r, g.logger, http.StatusConflict, errorEnvelope{
+				Error:       ErrorCodeConflict,
+				Message:     "known commit is not an ancestor of the remote branch head",
+				CurrentHead: divergence.CurrentHead,
+			})
+			return
+		}
+	}
+	if errors.Is(err, postgres.ErrBranchNotFound) {
+		writeJSONError(w, r, g.logger, http.StatusNotFound, ErrorCodeNotFound, "branch not found")
+		return
+	}
+	if err != nil {
+		writeJSONError(w, r, g.logger, http.StatusInternalServerError, ErrorCodeInternal, "failed to prepare pull")
+		return
+	}
+	if err := g.pullEngine.ValidatePullPacks(r.Context(), plan); err != nil {
+		writeJSONError(w, r, g.logger, http.StatusInternalServerError, ErrorCodeInternal, "failed to open pull pack")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Encoding", "zstd")
+	w.Header().Set("X-Spool-Head-Commit", plan.Head)
+	if err := g.pullEngine.StreamPull(r.Context(), plan, w); err != nil {
+		logger := g.logger
+		if logger == nil {
+			logger = defaultLogger
+		}
+		logger.Error("pull stream failed", "path", r.URL.Path, "error", err)
+	}
 }
 
 func (g *Gateway) handleHealthz(w http.ResponseWriter, r *http.Request) {

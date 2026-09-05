@@ -83,6 +83,7 @@ func TestPushEngineHandlePush_FastForwardSuccess(t *testing.T) {
 	wantOrder := []string{
 		"put:" + targetParent,
 		"put:" + targetCommit,
+		"pack",
 		"get",
 		"cas",
 	}
@@ -331,6 +332,10 @@ type fakeBranchStore struct {
 	callOrder           []string
 }
 
+func (f *fakeBranchStore) SetTenantContext(ctx context.Context, _ string) (context.Context, error) {
+	return ctx, nil
+}
+
 type casCallArgs struct {
 	repoID         string
 	branch         string
@@ -361,6 +366,15 @@ func (f *fakeBranchStore) PutCommit(_ context.Context, repoID, commitID, parentC
 		return f.putCommitErr
 	}
 	return nil
+}
+
+func (f *fakeBranchStore) PutPackRange(context.Context, string, string, string, string) error {
+	f.callOrder = append(f.callOrder, "pack")
+	return nil
+}
+
+func (f *fakeBranchStore) GetPackRanges(context.Context, string, string, string) ([]postgres.PackRange, error) {
+	panic("unexpected GetPackRanges call")
 }
 
 func (f *fakeBranchStore) GetBranchRef(_ context.Context, _ string, branch string) (string, error) {

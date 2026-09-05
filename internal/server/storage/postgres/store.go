@@ -56,6 +56,9 @@ type Store interface {
 	// carried by ctx. It is idempotent: re-registering an already-known
 	// commitID (e.g. a retried push) is a no-op rather than an error.
 	PutCommit(ctx context.Context, repoID, commitID, parentCommitID, snapshotRoot, author, message string) error
+	// PutPackRange registers the immutable CAS pack created by a successful
+	// push and the contiguous commit range that it contains.
+	PutPackRange(ctx context.Context, repoID, packHash, baseCommitID, targetCommitID string) error
 	// GetBranchRef resolves the commit identifier for a named branch.
 	GetBranchRef(ctx context.Context, repoID, branch string) (string, error)
 	// IsAncestor reports whether ancestorCommit is reachable by walking the
@@ -65,8 +68,19 @@ type Store interface {
 	// per req-ancestry-verified-remote-fast-forward. If commit does not exist
 	// in the repository, IsAncestor returns false, nil.
 	IsAncestor(ctx context.Context, repoID, ancestorCommit, commit string) (bool, error)
+	// GetPackRanges returns the pack ranges required to reconstruct the
+	// history from headCommitID back to knownCommitID. Ranges are returned
+	// newest-first so callers can validate the chain and stream it in reverse.
+	GetPackRanges(ctx context.Context, repoID, headCommitID, knownCommitID string) ([]PackRange, error)
 	// CompareAndSwapBranchRef updates a branch ref only if current matches expected.
 	CompareAndSwapBranchRef(ctx context.Context, repoID, branch, expectedCommit, newCommit string) error
+}
+
+// PackRange identifies one immutable pack and the commit interval it contains.
+type PackRange struct {
+	PackHash       string
+	BaseCommitID   string
+	TargetCommitID string
 }
 
 // PGStore is a PostgreSQL-backed implementation of Store.
@@ -210,6 +224,33 @@ func (s *PGStore) PutCommit(ctx context.Context, repoID, commitID, parentCommitI
 	return nil
 }
 
+// PutPackRange records the commit range carried by an immutable CAS pack.
+func (s *PGStore) PutPackRange(ctx context.Context, repoID, packHash, baseCommitID, targetCommitID string) error {
+	tenantID, err := requireTenantID(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres: put pack range for repo %s: %w", repoID, err)
+	}
+
+	var base any
+	if baseCommitID != "" {
+		base = baseCommitID
+	}
+
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO pack_ranges (tenant_id, repo_id, pack_hash, base_commit_id, target_commit_id)
+			VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT (tenant_id, repo_id, pack_hash) DO NOTHING
+		`, tenantID, repoID, packHash, base, targetCommitID); err != nil {
+			return fmt.Errorf("postgres: put pack range for repo %s: insert pack range: %w", repoID, err)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
 // GetBranchRef resolves the current head commit for branch in repoID.
 func (s *PGStore) GetBranchRef(ctx context.Context, repoID, branch string) (string, error) {
 	if _, err := requireTenantID(ctx); err != nil {
@@ -264,6 +305,51 @@ func (s *PGStore) IsAncestor(ctx context.Context, repoID, ancestorCommit, commit
 	}
 
 	return found, nil
+}
+
+// GetPackRanges traverses packs from a branch head toward a known ancestor.
+func (s *PGStore) GetPackRanges(ctx context.Context, repoID, headCommitID, knownCommitID string) ([]PackRange, error) {
+	if _, err := requireTenantID(ctx); err != nil {
+		return nil, fmt.Errorf("postgres: get pack ranges: %w", err)
+	}
+
+	ranges := make([]PackRange, 0)
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			WITH RECURSIVE pack_chain AS (
+				SELECT pack_hash, base_commit_id, target_commit_id, 0 AS depth
+				FROM pack_ranges
+				WHERE repo_id = $1 AND target_commit_id = $2
+				UNION ALL
+				SELECT p.pack_hash, p.base_commit_id, p.target_commit_id, c.depth + 1
+				FROM pack_ranges p
+				JOIN pack_chain c ON p.target_commit_id = c.base_commit_id
+				WHERE p.repo_id = $1 AND c.base_commit_id IS NOT NULL AND c.base_commit_id <> $3
+			)
+			SELECT pack_hash, COALESCE(base_commit_id, ''), target_commit_id
+			FROM pack_chain
+			ORDER BY depth ASC
+		`, repoID, headCommitID, knownCommitID)
+		if err != nil {
+			return fmt.Errorf("postgres: get pack ranges: query pack chain: %w", err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var pack PackRange
+			if err := rows.Scan(&pack.PackHash, &pack.BaseCommitID, &pack.TargetCommitID); err != nil {
+				return fmt.Errorf("postgres: get pack ranges: scan pack range: %w", err)
+			}
+			ranges = append(ranges, pack)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("postgres: get pack ranges: iterate pack ranges: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return ranges, nil
 }
 
 // CompareAndSwapBranchRef updates a branch head only when it still points at
