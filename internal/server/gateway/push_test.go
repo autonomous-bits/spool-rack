@@ -251,6 +251,57 @@ func TestPushRejectsNonMultipartBody(t *testing.T) {
 	assertErrorCode(t, rec, ErrorCodeBadRequest)
 }
 
+func TestPushRejectsInvalidPackHash(t *testing.T) {
+	t.Parallel()
+
+	driver, err := cas.NewLocalDriver(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewLocalDriver() error = %v", err)
+	}
+
+	baseCommit := hashCommitString("commit-a")
+	store := &fakeGatewayBranchStore{
+		branchHeads: map[gatewayBranchKey]string{
+			{repoID: "repo-1", branch: "main"}: baseCommit,
+		},
+	}
+	gw := New(
+		WithCASDriver(driver),
+		WithBranchStore(store),
+		WithVerifier(auth.NewStaticVerifier(map[string]auth.Claims{
+			"contributor-token": {Role: auth.RoleContributor, Subject: "u4"},
+		})),
+	)
+
+	req := newPushRequest(t, pushRequestFixture{
+		token:    "contributor-token",
+		tenantID: "tenant-1",
+		repoID:   "repo-1",
+		metadata: pushMetadata{
+			Branch:       "main",
+			BaseCommit:   baseCommit,
+			TargetCommit: hashCommitString("commit-b"),
+			PackHash:     "../etc/passwd",
+		},
+		packData: []byte("invalid pack hash should never be written"),
+	})
+	rec := httptest.NewRecorder()
+
+	gw.Routes().ServeHTTP(rec, req)
+
+	assertStatus(t, rec, http.StatusBadRequest)
+	assertErrorCode(t, rec, ErrorCodeBadRequest)
+	if len(store.putCommitCalls) != 0 {
+		t.Fatalf("PutCommit() calls = %d, want 0", len(store.putCommitCalls))
+	}
+	if store.getBranchRefCalls != 0 {
+		t.Fatalf("GetBranchRef() calls = %d, want 0", store.getBranchRefCalls)
+	}
+	if store.compareAndSwapCalls != 0 {
+		t.Fatalf("CompareAndSwapBranchRef() calls = %d, want 0", store.compareAndSwapCalls)
+	}
+}
+
 func TestPushReturnsNotImplementedWhenUnconfigured(t *testing.T) {
 	t.Parallel()
 

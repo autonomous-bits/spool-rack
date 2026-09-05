@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 
 	"github.com/autonomous-bits/spool-rack/internal/server/auth"
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/cas"
@@ -131,6 +132,8 @@ type pushMetadata struct {
 	Commits      []serversync.CommitRecord `json:"commits,omitempty"`
 }
 
+var pushPackHashPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
 func (g *Gateway) handlePush(w http.ResponseWriter, r *http.Request) {
 	if g.pushEngine == nil {
 		writeJSONError(w, r, g.logger, http.StatusNotImplemented, ErrorCodeNotImplemented, "push is not configured on this server")
@@ -168,6 +171,11 @@ func (g *Gateway) handlePush(w http.ResponseWriter, r *http.Request) {
 			if err := dec.Decode(&meta); err != nil {
 				_ = part.Close()
 				writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "metadata part must contain valid JSON")
+				return
+			}
+			if !pushPackHashPattern.MatchString(meta.PackHash) {
+				_ = part.Close()
+				writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "packHash must be 64 lowercase hex characters")
 				return
 			}
 			sawMetadataPart = true
