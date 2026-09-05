@@ -25,9 +25,16 @@ const (
 var schemaSQL string
 
 var putCommitCounter uint64
+var postgresTestDatabaseMu sync.Mutex
 
 func newTestStore(t *testing.T) (*PGStore, context.Context) {
 	t.Helper()
+
+	// The integration tests share one database and schema bootstrap truncates
+	// every tenant table. Keep a test's setup, execution, and cleanup together
+	// even when another caller marks its test parallel.
+	postgresTestDatabaseMu.Lock()
+	t.Cleanup(postgresTestDatabaseMu.Unlock)
 
 	adminDSN := getenvDefault("TEST_POSTGRES_ADMIN_DSN", defaultTestPostgresAdminDSN)
 	appDSN := getenvDefault("TEST_POSTGRES_APP_DSN", defaultTestPostgresAppDSN)
@@ -241,6 +248,51 @@ func TestCompareAndSwapBranchRef_NotFound(t *testing.T) {
 	err := store.CompareAndSwapBranchRef(tenantCtx, repoID, "missing", commitID, commitID)
 	if !errors.Is(err, ErrBranchNotFound) {
 		t.Fatalf("CompareAndSwapBranchRef missing branch: expected ErrBranchNotFound, got %v", err)
+	}
+}
+
+func TestCompareAndSwapBranchRef_RespectsTargetBranchMergeLease(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-cas-merge-lease")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoID := mustCreateRepository(t, store, tenantCtx, "repo-cas-merge-lease")
+	base := mustPutCommit(t, store, tenantCtx, repoID, "", "snap-base", "alice", "base")
+	target := mustPutCommit(t, store, tenantCtx, repoID, base, "snap-target", "alice", "target")
+	next := mustPutCommit(t, store, tenantCtx, repoID, target, "snap-next", "alice", "next")
+	source := mustPutCommit(t, store, tenantCtx, repoID, base, "snap-source", "bob", "source")
+	mustCreateBranch(t, store, tenantCtx, repoID, "main", target)
+
+	_, err := store.AcquireMergeLease(tenantCtx, MergeLeaseRequest{
+		RepoID: repoID, TargetBranch: "main", Subject: "alice",
+		SourceCommitID: source, TargetCommitID: target, BaseCommitID: base, Duration: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("AcquireMergeLease active: %v", err)
+	}
+	if err := store.CompareAndSwapBranchRef(tenantCtx, repoID, "main", target, next); !errors.Is(err, ErrMergeLeaseHeld) {
+		t.Fatalf("CompareAndSwapBranchRef active lease: expected ErrMergeLeaseHeld, got %v", err)
+	}
+	head, err := store.GetBranchRef(tenantCtx, repoID, "main")
+	if err != nil || head != target {
+		t.Fatalf("GetBranchRef after rejected CAS = (%q, %v), want (%q, nil)", head, err, target)
+	}
+
+	mustCreateBranch(t, store, tenantCtx, repoID, "expired", target)
+	_, err = store.AcquireMergeLease(tenantCtx, MergeLeaseRequest{
+		RepoID: repoID, TargetBranch: "expired", Subject: "alice",
+		SourceCommitID: source, TargetCommitID: target, BaseCommitID: base, Duration: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("AcquireMergeLease expired: %v", err)
+	}
+	time.Sleep(60 * time.Millisecond)
+	if err := store.CompareAndSwapBranchRef(tenantCtx, repoID, "expired", target, next); err != nil {
+		t.Fatalf("CompareAndSwapBranchRef expired lease: %v", err)
+	}
+	head, err = store.GetBranchRef(tenantCtx, repoID, "expired")
+	if err != nil || head != next {
+		t.Fatalf("GetBranchRef after expired lease CAS = (%q, %v), want (%q, nil)", head, err, next)
 	}
 }
 
@@ -557,5 +609,289 @@ func TestCreateTenant_DuplicateName(t *testing.T) {
 	_, err := store.CreateTenant(ctx, "duplicate-tenant")
 	if !errors.Is(err, ErrTenantNameConflict) {
 		t.Fatalf("CreateTenant duplicate: expected ErrTenantNameConflict, got %v", err)
+	}
+}
+
+func TestMergeLease_ContentionOwnershipAndExpiry(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-merge-lease")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoID := mustCreateRepository(t, store, tenantCtx, "repo-merge-lease")
+	base := mustPutCommit(t, store, tenantCtx, repoID, "", "snap-base", "alice", "base")
+	target := mustPutCommit(t, store, tenantCtx, repoID, base, "snap-target", "alice", "target")
+	source := mustPutCommit(t, store, tenantCtx, repoID, base, "snap-source", "bob", "source")
+	mustCreateBranch(t, store, tenantCtx, repoID, "main", target)
+
+	request := MergeLeaseRequest{
+		RepoID: repoID, TargetBranch: "main", Subject: "alice",
+		SourceCommitID: source, TargetCommitID: target, BaseCommitID: base,
+		Duration: time.Second,
+	}
+	lease, err := store.AcquireMergeLease(tenantCtx, request)
+	if err != nil {
+		t.Fatalf("AcquireMergeLease: %v", err)
+	}
+	if lease.Token == "" || lease.ExpiresAt.Before(time.Now()) {
+		t.Fatalf("AcquireMergeLease returned invalid lease: %+v", lease)
+	}
+
+	request.Subject = "bob"
+	if _, err := store.AcquireMergeLease(tenantCtx, request); !errors.Is(err, ErrMergeLeaseHeld) {
+		t.Fatalf("competing AcquireMergeLease: expected ErrMergeLeaseHeld, got %v", err)
+	}
+	if _, err := store.ValidateMergeLease(tenantCtx, repoID, "main", "bob", lease.Token); !errors.Is(err, ErrMergeLeaseOwnership) {
+		t.Fatalf("ValidateMergeLease foreign subject: expected ErrMergeLeaseOwnership, got %v", err)
+	}
+	validated, err := store.ValidateMergeLease(tenantCtx, repoID, "main", "alice", lease.Token)
+	if err != nil {
+		t.Fatalf("ValidateMergeLease owner: %v", err)
+	}
+	if validated.SourceCommitID != source || validated.TargetCommitID != target || validated.BaseCommitID != base {
+		t.Fatalf("ValidateMergeLease identities = %+v, want source=%q target=%q base=%q", validated, source, target, base)
+	}
+
+	shortRequest := MergeLeaseRequest{
+		RepoID: repoID, TargetBranch: "main", Subject: "alice",
+		SourceCommitID: source, TargetCommitID: target, BaseCommitID: base,
+		Duration: 20 * time.Millisecond,
+	}
+	// A separate branch avoids waiting for the deliberately active lease.
+	mustCreateBranch(t, store, tenantCtx, repoID, "release", target)
+	shortRequest.TargetBranch = "release"
+	expiring, err := store.AcquireMergeLease(tenantCtx, shortRequest)
+	if err != nil {
+		t.Fatalf("AcquireMergeLease short: %v", err)
+	}
+	time.Sleep(60 * time.Millisecond)
+	if _, err := store.ValidateMergeLease(tenantCtx, repoID, "release", "alice", expiring.Token); !errors.Is(err, ErrMergeLeaseExpired) {
+		t.Fatalf("ValidateMergeLease expired: expected ErrMergeLeaseExpired, got %v", err)
+	}
+	shortRequest.Subject = "bob"
+	replacement, err := store.AcquireMergeLease(tenantCtx, shortRequest)
+	if err != nil {
+		t.Fatalf("AcquireMergeLease replacement: %v", err)
+	}
+	if replacement.Token == expiring.Token || replacement.Subject != "bob" {
+		t.Fatalf("replacement lease = %+v, want a distinct bob-owned token", replacement)
+	}
+}
+
+func TestMergeLease_ConcurrentContendersHaveOneWinner(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-merge-lease-race")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoID := mustCreateRepository(t, store, tenantCtx, "repo-merge-lease-race")
+	base := mustPutCommit(t, store, tenantCtx, repoID, "", "snap-base", "alice", "base")
+	target := mustPutCommit(t, store, tenantCtx, repoID, base, "snap-target", "alice", "target")
+	source := mustPutCommit(t, store, tenantCtx, repoID, base, "snap-source", "bob", "source")
+	mustCreateBranch(t, store, tenantCtx, repoID, "main", target)
+
+	const contenders = 8
+	start := make(chan struct{})
+	errs := make([]error, contenders)
+	var wg sync.WaitGroup
+	wg.Add(contenders)
+	for i := 0; i < contenders; i++ {
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, errs[i] = store.AcquireMergeLease(tenantCtx, MergeLeaseRequest{
+				RepoID: repoID, TargetBranch: "main", Subject: fmt.Sprintf("reviewer-%d", i),
+				SourceCommitID: source, TargetCommitID: target, BaseCommitID: base, Duration: time.Minute,
+			})
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	winners := 0
+	for i, err := range errs {
+		switch {
+		case err == nil:
+			winners++
+		case errors.Is(err, ErrMergeLeaseHeld):
+		default:
+			t.Fatalf("AcquireMergeLease contender %d: unexpected error %v", i, err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("AcquireMergeLease winners = %d, want 1", winners)
+	}
+}
+
+func TestReleaseMergeLease_RequiresMatchingOwner(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-release-merge-lease")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoID := mustCreateRepository(t, store, tenantCtx, "repo-release-merge-lease")
+	base := mustPutCommit(t, store, tenantCtx, repoID, "", "snap-base", "alice", "base")
+	target := mustPutCommit(t, store, tenantCtx, repoID, base, "snap-target", "alice", "target")
+	source := mustPutCommit(t, store, tenantCtx, repoID, base, "snap-source", "bob", "source")
+	mustCreateBranch(t, store, tenantCtx, repoID, "main", target)
+	lease, err := store.AcquireMergeLease(tenantCtx, MergeLeaseRequest{
+		RepoID: repoID, TargetBranch: "main", Subject: "alice",
+		SourceCommitID: source, TargetCommitID: target, BaseCommitID: base, Duration: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("AcquireMergeLease: %v", err)
+	}
+
+	if err := store.ReleaseMergeLease(tenantCtx, repoID, "main", "bob", lease.Token); !errors.Is(err, ErrMergeLeaseOwnership) {
+		t.Fatalf("ReleaseMergeLease wrong subject: expected ErrMergeLeaseOwnership, got %v", err)
+	}
+	if err := store.ReleaseMergeLease(tenantCtx, repoID, "main", "alice", "wrong-token"); !errors.Is(err, ErrMergeLeaseOwnership) {
+		t.Fatalf("ReleaseMergeLease wrong token: expected ErrMergeLeaseOwnership, got %v", err)
+	}
+	if _, err := store.ValidateMergeLease(tenantCtx, repoID, "main", "alice", lease.Token); err != nil {
+		t.Fatalf("lease after rejected releases: %v", err)
+	}
+
+	if err := store.ReleaseMergeLease(tenantCtx, repoID, "main", "alice", lease.Token); err != nil {
+		t.Fatalf("ReleaseMergeLease owner: %v", err)
+	}
+	if _, err := store.ValidateMergeLease(tenantCtx, repoID, "main", "alice", lease.Token); !errors.Is(err, ErrMergeLeaseNotFound) {
+		t.Fatalf("released lease validation: expected ErrMergeLeaseNotFound, got %v", err)
+	}
+	if err := store.ReleaseMergeLease(tenantCtx, repoID, "main", "alice", lease.Token); !errors.Is(err, ErrMergeLeaseNotFound) {
+		t.Fatalf("ReleaseMergeLease absent: expected ErrMergeLeaseNotFound, got %v", err)
+	}
+	if err := store.ReleaseMergeLease(context.Background(), repoID, "main", "alice", lease.Token); !errors.Is(err, ErrMissingTenantContext) {
+		t.Fatalf("ReleaseMergeLease no tenant context: expected ErrMissingTenantContext, got %v", err)
+	}
+}
+
+func TestApplyMerge_RegistersDAGAndConsumesOwnedLease(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-apply-merge")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoID := mustCreateRepository(t, store, tenantCtx, "repo-apply-merge")
+	root := mustPutCommit(t, store, tenantCtx, repoID, "", "snap-root", "alice", "root")
+	base := mustPutCommit(t, store, tenantCtx, repoID, root, "snap-base", "alice", "base")
+	target := mustPutCommit(t, store, tenantCtx, repoID, base, "snap-target", "alice", "target")
+	source := mustPutCommit(t, store, tenantCtx, repoID, base, "snap-source", "bob", "source")
+	mustCreateBranch(t, store, tenantCtx, repoID, "main", target)
+
+	lease, err := store.AcquireMergeLease(tenantCtx, MergeLeaseRequest{
+		RepoID: repoID, TargetBranch: "main", Subject: "alice",
+		SourceCommitID: source, TargetCommitID: target, BaseCommitID: base, Duration: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("AcquireMergeLease: %v", err)
+	}
+	result := testCommitID(t.Name(), "merge-result")
+	apply := ApplyMergeRequest{
+		RepoID: repoID, TargetBranch: "main", Subject: "alice", LeaseToken: lease.Token,
+		SourceCommitID: source, TargetCommitID: target, BaseCommitID: base,
+		ResultCommitID: result, SnapshotRoot: "snap-merge", Author: "alice",
+		Message: "merge source", PackHash: testCommitID(t.Name(), "merge-pack"),
+	}
+	if err := store.ApplyMerge(tenantCtx, apply); err != nil {
+		t.Fatalf("ApplyMerge: %v", err)
+	}
+
+	head, err := store.GetBranchRef(tenantCtx, repoID, "main")
+	if err != nil || head != result {
+		t.Fatalf("GetBranchRef after ApplyMerge = (%q, %v), want (%q, nil)", head, err, result)
+	}
+	if _, err := store.ValidateMergeLease(tenantCtx, repoID, "main", "alice", lease.Token); !errors.Is(err, ErrMergeLeaseNotFound) {
+		t.Fatalf("ValidateMergeLease consumed lease: expected ErrMergeLeaseNotFound, got %v", err)
+	}
+	var (
+		legacyParent string
+		parents      []string
+		packBase     string
+		packTarget   string
+	)
+	if err := store.withTenantTx(tenantCtx, func(ctx context.Context, tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT parent_commit_id FROM commits WHERE repo_id = $1 AND id = $2`, repoID, result).Scan(&legacyParent); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT parent_commit_id FROM commit_parents
+			WHERE repo_id = $1 AND commit_id = $2
+			ORDER BY parent_position
+		`, repoID, result)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var parent string
+			if err := rows.Scan(&parent); err != nil {
+				return err
+			}
+			parents = append(parents, parent)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `
+			SELECT base_commit_id, target_commit_id
+			FROM pack_ranges WHERE repo_id = $1 AND pack_hash = $2
+		`, repoID, apply.PackHash).Scan(&packBase, &packTarget)
+	}); err != nil {
+		t.Fatalf("query ApplyMerge records: %v", err)
+	}
+	if legacyParent != target {
+		t.Fatalf("legacy merge parent = %q, want target %q", legacyParent, target)
+	}
+	if len(parents) != 2 || parents[0] != target || parents[1] != source {
+		t.Fatalf("ordered merge parents = %q, want [%q %q]", parents, target, source)
+	}
+	if packBase != target || packTarget != result {
+		t.Fatalf("merge pack range = (%q, %q), want (%q, %q)", packBase, packTarget, target, result)
+	}
+
+	for _, check := range []struct {
+		ancestor string
+		commit   string
+	}{
+		{source, result},
+		{target, result},
+		{root, result},
+	} {
+		got, err := store.IsAncestor(tenantCtx, repoID, check.ancestor, check.commit)
+		if err != nil || !got {
+			t.Fatalf("IsAncestor(%q, %q) = (%t, %v), want (true, nil)", check.ancestor, check.commit, got, err)
+		}
+	}
+	got, err := store.FindLowestCommonAncestor(tenantCtx, repoID, result, source)
+	if err != nil || got != source {
+		t.Fatalf("FindLowestCommonAncestor(merge, source) = (%q, %v), want (%q, nil)", got, err, source)
+	}
+}
+
+func TestApplyMerge_RejectsWrongOwnerWithoutConsumingLease(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-merge-wrong-owner")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoID := mustCreateRepository(t, store, tenantCtx, "repo-merge-wrong-owner")
+	base := mustPutCommit(t, store, tenantCtx, repoID, "", "snap-base", "alice", "base")
+	target := mustPutCommit(t, store, tenantCtx, repoID, base, "snap-target", "alice", "target")
+	source := mustPutCommit(t, store, tenantCtx, repoID, base, "snap-source", "bob", "source")
+	mustCreateBranch(t, store, tenantCtx, repoID, "main", target)
+	lease, err := store.AcquireMergeLease(tenantCtx, MergeLeaseRequest{
+		RepoID: repoID, TargetBranch: "main", Subject: "alice",
+		SourceCommitID: source, TargetCommitID: target, BaseCommitID: base, Duration: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("AcquireMergeLease: %v", err)
+	}
+	err = store.ApplyMerge(tenantCtx, ApplyMergeRequest{
+		RepoID: repoID, TargetBranch: "main", Subject: "mallory", LeaseToken: lease.Token,
+		SourceCommitID: source, TargetCommitID: target, BaseCommitID: base,
+		ResultCommitID: testCommitID(t.Name(), "result"), SnapshotRoot: "snap-merge",
+		Author: "mallory", Message: "unauthorized", PackHash: testCommitID(t.Name(), "pack"),
+	})
+	if !errors.Is(err, ErrMergeLeaseOwnership) {
+		t.Fatalf("ApplyMerge wrong owner: expected ErrMergeLeaseOwnership, got %v", err)
+	}
+	if _, err := store.ValidateMergeLease(tenantCtx, repoID, "main", "alice", lease.Token); err != nil {
+		t.Fatalf("owner lease after rejected ApplyMerge: %v", err)
 	}
 }

@@ -24,6 +24,7 @@ type Gateway struct {
 	pushEngine    *serversync.PushEngine
 	pullEngine    *serversync.PullEngine
 	previewEngine review.Engine
+	mergeEngine   review.Finalizer
 	mux           *http.ServeMux
 }
 
@@ -56,6 +57,11 @@ func WithPreviewEngine(engine review.Engine) Option {
 	return func(g *Gateway) { g.previewEngine = engine }
 }
 
+// WithMergeEngine configures the write-side merge lease and apply engine.
+func WithMergeEngine(engine review.Finalizer) Option {
+	return func(g *Gateway) { g.mergeEngine = engine }
+}
+
 // New constructs an initialized API Gateway. When no verifier is provided,
 // it defaults to auth.PermissiveVerifier{} for zero-config local development
 // and MVP wiring; this MUST be overridden with WithVerifier before any
@@ -76,6 +82,11 @@ func New(opts ...Option) *Gateway {
 		if g.previewEngine == nil {
 			if metadataStore, ok := g.branchStore.(review.MetadataStore); ok {
 				g.previewEngine = review.NewPreviewEngine(g.casDriver, metadataStore)
+			}
+		}
+		if g.mergeEngine == nil {
+			if mergeStore, ok := g.branchStore.(review.MergeStore); ok {
+				g.mergeEngine = review.NewFinalizeEngine(g.casDriver, mergeStore)
 			}
 		}
 	}
@@ -113,11 +124,160 @@ func (g *Gateway) registerRoutes() {
 			),
 		),
 	)
+	g.mux.Handle("POST /api/v1/repos/{repo}/merge/lease",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleContributor)(http.HandlerFunc(g.handleMergeLease)),
+			),
+		),
+	)
+	g.mux.Handle("DELETE /api/v1/repos/{repo}/merge/lease",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleContributor)(http.HandlerFunc(g.handleMergeLeaseRelease)),
+			),
+		),
+	)
+	g.mux.Handle("POST /api/v1/repos/{repo}/merge/apply",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleContributor)(http.HandlerFunc(g.handleMergeApply)),
+			),
+		),
+	)
 }
 
 type mergePreviewRequest struct {
 	SourceBranch *string `json:"sourceBranch"`
 	TargetBranch *string `json:"targetBranch"`
+}
+
+type mergeLeaseRequest struct {
+	SourceBranch *string `json:"sourceBranch"`
+	TargetBranch *string `json:"targetBranch"`
+}
+
+type mergeApplyRequest struct {
+	SourceBranch *string             `json:"sourceBranch"`
+	TargetBranch *string             `json:"targetBranch"`
+	LeaseToken   string              `json:"leaseToken,omitempty"`
+	Resolutions  []review.Resolution `json:"resolutions"`
+	Author       *string             `json:"author"`
+	Message      *string             `json:"message"`
+}
+
+type mergeLeaseReleaseRequest struct {
+	TargetBranch *string `json:"targetBranch"`
+	LeaseToken   *string `json:"leaseToken"`
+}
+
+func (g *Gateway) handleMergeLease(w http.ResponseWriter, r *http.Request) {
+	if g.mergeEngine == nil {
+		writeJSONError(w, r, g.logger, http.StatusNotImplemented, ErrorCodeNotImplemented, "merge finalization is not configured on this server")
+		return
+	}
+	var request mergeLeaseRequest
+	if !decodeSingleJSON(w, r, g.logger, &request) {
+		return
+	}
+	if request.SourceBranch == nil || *request.SourceBranch == "" || request.TargetBranch == nil || *request.TargetBranch == "" {
+		writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "sourceBranch and targetBranch are required")
+		return
+	}
+	tenantID, _ := TenantIDFromContext(r.Context())
+	scope, _ := ScopeFromContext(r.Context())
+	claims, _ := ClaimsFromContext(r.Context())
+	lease, err := g.mergeEngine.AcquireLease(r.Context(), tenantID, scope.RepoID(), review.LeaseRequest{
+		SourceBranch: *request.SourceBranch, TargetBranch: *request.TargetBranch, Subject: claims.Subject,
+	})
+	if err != nil {
+		g.writeMergeError(w, r, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(lease)
+}
+
+func (g *Gateway) handleMergeApply(w http.ResponseWriter, r *http.Request) {
+	if g.mergeEngine == nil {
+		writeJSONError(w, r, g.logger, http.StatusNotImplemented, ErrorCodeNotImplemented, "merge finalization is not configured on this server")
+		return
+	}
+	var request mergeApplyRequest
+	if !decodeSingleJSON(w, r, g.logger, &request) {
+		return
+	}
+	if request.SourceBranch == nil || *request.SourceBranch == "" || request.TargetBranch == nil || *request.TargetBranch == "" ||
+		request.Author == nil || *request.Author == "" || request.Message == nil || *request.Message == "" || request.Resolutions == nil {
+		writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "sourceBranch, targetBranch, resolutions, author, and message are required")
+		return
+	}
+	tenantID, _ := TenantIDFromContext(r.Context())
+	scope, _ := ScopeFromContext(r.Context())
+	claims, _ := ClaimsFromContext(r.Context())
+	result, err := g.mergeEngine.Apply(r.Context(), tenantID, scope.RepoID(), review.ApplyRequest{
+		SourceBranch: *request.SourceBranch, TargetBranch: *request.TargetBranch, Subject: claims.Subject,
+		LeaseToken: request.LeaseToken, Resolutions: request.Resolutions, Author: *request.Author, Message: *request.Message,
+	})
+	if err != nil {
+		g.writeMergeError(w, r, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+func (g *Gateway) handleMergeLeaseRelease(w http.ResponseWriter, r *http.Request) {
+	if g.mergeEngine == nil {
+		writeJSONError(w, r, g.logger, http.StatusNotImplemented, ErrorCodeNotImplemented, "merge finalization is not configured on this server")
+		return
+	}
+	var request mergeLeaseReleaseRequest
+	if !decodeSingleJSON(w, r, g.logger, &request) {
+		return
+	}
+	if request.TargetBranch == nil || *request.TargetBranch == "" || request.LeaseToken == nil || *request.LeaseToken == "" {
+		writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "targetBranch and leaseToken are required")
+		return
+	}
+	tenantID, _ := TenantIDFromContext(r.Context())
+	scope, _ := ScopeFromContext(r.Context())
+	claims, _ := ClaimsFromContext(r.Context())
+	if err := g.mergeEngine.ReleaseLease(r.Context(), tenantID, scope.RepoID(), *request.TargetBranch, claims.Subject, *request.LeaseToken); err != nil {
+		g.writeMergeError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func decodeSingleJSON(w http.ResponseWriter, r *http.Request, logger *slog.Logger, destination any) bool {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		writeJSONError(w, r, logger, http.StatusBadRequest, ErrorCodeBadRequest, "request must contain valid JSON")
+		return false
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		writeJSONError(w, r, logger, http.StatusBadRequest, ErrorCodeBadRequest, "request must contain exactly one JSON object")
+		return false
+	}
+	return true
+}
+
+func (g *Gateway) writeMergeError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, postgres.ErrBranchNotFound):
+		writeJSONError(w, r, g.logger, http.StatusNotFound, ErrorCodeNotFound, "branch not found")
+	case errors.Is(err, postgres.ErrMergeLeaseHeld), errors.Is(err, postgres.ErrNonFastForward), errors.Is(err, postgres.ErrMergeLeaseMismatch):
+		writeJSONError(w, r, g.logger, http.StatusConflict, ErrorCodeConflict, "merge branch state changed or is currently leased")
+	case errors.Is(err, postgres.ErrMergeLeaseNotFound), errors.Is(err, postgres.ErrMergeLeaseOwnership), errors.Is(err, postgres.ErrMergeLeaseExpired), errors.Is(err, review.ErrInvalidMergeRequest):
+		writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, err.Error())
+	default:
+		writeJSONError(w, r, g.logger, http.StatusInternalServerError, ErrorCodeInternal, "failed to finalize merge")
+	}
 }
 
 func (g *Gateway) handleMergePreview(w http.ResponseWriter, r *http.Request) {

@@ -177,14 +177,86 @@ BEGIN
 			FOREIGN KEY (tenant_id, repo_id, head_commit_id)
 			REFERENCES commits(tenant_id, repo_id, id);
 	END IF;
+	IF NOT EXISTS (
+		SELECT 1
+		FROM pg_constraint
+		WHERE conname = 'branches_tenant_repo_name_key'
+	) THEN
+		ALTER TABLE branches
+			ADD CONSTRAINT branches_tenant_repo_name_key
+			UNIQUE (tenant_id, repo_id, name);
+	END IF;
 END
 $$;
+
+-- parent_commit_id remains the legacy first-parent representation.  The
+-- normalized table records an ordered parent list so a merge commit can retain
+-- both its target (position 1) and source (position 2) histories.
+CREATE TABLE IF NOT EXISTS commit_parents (
+	tenant_id uuid NOT NULL REFERENCES tenants(id),
+	repo_id uuid NOT NULL REFERENCES repositories(id),
+	commit_id text NOT NULL,
+	parent_position smallint NOT NULL CHECK (parent_position BETWEEN 1 AND 2),
+	parent_commit_id text NOT NULL REFERENCES commits(id),
+	CONSTRAINT commit_parents_commit_scope_fk
+		FOREIGN KEY (tenant_id, repo_id, commit_id)
+		REFERENCES commits(tenant_id, repo_id, id),
+	CONSTRAINT commit_parents_repository_scope_fk
+		FOREIGN KEY (tenant_id, repo_id)
+		REFERENCES repositories(tenant_id, id),
+	PRIMARY KEY (tenant_id, repo_id, commit_id, parent_position)
+);
+
+CREATE INDEX IF NOT EXISTS commit_parents_parent_idx ON commit_parents (repo_id, parent_commit_id);
+
+-- Backfill pre-existing linear commits.  The conflict clause makes repeated
+-- schema application safe and preserves any already-recorded merge parent.
+INSERT INTO commit_parents (tenant_id, repo_id, commit_id, parent_position, parent_commit_id)
+SELECT tenant_id, repo_id, id, 1, parent_commit_id
+FROM commits
+WHERE parent_commit_id IS NOT NULL
+ON CONFLICT (tenant_id, repo_id, commit_id, parent_position) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS target_branch_merge_leases (
+	tenant_id uuid NOT NULL REFERENCES tenants(id),
+	repo_id uuid NOT NULL REFERENCES repositories(id),
+	target_branch text NOT NULL,
+	subject text NOT NULL,
+	lease_token text NOT NULL,
+	source_commit_id text NOT NULL REFERENCES commits(id),
+	target_commit_id text NOT NULL REFERENCES commits(id),
+	base_commit_id text NOT NULL REFERENCES commits(id),
+	expires_at timestamptz NOT NULL,
+	created_at timestamptz NOT NULL DEFAULT now(),
+	CONSTRAINT target_branch_merge_leases_repository_scope_fk
+		FOREIGN KEY (tenant_id, repo_id)
+		REFERENCES repositories(tenant_id, id),
+	CONSTRAINT target_branch_merge_leases_branch_scope_fk
+		FOREIGN KEY (tenant_id, repo_id, target_branch)
+		REFERENCES branches(tenant_id, repo_id, name),
+	CONSTRAINT target_branch_merge_leases_source_scope_fk
+		FOREIGN KEY (tenant_id, repo_id, source_commit_id)
+		REFERENCES commits(tenant_id, repo_id, id),
+	CONSTRAINT target_branch_merge_leases_target_scope_fk
+		FOREIGN KEY (tenant_id, repo_id, target_commit_id)
+		REFERENCES commits(tenant_id, repo_id, id),
+	CONSTRAINT target_branch_merge_leases_base_scope_fk
+		FOREIGN KEY (tenant_id, repo_id, base_commit_id)
+		REFERENCES commits(tenant_id, repo_id, id),
+	PRIMARY KEY (tenant_id, repo_id, target_branch),
+	UNIQUE (lease_token)
+);
+
+CREATE INDEX IF NOT EXISTS target_branch_merge_leases_expiry_idx
+	ON target_branch_merge_leases (expires_at);
 
 ALTER TABLE tenants ENABLE ROW LEVEL SECURITY;
 ALTER TABLE repositories ENABLE ROW LEVEL SECURITY;
 ALTER TABLE commits ENABLE ROW LEVEL SECURITY;
+ALTER TABLE commit_parents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pack_ranges ENABLE ROW LEVEL SECURITY;
 ALTER TABLE branches ENABLE ROW LEVEL SECURITY;
+ALTER TABLE target_branch_merge_leases ENABLE ROW LEVEL SECURITY;
 
 -- current_setting(..., true) returns NULL instead of raising if the tenant
 -- context was never set on the session. That fail-closed behaviour is
@@ -208,6 +280,12 @@ CREATE POLICY tenant_isolation ON commits
 	USING (tenant_id = current_setting('app.current_tenant_id', true)::uuid)
 	WITH CHECK (tenant_id = current_setting('app.current_tenant_id', true)::uuid);
 
+DROP POLICY IF EXISTS tenant_isolation ON commit_parents;
+CREATE POLICY tenant_isolation ON commit_parents
+	FOR ALL
+	USING (tenant_id = current_setting('app.current_tenant_id', true)::uuid)
+	WITH CHECK (tenant_id = current_setting('app.current_tenant_id', true)::uuid);
+
 DROP POLICY IF EXISTS tenant_isolation ON pack_ranges;
 CREATE POLICY tenant_isolation ON pack_ranges
 	FOR ALL
@@ -220,9 +298,15 @@ CREATE POLICY tenant_isolation ON branches
 	USING (tenant_id = current_setting('app.current_tenant_id', true)::uuid)
 	WITH CHECK (tenant_id = current_setting('app.current_tenant_id', true)::uuid);
 
+DROP POLICY IF EXISTS tenant_isolation ON target_branch_merge_leases;
+CREATE POLICY tenant_isolation ON target_branch_merge_leases
+	FOR ALL
+	USING (tenant_id = current_setting('app.current_tenant_id', true)::uuid)
+	WITH CHECK (tenant_id = current_setting('app.current_tenant_id', true)::uuid);
+
 -- Grant the application only the privileges needed for ordinary CRUD access to
 -- metadata rows. Schema changes, ownership, and any RLS-bypass capability
 -- remain with the migration/admin role, which keeps the blast radius of an
 -- application credential compromise as small as this control plane allows.
 GRANT USAGE ON SCHEMA public TO spool_app;
-GRANT SELECT, INSERT, UPDATE, DELETE ON tenants, repositories, commits, pack_ranges, branches TO spool_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON tenants, repositories, commits, commit_parents, pack_ranges, branches, target_branch_merge_leases TO spool_app;
