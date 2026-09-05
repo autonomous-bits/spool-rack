@@ -183,6 +183,9 @@ func UnmarshalPullEnvelopeV2(data []byte) (PullManifestV2, [][]byte, error) {
 	if headTargets != 1 {
 		return PullManifestV2{}, nil, fmt.Errorf("%w: advertised head %s is not a transmitted v2 pack target", ErrInvalidPullEnvelope, manifest.Head)
 	}
+	if frames[len(frames)-1].Target != V2CommitIdentity(manifest.Head) {
+		return PullManifestV2{}, nil, fmt.Errorf("%w: advertised head %s is not the terminal pack target", ErrInvalidPullEnvelope, manifest.Head)
+	}
 	for _, frame := range frames {
 		for _, commit := range frame.Commits {
 			if len(commit.Parents) < 2 {

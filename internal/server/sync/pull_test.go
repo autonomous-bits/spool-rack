@@ -253,6 +253,44 @@ func TestPullEnvelopeV2RejectsDuplicateAdvertisedHead(t *testing.T) {
 	}
 }
 
+func TestPullEnvelopeV2RejectsEarlierAdvertisedHead(t *testing.T) {
+	t.Parallel()
+
+	newPack := func(label string) ([]byte, CommitIdentity) {
+		t.Helper()
+		snapshot := []byte(label + " snapshot")
+		commit := CommitFrameV2{
+			Version: CommitFormatV2, SnapshotRoot: ContentID(snapshot), Author: "Ada", Message: label,
+		}
+		target, err := commit.Identity()
+		if err != nil {
+			t.Fatal(err)
+		}
+		pack, err := MarshalPackFrameV2(PackFrameV2{
+			Version: PackFormatV2, Target: target, Commits: []CommitFrameV2{commit},
+			Objects: []PackObjectV2{{ID: ContentID(snapshot), Data: snapshot}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return pack, target
+	}
+	earlierPack, earlierTarget := newPack("earlier")
+	terminalPack, _ := newPack("terminal")
+	manifest := PullManifestV2{
+		Version: PullEnvelopeFormatV2,
+		Head:    earlierTarget.ID,
+		Packs: []PullPackManifestV2{
+			{Hash: ContentID(earlierPack), Format: PackFormatV2, Length: uint64(len(earlierPack))},
+			{Hash: ContentID(terminalPack), Format: PackFormatV2, Length: uint64(len(terminalPack))},
+		},
+	}
+	envelope := marshalPullEnvelope(t, manifest, earlierPack, terminalPack)
+	if _, _, err := UnmarshalPullEnvelopeV2(envelope); !errors.Is(err, ErrInvalidPullEnvelope) {
+		t.Fatalf("UnmarshalPullEnvelopeV2() error = %v, want nonterminal head error", err)
+	}
+}
+
 func marshalPullEnvelope(t *testing.T, manifest PullManifestV2, packs ...[]byte) []byte {
 	t.Helper()
 
