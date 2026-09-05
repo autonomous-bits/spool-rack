@@ -101,8 +101,8 @@ func (m PullManifestV2) validate() error {
 	if m.Version != PullEnvelopeFormatV2 {
 		return fmt.Errorf("%w: unsupported manifest version %d", ErrInvalidPullEnvelope, m.Version)
 	}
-	if m.Head == "" {
-		return fmt.Errorf("%w: head is required", ErrInvalidPullEnvelope)
+	if !validContentID(m.Head) {
+		return fmt.Errorf("%w: head must be a v2 BLAKE3-256 content ID", ErrInvalidPullEnvelope)
 	}
 	if len(m.Packs) == 0 {
 		return fmt.Errorf("%w: at least one pack is required", ErrInvalidPullEnvelope)
@@ -140,6 +140,7 @@ func UnmarshalPullEnvelopeV2(data []byte) (PullManifestV2, [][]byte, error) {
 	packs := make([][]byte, len(manifest.Packs))
 	frames := make([]PackFrameV2, len(manifest.Packs))
 	commits := make(map[CommitIdentity]struct{})
+	headTargets := 0
 	offset := manifestEnd
 	for i, pack := range manifest.Packs {
 		if pack.Length > uint64(MaxV2PackBytes) {
@@ -158,6 +159,12 @@ func UnmarshalPullEnvelopeV2(data []byte) (PullManifestV2, [][]byte, error) {
 			return PullManifestV2{}, nil, fmt.Errorf("%w: pack %d is not a canonical v2 frame: %v", ErrInvalidPullEnvelope, i, err)
 		}
 		frames[i] = frame
+		if frame.Target.Format == CommitFormatV2 && frame.Target.ID == manifest.Head {
+			headTargets++
+			if headTargets > 1 {
+				return PullManifestV2{}, nil, fmt.Errorf("%w: advertised head %s appears in multiple packs", ErrInvalidPullEnvelope, manifest.Head)
+			}
+		}
 		for _, commit := range frame.Commits {
 			identity, err := commit.Identity()
 			if err != nil {
@@ -172,6 +179,9 @@ func UnmarshalPullEnvelopeV2(data []byte) (PullManifestV2, [][]byte, error) {
 	}
 	if offset != len(data) {
 		return PullManifestV2{}, nil, fmt.Errorf("%w: trailing bytes after packs", ErrInvalidPullEnvelope)
+	}
+	if headTargets != 1 {
+		return PullManifestV2{}, nil, fmt.Errorf("%w: advertised head %s is not a transmitted v2 pack target", ErrInvalidPullEnvelope, manifest.Head)
 	}
 	for _, frame := range frames {
 		for _, commit := range frame.Commits {
