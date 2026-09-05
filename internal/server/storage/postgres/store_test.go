@@ -164,6 +164,52 @@ func mustCreateBranch(t *testing.T, store *PGStore, ctx context.Context, repoID,
 	}
 }
 
+func TestSchemaBootstrapIncludesMergeLeaseBranchCandidateKey(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	var candidateKeyExists bool
+	err := store.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM pg_index
+			WHERE indexrelid = 'branches_tenant_id_repo_id_name_key'::regclass
+				AND indrelid = 'branches'::regclass
+				AND indisunique
+				AND (
+					SELECT array_agg(attribute.attname ORDER BY key.ordinality)
+					FROM unnest(indkey) WITH ORDINALITY AS key(attnum, ordinality)
+					JOIN pg_attribute AS attribute
+						ON attribute.attrelid = indrelid
+						AND attribute.attnum = key.attnum
+				) = ARRAY['tenant_id', 'repo_id', 'name']::name[]
+		)
+	`).Scan(&candidateKeyExists)
+	if err != nil {
+		t.Fatalf("query branch candidate key: %v", err)
+	}
+	if !candidateKeyExists {
+		t.Fatal("branches tenant/repository/name candidate key is missing")
+	}
+
+	var leaseBranchForeignKeyExists bool
+	err = store.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM pg_constraint
+			WHERE conname = 'target_branch_merge_leases_branch_scope_fk'
+				AND contype = 'f'
+				AND conrelid = 'target_branch_merge_leases'::regclass
+				AND confrelid = 'branches'::regclass
+		)
+	`).Scan(&leaseBranchForeignKeyExists)
+	if err != nil {
+		t.Fatalf("query merge lease branch foreign key: %v", err)
+	}
+	if !leaseBranchForeignKeyExists {
+		t.Fatal("target branch merge leases branch scope foreign key is missing")
+	}
+}
+
 func TestCrossTenantIsolation(t *testing.T) {
 	store, ctx := newTestStore(t)
 
@@ -307,7 +353,7 @@ func TestPutCommit_Idempotent(t *testing.T) {
 	if err := store.PutCommit(tenantCtx, repoID, commitID, "", "snap-a", "alice", "initial"); err != nil {
 		t.Fatalf("PutCommit first call: %v", err)
 	}
-	if err := store.PutCommit(tenantCtx, repoID, commitID, "ignored-parent", "snap-b", "bob", "replayed"); err != nil {
+	if err := store.PutCommit(tenantCtx, repoID, commitID, "", "snap-a", "alice", "initial"); err != nil {
 		t.Fatalf("PutCommit second call: %v", err)
 	}
 
@@ -486,10 +532,8 @@ func TestFindLowestCommonAncestor_HistoryErrorsAndBound(t *testing.T) {
 
 	otherRepoID := mustCreateRepository(t, store, tenantCtx, "repo-other-history")
 	foreignParent := mustPutCommit(t, store, tenantCtx, otherRepoID, "", "snap-foreign", "alice", "foreign")
-	incomplete := mustPutCommit(t, store, tenantCtx, repoID, foreignParent, "snap-incomplete", "alice", "incomplete")
-	_, err = store.FindLowestCommonAncestor(tenantCtx, repoID, incomplete, incomplete)
-	if !errors.Is(err, ErrCommitHistoryIncomplete) {
-		t.Fatalf("FindLowestCommonAncestor(incomplete): expected ErrCommitHistoryIncomplete, got %v", err)
+	if err := store.PutCommit(tenantCtx, repoID, testCommitID(t.Name(), "cross-repo-parent"), foreignParent, "snap-incomplete", "alice", "incomplete"); err == nil {
+		t.Fatal("PutCommit(cross-repository parent) error = nil, want scoped foreign-key rejection")
 	}
 
 	tip := root
@@ -586,6 +630,31 @@ func TestGetPackRanges(t *testing.T) {
 	for i, want := range []string{headPack, middlePack, rootPack} {
 		if ranges[i].PackHash != want {
 			t.Fatalf("GetPackRanges(full)[%d] = %q, want %q", i, ranges[i].PackHash, want)
+		}
+	}
+}
+
+func TestCommitIdentityIsRepositoryScopedAndImmutable(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-scoped-v2-identity")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoA := mustCreateRepository(t, store, tenantCtx, "repo-v2-a")
+	repoB := mustCreateRepository(t, store, tenantCtx, "repo-v2-b")
+	commitID := testCommitID(t.Name(), "same-v2-frame")
+	if err := store.PutCommitWithFormat(tenantCtx, repoA, commitID, "", "snapshot", "Ada", "same frame", 2); err != nil {
+		t.Fatalf("PutCommitWithFormat(repo A): %v", err)
+	}
+	if err := store.PutCommitWithFormat(tenantCtx, repoB, commitID, "", "snapshot", "Ada", "same frame", 2); err != nil {
+		t.Fatalf("PutCommitWithFormat(repo B): %v", err)
+	}
+	if err := store.PutCommitWithFormat(tenantCtx, repoA, commitID, "", "snapshot", "Mallory", "poisoned frame", 1); !errors.Is(err, ErrImmutableMetadataMismatch) {
+		t.Fatalf("PutCommitWithFormat(conflicting ID) error = %v, want immutable metadata mismatch", err)
+	}
+	for _, repoID := range []string{repoA, repoB} {
+		metadata, err := store.GetCommitMetadata(tenantCtx, repoID, commitID)
+		if err != nil || metadata.Format != 2 || metadata.SnapshotRoot != "snapshot" {
+			t.Fatalf("GetCommitMetadata(%s) = %+v, %v; want scoped v2 commit", repoID, metadata, err)
 		}
 	}
 }

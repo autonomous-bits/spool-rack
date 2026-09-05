@@ -65,26 +65,28 @@ CREATE TABLE IF NOT EXISTS repositories (
 	UNIQUE (tenant_id, name)
 );
 
--- Commits belong to both a tenant and a repository. Their primary key is the
--- caller-supplied 64-character BLAKE3 hex digest used everywhere else in the
--- system as the content-addressed commit identity. Storing tenant_id directly
--- lets RLS decisions remain local to this table instead of requiring a join
--- through repositories to prove tenancy for every read or write. The scoped
--- foreign key and composite uniqueness keep that denormalised tenant_id honest
--- so a commit cannot claim one tenant while pointing at another tenant's repo.
+-- Commits belong to both a tenant and a repository. Their content-addressed ID
+-- is unique only inside that scope: the same canonical frame may legitimately
+-- exist in two repositories. Storing tenant_id directly lets RLS decisions
+-- remain local to this table instead of requiring a join through repositories
+-- to prove tenancy for every read or write.
 CREATE TABLE IF NOT EXISTS commits (
-	id text PRIMARY KEY,
+	id text NOT NULL,
 	tenant_id uuid NOT NULL REFERENCES tenants(id),
 	repo_id uuid NOT NULL REFERENCES repositories(id),
-	parent_commit_id text REFERENCES commits(id),
+	parent_commit_id text,
 	snapshot_root text NOT NULL,
+	object_format smallint NOT NULL DEFAULT 1 CHECK (object_format IN (1, 2)),
 	author text NOT NULL,
 	message text NOT NULL,
 	created_at timestamptz NOT NULL DEFAULT now(),
-	UNIQUE (tenant_id, repo_id, id),
+	PRIMARY KEY (tenant_id, repo_id, id),
 	CONSTRAINT commits_repository_scope_fk
 		FOREIGN KEY (tenant_id, repo_id)
-		REFERENCES repositories(tenant_id, id)
+		REFERENCES repositories(tenant_id, id),
+	CONSTRAINT commits_parent_scope_fk
+		FOREIGN KEY (tenant_id, repo_id, parent_commit_id)
+		REFERENCES commits(tenant_id, repo_id, id)
 );
 
 CREATE INDEX IF NOT EXISTS commits_repo_id_idx ON commits (repo_id);
@@ -96,8 +98,9 @@ CREATE TABLE IF NOT EXISTS pack_ranges (
 	tenant_id uuid NOT NULL REFERENCES tenants(id),
 	repo_id uuid NOT NULL REFERENCES repositories(id),
 	pack_hash text NOT NULL,
-	base_commit_id text REFERENCES commits(id),
-	target_commit_id text NOT NULL REFERENCES commits(id),
+	object_format smallint NOT NULL DEFAULT 1 CHECK (object_format IN (1, 2)),
+	base_commit_id text,
+	target_commit_id text NOT NULL,
 	created_at timestamptz NOT NULL DEFAULT now(),
 	CONSTRAINT pack_ranges_repository_scope_fk
 		FOREIGN KEY (tenant_id, repo_id)
@@ -123,7 +126,7 @@ CREATE TABLE IF NOT EXISTS branches (
 	tenant_id uuid NOT NULL REFERENCES tenants(id),
 	repo_id uuid NOT NULL REFERENCES repositories(id),
 	name text NOT NULL,
-	head_commit_id text NOT NULL REFERENCES commits(id),
+	head_commit_id text NOT NULL,
 	updated_at timestamptz NOT NULL DEFAULT now(),
 	CONSTRAINT branches_repository_scope_fk
 		FOREIGN KEY (tenant_id, repo_id)
@@ -134,60 +137,13 @@ CREATE TABLE IF NOT EXISTS branches (
 	PRIMARY KEY (repo_id, name)
 );
 
-ALTER TABLE branches DROP CONSTRAINT IF EXISTS branches_head_commit_scope_fk;
-ALTER TABLE branches DROP CONSTRAINT IF EXISTS branches_head_commit_id_fkey;
-ALTER TABLE commits DROP CONSTRAINT IF EXISTS commits_parent_commit_id_fkey;
-ALTER TABLE commits ALTER COLUMN id DROP DEFAULT;
-ALTER TABLE commits ALTER COLUMN id TYPE text USING id::text;
-ALTER TABLE commits ALTER COLUMN parent_commit_id TYPE text USING parent_commit_id::text;
-ALTER TABLE branches ALTER COLUMN head_commit_id TYPE text USING head_commit_id::text;
-ALTER TABLE pack_ranges ALTER COLUMN pack_hash TYPE text USING pack_hash::text;
-ALTER TABLE pack_ranges ALTER COLUMN base_commit_id TYPE text USING base_commit_id::text;
-ALTER TABLE pack_ranges ALTER COLUMN target_commit_id TYPE text USING target_commit_id::text;
-
-DO $$
-BEGIN
-	IF NOT EXISTS (
-		SELECT 1
-		FROM pg_constraint
-		WHERE conname = 'commits_parent_commit_id_fkey'
-	) THEN
-		ALTER TABLE commits
-			ADD CONSTRAINT commits_parent_commit_id_fkey
-			FOREIGN KEY (parent_commit_id)
-			REFERENCES commits(id);
-	END IF;
-	IF NOT EXISTS (
-		SELECT 1
-		FROM pg_constraint
-		WHERE conname = 'branches_head_commit_id_fkey'
-	) THEN
-		ALTER TABLE branches
-			ADD CONSTRAINT branches_head_commit_id_fkey
-			FOREIGN KEY (head_commit_id)
-			REFERENCES commits(id);
-	END IF;
-	IF NOT EXISTS (
-		SELECT 1
-		FROM pg_constraint
-		WHERE conname = 'branches_head_commit_scope_fk'
-	) THEN
-		ALTER TABLE branches
-			ADD CONSTRAINT branches_head_commit_scope_fk
-			FOREIGN KEY (tenant_id, repo_id, head_commit_id)
-			REFERENCES commits(tenant_id, repo_id, id);
-	END IF;
-	IF NOT EXISTS (
-		SELECT 1
-		FROM pg_constraint
-		WHERE conname = 'branches_tenant_repo_name_key'
-	) THEN
-		ALTER TABLE branches
-			ADD CONSTRAINT branches_tenant_repo_name_key
-			UNIQUE (tenant_id, repo_id, name);
-	END IF;
-END
-$$;
+-- Leases reference a branch together with its tenant and repository scope.
+-- Keep this candidate key separate and before the lease table so fresh schema
+-- bootstrap can create that foreign key. The conventional constraint-backed
+-- index name lets this remain a no-op for databases created by earlier
+-- schema versions that already have the equivalent unique constraint.
+CREATE UNIQUE INDEX IF NOT EXISTS branches_tenant_id_repo_id_name_key
+	ON branches (tenant_id, repo_id, name);
 
 -- parent_commit_id remains the legacy first-parent representation.  The
 -- normalized table records an ordered parent list so a merge commit can retain
@@ -197,9 +153,12 @@ CREATE TABLE IF NOT EXISTS commit_parents (
 	repo_id uuid NOT NULL REFERENCES repositories(id),
 	commit_id text NOT NULL,
 	parent_position smallint NOT NULL CHECK (parent_position BETWEEN 1 AND 2),
-	parent_commit_id text NOT NULL REFERENCES commits(id),
+	parent_commit_id text NOT NULL,
 	CONSTRAINT commit_parents_commit_scope_fk
 		FOREIGN KEY (tenant_id, repo_id, commit_id)
+		REFERENCES commits(tenant_id, repo_id, id),
+	CONSTRAINT commit_parents_parent_scope_fk
+		FOREIGN KEY (tenant_id, repo_id, parent_commit_id)
 		REFERENCES commits(tenant_id, repo_id, id),
 	CONSTRAINT commit_parents_repository_scope_fk
 		FOREIGN KEY (tenant_id, repo_id)
@@ -223,9 +182,9 @@ CREATE TABLE IF NOT EXISTS target_branch_merge_leases (
 	target_branch text NOT NULL,
 	subject text NOT NULL,
 	lease_token text NOT NULL,
-	source_commit_id text NOT NULL REFERENCES commits(id),
-	target_commit_id text NOT NULL REFERENCES commits(id),
-	base_commit_id text NOT NULL REFERENCES commits(id),
+	source_commit_id text NOT NULL,
+	target_commit_id text NOT NULL,
+	base_commit_id text NOT NULL,
 	expires_at timestamptz NOT NULL,
 	created_at timestamptz NOT NULL DEFAULT now(),
 	CONSTRAINT target_branch_merge_leases_repository_scope_fk

@@ -3,7 +3,6 @@ package review
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,7 +11,7 @@ import (
 
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/cas"
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/postgres"
-	"lukechampine.com/blake3"
+	serversync "github.com/autonomous-bits/spool-rack/internal/server/sync"
 )
 
 const defaultMergeLeaseDuration = 5 * time.Minute
@@ -188,34 +187,67 @@ func (e *FinalizeEngine) Apply(ctx context.Context, tenantID, repoID string, req
 	if err != nil {
 		return ApplyResult{}, err
 	}
-	snapshotData, err := MarshalSnapshotJSON(merged)
+	snapshotData, err := MarshalSnapshot(merged)
 	if err != nil {
 		return ApplyResult{}, fmt.Errorf("review: encode merged snapshot: %w", err)
 	}
-	snapshotRoot := hashBytes(snapshotData)
+	snapshotRoot := serversync.ContentID(snapshotData)
+	targetIdentity, err := frameCommitIdentity(preview.TargetCommit)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	sourceIdentity, err := frameCommitIdentity(preview.SourceCommit)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	commitFrame := serversync.CommitFrameV2{
+		Version:      serversync.CommitFormatV2,
+		Parents:      []serversync.CommitIdentity{targetIdentity, sourceIdentity},
+		SnapshotRoot: snapshotRoot,
+		Author:       request.Author,
+		Message:      request.Message,
+	}
+	commitIdentity, err := commitFrame.Identity()
+	if err != nil {
+		return ApplyResult{}, fmt.Errorf("review: frame merged commit: %w", err)
+	}
+	packData, err := serversync.MarshalPackFrameV2(serversync.PackFrameV2{
+		Version: serversync.PackFormatV2,
+		Base:    targetIdentity,
+		Target:  commitIdentity,
+		Commits: []serversync.CommitFrameV2{commitFrame},
+		Objects: []serversync.PackObjectV2{{ID: snapshotRoot, Data: snapshotData}},
+	})
+	if err != nil {
+		return ApplyResult{}, fmt.Errorf("review: frame merged pack: %w", err)
+	}
 	if err := e.objects.Put(tenantCtx, scope, snapshotRoot, snapshotData); err != nil {
 		return ApplyResult{}, fmt.Errorf("review: persist merged snapshot: %w", err)
 	}
-	packData, err := json.Marshal(struct {
-		SnapshotRoot string          `json:"snapshotRoot"`
-		Snapshot     json.RawMessage `json:"snapshot"`
-	}{SnapshotRoot: snapshotRoot, Snapshot: snapshotData})
-	if err != nil {
-		return ApplyResult{}, fmt.Errorf("review: encode merged pack: %w", err)
-	}
-	packHash := hashBytes(packData)
+	packHash := serversync.ContentID(packData)
 	if err := e.objects.WritePack(tenantCtx, scope, packHash, bytes.NewReader(packData)); err != nil {
 		return ApplyResult{}, fmt.Errorf("review: persist merged pack: %w", err)
 	}
-	commitID := hashBytes([]byte("spool-merge-v1\x00" + preview.TargetCommit.ID + "\x00" + preview.SourceCommit.ID + "\x00" + snapshotRoot + "\x00" + request.Author + "\x00" + request.Message))
 	if err := e.store.ApplyMerge(tenantCtx, postgres.ApplyMergeRequest{
 		RepoID: repoID, TargetBranch: request.TargetBranch, Subject: request.Subject, LeaseToken: request.LeaseToken,
 		SourceCommitID: preview.SourceCommit.ID, TargetCommitID: preview.TargetCommit.ID, BaseCommitID: preview.BaseCommit.ID,
-		ResultCommitID: commitID, SnapshotRoot: snapshotRoot, Author: request.Author, Message: request.Message, PackHash: packHash,
+		ResultCommitID: commitIdentity.ID, SnapshotRoot: snapshotRoot, Author: request.Author, Message: request.Message, PackHash: packHash,
+		CommitFormat: serversync.CommitFormatV2, PackFormat: serversync.PackFormatV2,
 	}); err != nil {
 		return ApplyResult{}, fmt.Errorf("review: apply merge: %w", err)
 	}
-	return ApplyResult{Branch: request.TargetBranch, HeadCommit: commitID, SnapshotRoot: snapshotRoot, PackHash: packHash}, nil
+	return ApplyResult{Branch: request.TargetBranch, HeadCommit: commitIdentity.ID, SnapshotRoot: snapshotRoot, PackHash: packHash}, nil
+}
+
+func frameCommitIdentity(commit CommitIdentity) (serversync.CommitIdentity, error) {
+	if commit.Format != serversync.CommitFormatV2 {
+		return serversync.CommitIdentity{}, fmt.Errorf("%w: merge parents must use v2 framing", ErrInvalidMergeRequest)
+	}
+	identity := serversync.V2CommitIdentity(commit.ID)
+	if err := identity.Validate(); err != nil {
+		return serversync.CommitIdentity{}, fmt.Errorf("%w: invalid v2 commit identity: %v", ErrInvalidMergeRequest, err)
+	}
+	return identity, nil
 }
 
 func (e *FinalizeEngine) preview(ctx context.Context, tenantID, repoID, sourceBranch, targetBranch string) (*MergePreview, error) {
@@ -270,20 +302,19 @@ func validateResolutions(preview *MergePreview, resolutions []Resolution) error 
 }
 
 func materializeMerge(base, source, target Snapshot, preview *MergePreview, resolutions []Resolution) (Snapshot, error) {
-	if len(preview.Conflicts) == 1 && preview.Conflicts[0].Type == ConflictCardinality {
-		for _, resolution := range resolutions {
-			if resolution.Choice == "source" {
-				return source, nil
-			}
-			if resolution.Choice == "target" {
-				return target, nil
-			}
-			var snapshot Snapshot
-			if err := decodeManual(resolution.Value, &snapshot); err != nil {
-				return Snapshot{}, err
-			}
-			return snapshot, snapshot.Validate()
+	if len(preview.Conflicts) == 1 && preview.Conflicts[0].Type == ConflictCardinality && len(resolutions) != 0 {
+		resolution := resolutions[0]
+		if resolution.Choice == "source" {
+			return source, nil
 		}
+		if resolution.Choice == "target" {
+			return target, nil
+		}
+		var snapshot Snapshot
+		if err := decodeManual(resolution.Value, &snapshot); err != nil {
+			return Snapshot{}, err
+		}
+		return snapshot, snapshot.Validate()
 	}
 	result := mergeSnapshots(base, source, target)
 	merged := Snapshot{Version: SnapshotVersion, Schema: target.Schema, Nodes: mergeElements(base.Nodes, source.Nodes, target.Nodes, ElementNode, &MergePreview{}), Edges: mergeElements(base.Edges, source.Edges, target.Edges, ElementEdge, &MergePreview{})}
@@ -557,7 +588,4 @@ func sortNodes(values []Node) {
 func sortEdges(values []Edge) {
 	sort.Slice(values, func(i, j int) bool { return values[i].ID < values[j].ID })
 }
-func hashBytes(data []byte) string {
-	sum := blake3.Sum256(data)
-	return hex.EncodeToString(sum[:])
-}
+func hashBytes(data []byte) string { return serversync.ContentID(data) }

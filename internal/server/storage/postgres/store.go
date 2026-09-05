@@ -26,6 +26,9 @@ var (
 	// ErrCommitNotFound indicates that a requested commit is not visible in the
 	// repository scoped by the current tenant context.
 	ErrCommitNotFound = errors.New("commit not found")
+	// ErrImmutableMetadataMismatch indicates a caller attempted to reuse an
+	// immutable commit or pack ID with different metadata.
+	ErrImmutableMetadataMismatch = errors.New("immutable metadata does not match existing content ID")
 	// ErrNoCommonAncestor indicates that two complete commit histories do not
 	// share an ancestor.
 	ErrNoCommonAncestor = errors.New("no common ancestor")
@@ -105,6 +108,9 @@ type Store interface {
 	// GetCommitSnapshotRoot returns the immutable snapshot root recorded for a
 	// commit, or ErrCommitNotFound when that commit is not visible in repoID.
 	GetCommitSnapshotRoot(ctx context.Context, repoID, commitID string) (string, error)
+	// GetCommitMetadata returns the immutable snapshot root and framing format
+	// for a commit visible in the tenant-scoped repository.
+	GetCommitMetadata(ctx context.Context, repoID, commitID string) (CommitMetadata, error)
 	// GetPackRanges returns the pack ranges required to reconstruct the
 	// history from headCommitID back to knownCommitID. Ranges are returned
 	// newest-first so callers can validate the chain and stream it in reverse.
@@ -130,6 +136,15 @@ type PackRange struct {
 	PackHash       string
 	BaseCommitID   string
 	TargetCommitID string
+	Format         uint32
+}
+
+// CommitMetadata is the storage identity returned for a commit without
+// exposing mutable branch state.
+type CommitMetadata struct {
+	ID           string
+	SnapshotRoot string
+	Format       uint32
 }
 
 // MergeLeaseRequest identifies the merge preview that is reserving a target
@@ -173,6 +188,8 @@ type ApplyMergeRequest struct {
 	Author         string
 	Message        string
 	PackHash       string
+	CommitFormat   uint32
+	PackFormat     uint32
 }
 
 // PGStore is a PostgreSQL-backed implementation of Store.
@@ -288,6 +305,19 @@ func (s *PGStore) CreateBranch(ctx context.Context, repoID, name, headCommitID s
 // PutCommit inserts a content-addressed commit row scoped to the tenant
 // carried by ctx. Re-registering the same commitID is a no-op.
 func (s *PGStore) PutCommit(ctx context.Context, repoID, commitID, parentCommitID, snapshotRoot, author, message string) error {
+	return s.putCommit(ctx, repoID, commitID, parentCommitID, snapshotRoot, author, message, 1)
+}
+
+// PutCommitWithFormat records a commit using its explicit frame format. The
+// base Store interface remains legacy-compatible for existing JSON clients.
+func (s *PGStore) PutCommitWithFormat(ctx context.Context, repoID, commitID, parentCommitID, snapshotRoot, author, message string, format uint32) error {
+	if !validObjectFormat(format) {
+		return fmt.Errorf("postgres: put commit for repo %s: unsupported object format %d", repoID, format)
+	}
+	return s.putCommit(ctx, repoID, commitID, parentCommitID, snapshotRoot, author, message, normalizeObjectFormat(format))
+}
+
+func (s *PGStore) putCommit(ctx context.Context, repoID, commitID, parentCommitID, snapshotRoot, author, message string, format uint32) error {
 	tenantID, err := requireTenantID(ctx)
 	if err != nil {
 		return fmt.Errorf("postgres: put commit for repo %s: %w", repoID, err)
@@ -300,14 +330,42 @@ func (s *PGStore) PutCommit(ctx context.Context, repoID, commitID, parentCommitI
 
 	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		result, err := tx.Exec(ctx, `
-			INSERT INTO commits (id, tenant_id, repo_id, parent_commit_id, snapshot_root, author, message)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			INSERT INTO commits (id, tenant_id, repo_id, parent_commit_id, snapshot_root, object_format, author, message)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 			ON CONFLICT (tenant_id, repo_id, id) DO NOTHING
-		`, commitID, tenantID, repoID, parent, snapshotRoot, author, message)
+		`, commitID, tenantID, repoID, parent, snapshotRoot, format, author, message)
 		if err != nil {
 			return fmt.Errorf("postgres: put commit for repo %s: insert commit: %w", repoID, err)
 		}
-		if parentCommitID != "" && result.RowsAffected() == 1 {
+		if result.RowsAffected() == 0 {
+			var existing struct {
+				parent       *string
+				snapshotRoot string
+				format       uint32
+				author       string
+				message      string
+			}
+			if err := tx.QueryRow(ctx, `
+				SELECT parent_commit_id, snapshot_root, object_format, author, message
+				FROM commits
+				WHERE tenant_id = $1 AND repo_id = $2 AND id = $3
+				FOR KEY SHARE
+			`, tenantID, repoID, commitID).Scan(
+				&existing.parent, &existing.snapshotRoot, &existing.format, &existing.author, &existing.message,
+			); err != nil {
+				return fmt.Errorf("postgres: put commit for repo %s: read existing commit: %w", repoID, err)
+			}
+			existingParent := ""
+			if existing.parent != nil {
+				existingParent = *existing.parent
+			}
+			if existingParent != parentCommitID || existing.snapshotRoot != snapshotRoot || existing.format != format ||
+				existing.author != author || existing.message != message {
+				return ErrImmutableMetadataMismatch
+			}
+			return nil
+		}
+		if parentCommitID != "" {
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO commit_parents (tenant_id, repo_id, commit_id, parent_position, parent_commit_id)
 				VALUES ($1, $2, $3, 1, $4)
@@ -316,8 +374,6 @@ func (s *PGStore) PutCommit(ctx context.Context, repoID, commitID, parentCommitI
 				return fmt.Errorf("postgres: put commit for repo %s: insert commit parent: %w", repoID, err)
 			}
 		}
-		// MVP note: if the same commitID is re-registered with different metadata,
-		// PostgreSQL keeps the first row and ignores the later insert.
 		return nil
 	}); err != nil {
 		return err
@@ -328,6 +384,18 @@ func (s *PGStore) PutCommit(ctx context.Context, repoID, commitID, parentCommitI
 
 // PutPackRange records the commit range carried by an immutable CAS pack.
 func (s *PGStore) PutPackRange(ctx context.Context, repoID, packHash, baseCommitID, targetCommitID string) error {
+	return s.putPackRange(ctx, repoID, packHash, baseCommitID, targetCommitID, 1)
+}
+
+// PutPackRangeWithFormat records an explicitly framed v2 pack range.
+func (s *PGStore) PutPackRangeWithFormat(ctx context.Context, repoID, packHash, baseCommitID, targetCommitID string, format uint32) error {
+	if !validObjectFormat(format) {
+		return fmt.Errorf("postgres: put pack range for repo %s: unsupported object format %d", repoID, format)
+	}
+	return s.putPackRange(ctx, repoID, packHash, baseCommitID, targetCommitID, normalizeObjectFormat(format))
+}
+
+func (s *PGStore) putPackRange(ctx context.Context, repoID, packHash, baseCommitID, targetCommitID string, format uint32) error {
 	tenantID, err := requireTenantID(ctx)
 	if err != nil {
 		return fmt.Errorf("postgres: put pack range for repo %s: %w", repoID, err)
@@ -339,12 +407,35 @@ func (s *PGStore) PutPackRange(ctx context.Context, repoID, packHash, baseCommit
 	}
 
 	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO pack_ranges (tenant_id, repo_id, pack_hash, base_commit_id, target_commit_id)
-			VALUES ($1, $2, $3, $4, $5)
+		result, err := tx.Exec(ctx, `
+			INSERT INTO pack_ranges (tenant_id, repo_id, pack_hash, object_format, base_commit_id, target_commit_id)
+			VALUES ($1, $2, $3, $4, $5, $6)
 			ON CONFLICT (tenant_id, repo_id, pack_hash) DO NOTHING
-		`, tenantID, repoID, packHash, base, targetCommitID); err != nil {
+		`, tenantID, repoID, packHash, format, base, targetCommitID)
+		if err != nil {
 			return fmt.Errorf("postgres: put pack range for repo %s: insert pack range: %w", repoID, err)
+		}
+		if result.RowsAffected() == 0 {
+			var existing struct {
+				base   *string
+				target string
+				format uint32
+			}
+			if err := tx.QueryRow(ctx, `
+				SELECT base_commit_id, target_commit_id, object_format
+				FROM pack_ranges
+				WHERE tenant_id = $1 AND repo_id = $2 AND pack_hash = $3
+				FOR KEY SHARE
+			`, tenantID, repoID, packHash).Scan(&existing.base, &existing.target, &existing.format); err != nil {
+				return fmt.Errorf("postgres: put pack range for repo %s: read existing pack range: %w", repoID, err)
+			}
+			existingBase := ""
+			if existing.base != nil {
+				existingBase = *existing.base
+			}
+			if existingBase != baseCommitID || existing.target != targetCommitID || existing.format != format {
+				return ErrImmutableMetadataMismatch
+			}
 		}
 		return nil
 	}); err != nil {
@@ -507,7 +598,8 @@ func (s *PGStore) ApplyMerge(ctx context.Context, request ApplyMergeRequest) err
 	if request.RepoID == "" || request.TargetBranch == "" || request.Subject == "" ||
 		request.LeaseToken == "" || request.SourceCommitID == "" || request.TargetCommitID == "" ||
 		request.BaseCommitID == "" || request.ResultCommitID == "" || request.SnapshotRoot == "" ||
-		request.Author == "" || request.Message == "" || request.PackHash == "" {
+		request.Author == "" || request.Message == "" || request.PackHash == "" ||
+		!validObjectFormat(request.CommitFormat) || !validObjectFormat(request.PackFormat) {
 		return fmt.Errorf("postgres: apply merge: %w", ErrInvalidMergeLease)
 	}
 
@@ -547,10 +639,10 @@ func (s *PGStore) ApplyMerge(ctx context.Context, request ApplyMergeRequest) err
 		}
 
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO commits (id, tenant_id, repo_id, parent_commit_id, snapshot_root, author, message)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			INSERT INTO commits (id, tenant_id, repo_id, parent_commit_id, snapshot_root, object_format, author, message)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		`, request.ResultCommitID, tenantID, request.RepoID, request.TargetCommitID,
-			request.SnapshotRoot, request.Author, request.Message); err != nil {
+			request.SnapshotRoot, normalizeObjectFormat(request.CommitFormat), request.Author, request.Message); err != nil {
 			return fmt.Errorf("insert merge commit: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `
@@ -560,9 +652,9 @@ func (s *PGStore) ApplyMerge(ctx context.Context, request ApplyMergeRequest) err
 			return fmt.Errorf("insert merge parents: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO pack_ranges (tenant_id, repo_id, pack_hash, base_commit_id, target_commit_id)
-			VALUES ($1, $2, $3, $4, $5)
-		`, tenantID, request.RepoID, request.PackHash, request.TargetCommitID, request.ResultCommitID); err != nil {
+			INSERT INTO pack_ranges (tenant_id, repo_id, pack_hash, object_format, base_commit_id, target_commit_id)
+			VALUES ($1, $2, $3, $4, $5, $6)
+		`, tenantID, request.RepoID, request.PackHash, normalizeObjectFormat(request.PackFormat), request.TargetCommitID, request.ResultCommitID); err != nil {
 			return fmt.Errorf("insert merge pack range: %w", err)
 		}
 
@@ -763,6 +855,34 @@ func (s *PGStore) GetCommitSnapshotRoot(ctx context.Context, repoID, commitID st
 	return snapshotRoot, nil
 }
 
+// GetCommitMetadata resolves the immutable snapshot root and framing version
+// of a visible commit. It is optional for older store fakes, keeping existing
+// HTTP preview contracts compatible while allowing v2 frames to retain parent
+// identity formats.
+func (s *PGStore) GetCommitMetadata(ctx context.Context, repoID, commitID string) (CommitMetadata, error) {
+	if _, err := requireTenantID(ctx); err != nil {
+		return CommitMetadata{}, fmt.Errorf("postgres: get commit metadata: %w", err)
+	}
+
+	metadata := CommitMetadata{ID: commitID}
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, `
+			SELECT snapshot_root, object_format
+			FROM commits
+			WHERE repo_id = $1 AND id = $2
+		`, repoID, commitID).Scan(&metadata.SnapshotRoot, &metadata.Format); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("postgres: get commit metadata: %w", ErrCommitNotFound)
+			}
+			return fmt.Errorf("postgres: get commit metadata: query commit: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return CommitMetadata{}, err
+	}
+	return metadata, nil
+}
+
 func collectMergeAncestry(ctx context.Context, tx pgx.Tx, repoID, commitID string) (map[string]int, error) {
 	type queuedCommit struct {
 		id    string
@@ -849,7 +969,6 @@ func commitParentIDs(ctx context.Context, tx pgx.Tx, repoID, commitID string) ([
 	return append(parents, *parent), nil
 }
 
-// GetPackRanges traverses packs from a branch head toward a known ancestor.
 func (s *PGStore) GetPackRanges(ctx context.Context, repoID, headCommitID, knownCommitID string) ([]PackRange, error) {
 	if _, err := requireTenantID(ctx); err != nil {
 		return nil, fmt.Errorf("postgres: get pack ranges: %w", err)
@@ -859,16 +978,16 @@ func (s *PGStore) GetPackRanges(ctx context.Context, repoID, headCommitID, known
 	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			WITH RECURSIVE pack_chain AS (
-				SELECT pack_hash, base_commit_id, target_commit_id, 0 AS depth
+				SELECT pack_hash, base_commit_id, target_commit_id, object_format, 0 AS depth
 				FROM pack_ranges
 				WHERE repo_id = $1 AND target_commit_id = $2
 				UNION ALL
-				SELECT p.pack_hash, p.base_commit_id, p.target_commit_id, c.depth + 1
+				SELECT p.pack_hash, p.base_commit_id, p.target_commit_id, p.object_format, c.depth + 1
 				FROM pack_ranges p
 				JOIN pack_chain c ON p.target_commit_id = c.base_commit_id
 				WHERE p.repo_id = $1 AND c.base_commit_id IS NOT NULL AND c.base_commit_id <> $3
 			)
-			SELECT pack_hash, COALESCE(base_commit_id, ''), target_commit_id
+			SELECT pack_hash, COALESCE(base_commit_id, ''), target_commit_id, object_format
 			FROM pack_chain
 			ORDER BY depth ASC
 		`, repoID, headCommitID, knownCommitID)
@@ -879,7 +998,7 @@ func (s *PGStore) GetPackRanges(ctx context.Context, repoID, headCommitID, known
 
 		for rows.Next() {
 			var pack PackRange
-			if err := rows.Scan(&pack.PackHash, &pack.BaseCommitID, &pack.TargetCommitID); err != nil {
+			if err := rows.Scan(&pack.PackHash, &pack.BaseCommitID, &pack.TargetCommitID, &pack.Format); err != nil {
 				return fmt.Errorf("postgres: get pack ranges: scan pack range: %w", err)
 			}
 			ranges = append(ranges, pack)
@@ -948,6 +1067,17 @@ func (s *PGStore) CompareAndSwapBranchRef(ctx context.Context, repoID, branch, e
 func (s *PGStore) withTenantTx(ctx context.Context, fn func(ctx context.Context, tx pgx.Tx) error) error {
 	tenantID, _ := tenantIDFromContext(ctx)
 	return s.withConfiguredTenantTx(ctx, tenantID, fn)
+}
+
+func validObjectFormat(format uint32) bool {
+	return format == 0 || format == 1 || format == 2
+}
+
+func normalizeObjectFormat(format uint32) uint32 {
+	if format == 0 {
+		return 1
+	}
+	return format
 }
 
 func (s *PGStore) withConfiguredTenantTx(ctx context.Context, tenantID string, fn func(ctx context.Context, tx pgx.Tx) error) error {

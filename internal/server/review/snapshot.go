@@ -7,14 +7,25 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/big"
 	"regexp"
 	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/cas"
+	"github.com/autonomous-bits/spool/graphcontract"
+	"github.com/fxamacker/cbor/v2"
 )
 
-// SnapshotVersion is the version of the graph snapshot JSON contract.
+// SnapshotVersion is the version of the Rack review snapshot contract.
 const SnapshotVersion uint32 = 1
+
+// SnapshotEnvelopeVersion is the version of Rack's canonical CBOR object
+// envelope. It is deliberately independent of SnapshotVersion: a v1 review
+// snapshot is losslessly represented in this v2 storage format.
+const SnapshotEnvelopeVersion uint32 = 2
 
 var (
 	// ErrInvalidSnapshot indicates malformed, incomplete, or nondeterministic
@@ -28,12 +39,28 @@ var (
 	ErrSchemaViolation = errors.New("review: graph snapshot schema violation")
 	// ErrInvalidSnapshotRoot indicates a value that cannot name a CAS object.
 	ErrInvalidSnapshotRoot = errors.New("review: invalid snapshot root")
+	// ErrInvalidCanonicalCBOR indicates a snapshot object which is not its
+	// unique canonical CBOR representation.
+	ErrInvalidCanonicalCBOR = errors.New("review: invalid canonical snapshot CBOR")
+	// ErrUnsupportedSnapshotData indicates JSON data that cannot be represented
+	// by graphcontract without an unsafe conversion.
+	ErrUnsupportedSnapshotData = errors.New("review: unsupported snapshot data")
 )
 
 var snapshotRootPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
-// Snapshot is a versioned, immutable graph value stored as one JSON object in
-// CAS. Its ordered collections are part of the contract: Nodes and Edges are
+var (
+	snapshotCanonicalCBOR, _ = cbor.CanonicalEncOptions().EncMode()
+	snapshotCBORDecoder, _   = cbor.DecOptions{
+		DupMapKey:         cbor.DupMapKeyEnforcedAPF,
+		IndefLength:       cbor.IndefLengthForbidden,
+		TagsMd:            cbor.TagsForbidden,
+		ExtraReturnErrors: cbor.ExtraDecErrorUnknownField,
+	}.DecMode()
+)
+
+// Snapshot is a versioned, immutable graph value stored in a canonical CBOR
+// envelope in CAS. Its ordered collections are part of the contract: Nodes and Edges are
 // sorted by ID; labels, properties, schema rules, and cardinality rules have
 // the ordering validated by Validate. A decoded Snapshot contains no state
 // outside this object, so a merge preview can safely load each of its three
@@ -43,34 +70,34 @@ var snapshotRootPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // iteration order explicit in the on-disk representation. Each property's
 // Value is canonical JSON whose shape is declared by Type.
 type Snapshot struct {
-	Version uint32 `json:"version"`
-	Schema  Schema `json:"schema"`
-	Nodes   []Node `json:"nodes"`
-	Edges   []Edge `json:"edges"`
+	Version uint32 `json:"version" cbor:"1,keyasint"`
+	Schema  Schema `json:"schema" cbor:"2,keyasint"`
+	Nodes   []Node `json:"nodes" cbor:"3,keyasint"`
+	Edges   []Edge `json:"edges" cbor:"4,keyasint"`
 }
 
 // Node is a labeled graph vertex.
 type Node struct {
-	ID         string     `json:"id"`
-	Labels     []string   `json:"labels"`
-	Properties []Property `json:"properties"`
+	ID         string     `json:"id" cbor:"1,keyasint"`
+	Labels     []string   `json:"labels" cbor:"2,keyasint"`
+	Properties []Property `json:"properties" cbor:"3,keyasint"`
 }
 
 // Edge is a labeled directed graph relationship from From to To.
 type Edge struct {
-	ID         string     `json:"id"`
-	From       string     `json:"from"`
-	To         string     `json:"to"`
-	Labels     []string   `json:"labels"`
-	Properties []Property `json:"properties"`
+	ID         string     `json:"id" cbor:"1,keyasint"`
+	From       string     `json:"from" cbor:"2,keyasint"`
+	To         string     `json:"to" cbor:"3,keyasint"`
+	Labels     []string   `json:"labels" cbor:"4,keyasint"`
+	Properties []Property `json:"properties" cbor:"5,keyasint"`
 }
 
 // Property is one typed JSON property. Value must be canonical JSON and its
 // JSON type must exactly match Type.
 type Property struct {
-	Name  string          `json:"name"`
-	Type  ValueType       `json:"type"`
-	Value json.RawMessage `json:"value"`
+	Name  string          `json:"name" cbor:"1,keyasint"`
+	Type  ValueType       `json:"type" cbor:"2,keyasint"`
+	Value json.RawMessage `json:"value" cbor:"3,keyasint"`
 }
 
 // ValueType is the JSON shape allowed for a Property value.
@@ -88,35 +115,35 @@ const (
 // Schema supplies the type and cardinality facts a three-way merge preview
 // needs to decide whether an otherwise structural merge is valid.
 type Schema struct {
-	NodeLabels    []LabelRule       `json:"nodeLabels"`
-	EdgeLabels    []LabelRule       `json:"edgeLabels"`
-	Cardinalities []CardinalityRule `json:"cardinalities"`
+	NodeLabels    []LabelRule       `json:"nodeLabels" cbor:"1,keyasint"`
+	EdgeLabels    []LabelRule       `json:"edgeLabels" cbor:"2,keyasint"`
+	Cardinalities []CardinalityRule `json:"cardinalities" cbor:"3,keyasint"`
 }
 
 // LabelRule constrains properties for every node or edge bearing Label.
 // Properties not mentioned by a matching rule remain valid, preserving the
 // graph's schemaless property capability.
 type LabelRule struct {
-	Label      string         `json:"label"`
-	Properties []PropertyRule `json:"properties"`
+	Label      string         `json:"label" cbor:"1,keyasint"`
+	Properties []PropertyRule `json:"properties" cbor:"2,keyasint"`
 }
 
 // PropertyRule constrains a named property when its enclosing Label applies.
 type PropertyRule struct {
-	Name     string    `json:"name"`
-	Type     ValueType `json:"type"`
-	Required bool      `json:"required"`
+	Name     string    `json:"name" cbor:"1,keyasint"`
+	Type     ValueType `json:"type" cbor:"2,keyasint"`
+	Required bool      `json:"required" cbor:"3,keyasint"`
 }
 
 // CardinalityRule applies to each node with FromLabel. Its outgoing edges
 // bearing EdgeLabel and ending at a node with ToLabel must be between Min and
 // Max inclusive. A nil Max is unbounded.
 type CardinalityRule struct {
-	EdgeLabel string `json:"edgeLabel"`
-	FromLabel string `json:"fromLabel"`
-	ToLabel   string `json:"toLabel"`
-	Min       int    `json:"min"`
-	Max       *int   `json:"max,omitempty"`
+	EdgeLabel string `json:"edgeLabel" cbor:"1,keyasint"`
+	FromLabel string `json:"fromLabel" cbor:"2,keyasint"`
+	ToLabel   string `json:"toLabel" cbor:"3,keyasint"`
+	Min       int    `json:"min" cbor:"4,keyasint"`
+	Max       *int   `json:"max,omitempty" cbor:"5,keyasint,omitempty"`
 }
 
 // SnapshotObjectStore is the minimal CAS capability needed to decode a graph
@@ -159,11 +186,16 @@ func DecodeSnapshot(ctx context.Context, objects SnapshotObjectStore, scope cas.
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("review: load snapshot root %s: %w", snapshotRoot, err)
 	}
-	snapshot, err := DecodeSnapshotJSON(data)
+	snapshot, err := DecodeSnapshotObject(data)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("review: decode snapshot root %s: %w", snapshotRoot, err)
 	}
 	return snapshot, nil
+}
+
+// DecodeSnapshotObject decodes a canonical CBOR review snapshot from storage.
+func DecodeSnapshotObject(data []byte) (Snapshot, error) {
+	return DecodeSnapshotCBOR(data)
 }
 
 // DecodeSnapshotJSON strictly decodes and validates the JSON payload of a
@@ -200,9 +232,7 @@ func DecodeSnapshotJSON(data []byte) (Snapshot, error) {
 }
 
 // MarshalSnapshotJSON validates snapshot and returns its deterministic JSON
-// representation for placement in a CAS object. It does not write the object:
-// callers retain control of the CAS scope and the content hash used as its
-// snapshotRoot.
+// representation for the HTTP compatibility bridge.
 func MarshalSnapshotJSON(snapshot Snapshot) ([]byte, error) {
 	if err := snapshot.Validate(); err != nil {
 		return nil, err
@@ -212,6 +242,193 @@ func MarshalSnapshotJSON(snapshot Snapshot) ([]byte, error) {
 		return nil, fmt.Errorf("%w: encode JSON: %w", ErrInvalidSnapshot, err)
 	}
 	return data, nil
+}
+
+// MarshalSnapshotCBOR validates snapshot and writes Rack's v2 canonical CBOR
+// envelope. The envelope contains the complete Rack model, including raw JSON
+// property values, as well as graphcontract's canonical graph objects. The
+// Rack model remains authoritative so decimal/exponent spelling is never
+// recovered from a float or otherwise silently coerced.
+func MarshalSnapshotCBOR(snapshot Snapshot) ([]byte, error) {
+	envelope, err := newSnapshotEnvelope(snapshot)
+	if err != nil {
+		return nil, err
+	}
+	data, err := snapshotCanonicalCBOR.Marshal(envelope)
+	if err != nil {
+		return nil, fmt.Errorf("%w: encode CBOR: %v", ErrInvalidSnapshot, err)
+	}
+	return data, nil
+}
+
+// DecodeSnapshotCBOR strictly decodes a v2 snapshot envelope. Re-marshalling
+// and comparing the input rejects alternate integer widths, map ordering,
+// duplicate keys, indefinite lengths, and every other noncanonical encoding.
+func DecodeSnapshotCBOR(data []byte) (Snapshot, error) {
+	var envelope snapshotEnvelope
+	if err := snapshotCBORDecoder.Unmarshal(data, &envelope); err != nil {
+		return Snapshot{}, fmt.Errorf("%w: decode CBOR: %v", ErrInvalidCanonicalCBOR, err)
+	}
+	if envelope.Version != SnapshotEnvelopeVersion {
+		return Snapshot{}, fmt.Errorf("%w: envelope version %d", ErrUnsupportedSnapshotVersion, envelope.Version)
+	}
+	canonical, err := snapshotCanonicalCBOR.Marshal(envelope)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("%w: re-encode CBOR: %v", ErrInvalidCanonicalCBOR, err)
+	}
+	if !bytes.Equal(data, canonical) {
+		return Snapshot{}, fmt.Errorf("%w: object is not canonically encoded", ErrInvalidCanonicalCBOR)
+	}
+	if err := envelope.validate(); err != nil {
+		return Snapshot{}, err
+	}
+	return envelope.Snapshot, nil
+}
+
+// MarshalSnapshot is the storage codec for newly-created Rack snapshots.
+func MarshalSnapshot(snapshot Snapshot) ([]byte, error) {
+	return MarshalSnapshotCBOR(snapshot)
+}
+
+type snapshotEnvelope struct {
+	Version  uint32               `cbor:"1,keyasint"`
+	Snapshot Snapshot             `cbor:"2,keyasint"`
+	Nodes    []graphcontract.Node `cbor:"3,keyasint"`
+	Edges    []graphcontract.Edge `cbor:"4,keyasint"`
+}
+
+func newSnapshotEnvelope(snapshot Snapshot) (snapshotEnvelope, error) {
+	if err := snapshot.Validate(); err != nil {
+		return snapshotEnvelope{}, err
+	}
+	envelope := snapshotEnvelope{
+		Version:  SnapshotEnvelopeVersion,
+		Snapshot: snapshot,
+		Nodes:    make([]graphcontract.Node, len(snapshot.Nodes)),
+		Edges:    make([]graphcontract.Edge, len(snapshot.Edges)),
+	}
+	for i, node := range snapshot.Nodes {
+		properties, err := graphProperties(node.Properties)
+		if err != nil {
+			return snapshotEnvelope{}, fmt.Errorf("%w: node %q: %v", ErrUnsupportedSnapshotData, node.ID, err)
+		}
+		graphNode, err := graphcontract.NewNode(node.ID, "", node.Labels, properties)
+		if err != nil {
+			return snapshotEnvelope{}, fmt.Errorf("%w: node %q: %v", ErrUnsupportedSnapshotData, node.ID, err)
+		}
+		envelope.Nodes[i] = graphNode
+	}
+	for i, edge := range snapshot.Edges {
+		properties, err := graphProperties(edge.Properties)
+		if err != nil {
+			return snapshotEnvelope{}, fmt.Errorf("%w: edge %q: %v", ErrUnsupportedSnapshotData, edge.ID, err)
+		}
+		// graphcontract has one edge Type while Rack preserves its complete,
+		// ordered label set in Snapshot.Edges. The first label is a stable
+		// projection, never a replacement for the Rack-owned labels.
+		graphEdge, err := graphcontract.NewEdge(edge.ID, edge.From, edge.To, edge.Labels[0], properties)
+		if err != nil {
+			return snapshotEnvelope{}, fmt.Errorf("%w: edge %q: %v", ErrUnsupportedSnapshotData, edge.ID, err)
+		}
+		envelope.Edges[i] = graphEdge
+	}
+	return envelope, nil
+}
+
+func (e snapshotEnvelope) validate() error {
+	expected, err := newSnapshotEnvelope(e.Snapshot)
+	if err != nil {
+		return err
+	}
+	if len(e.Nodes) != len(expected.Nodes) || len(e.Edges) != len(expected.Edges) {
+		return fmt.Errorf("%w: graphcontract object count does not match Rack snapshot", ErrInvalidSnapshot)
+	}
+	for i := range e.Nodes {
+		if !e.Nodes[i].Equal(expected.Nodes[i]) {
+			return fmt.Errorf("%w: graphcontract node %d does not match Rack snapshot", ErrInvalidSnapshot, i)
+		}
+	}
+	for i := range e.Edges {
+		if !e.Edges[i].Equal(expected.Edges[i]) {
+			return fmt.Errorf("%w: graphcontract edge %d does not match Rack snapshot", ErrInvalidSnapshot, i)
+		}
+	}
+	return nil
+}
+
+func graphProperties(properties []Property) (map[string]graphcontract.PropertyValue, error) {
+	result := make(map[string]graphcontract.PropertyValue, len(properties))
+	for _, property := range properties {
+		value, err := graphPropertyValue(property.Value)
+		if err != nil {
+			return nil, fmt.Errorf("property %q: %w", property.Name, err)
+		}
+		result[property.Name] = value
+	}
+	return result, nil
+}
+
+func graphPropertyValue(raw json.RawMessage) (graphcontract.PropertyValue, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return graphcontract.PropertyValue{}, fmt.Errorf("decode JSON: %w", err)
+	}
+	if err := ensureEOF(decoder); err != nil {
+		return graphcontract.PropertyValue{}, err
+	}
+	return graphValue(value)
+}
+
+func graphValue(value any) (graphcontract.PropertyValue, error) {
+	switch value := value.(type) {
+	case nil:
+		return graphcontract.NullPropertyValue(), nil
+	case bool:
+		return graphcontract.BoolPropertyValue(value), nil
+	case string:
+		return graphcontract.StringPropertyValue(value), nil
+	case json.Number:
+		if !strings.ContainsAny(value.String(), ".eE") {
+			integer, err := value.Int64()
+			if err != nil {
+				return graphcontract.PropertyValue{}, fmt.Errorf("integer %q cannot be represented by graphcontract", value)
+			}
+			return graphcontract.IntegerPropertyValue(integer), nil
+		}
+		number, err := strconv.ParseFloat(value.String(), 64)
+		if err != nil || math.IsNaN(number) || math.IsInf(number, 0) {
+			return graphcontract.PropertyValue{}, fmt.Errorf("number %q cannot be represented by graphcontract", value)
+		}
+		exact, ok := new(big.Rat).SetString(value.String())
+		if !ok || exact.Cmp(new(big.Rat).SetFloat64(number)) != 0 {
+			return graphcontract.PropertyValue{}, fmt.Errorf("number %q cannot be represented exactly by graphcontract float64", value)
+		}
+		return graphcontract.FloatPropertyValue(number), nil
+	case []any:
+		items := make([]graphcontract.PropertyValue, len(value))
+		for i, item := range value {
+			converted, err := graphValue(item)
+			if err != nil {
+				return graphcontract.PropertyValue{}, fmt.Errorf("array item %d: %w", i, err)
+			}
+			items[i] = converted
+		}
+		return graphcontract.ListPropertyValue(items), nil
+	case map[string]any:
+		items := make(map[string]graphcontract.PropertyValue, len(value))
+		for key, item := range value {
+			converted, err := graphValue(item)
+			if err != nil {
+				return graphcontract.PropertyValue{}, fmt.Errorf("object key %q: %w", key, err)
+			}
+			items[key] = converted
+		}
+		return graphcontract.MapPropertyValue(items), nil
+	default:
+		return graphcontract.PropertyValue{}, fmt.Errorf("unexpected JSON value type %T", value)
+	}
 }
 
 type snapshotWire struct {
@@ -226,6 +443,9 @@ type snapshotWire struct {
 func (s Snapshot) Validate() error {
 	if s.Version != SnapshotVersion {
 		return fmt.Errorf("%w: version %d", ErrUnsupportedSnapshotVersion, s.Version)
+	}
+	if s.Nodes == nil || s.Edges == nil {
+		return invalidSnapshotf("nodes and edges must be arrays")
 	}
 	if err := validateSchema(s.Schema); err != nil {
 		return err

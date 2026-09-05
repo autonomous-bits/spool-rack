@@ -77,7 +77,10 @@ func New(opts ...Option) *Gateway {
 		g.verifier = auth.PermissiveVerifier{}
 	}
 	if g.casDriver != nil && g.branchStore != nil {
-		g.pushEngine = serversync.NewPushEngine(g.casDriver, g.branchStore)
+		g.pushEngine = serversync.NewPushEngine(g.casDriver, g.branchStore, func(data []byte) error {
+			_, err := review.DecodeSnapshotCBOR(data)
+			return err
+		})
 		g.pullEngine = serversync.NewPullEngine(g.casDriver, g.branchStore)
 		if g.previewEngine == nil {
 			if metadataStore, ok := g.branchStore.(review.MetadataStore); ok {
@@ -347,7 +350,7 @@ func (g *Gateway) handlePull(w http.ResponseWriter, r *http.Request) {
 	}
 
 	plan, err := g.pullEngine.PreparePull(r.Context(), req)
-	if errors.Is(err, serversync.UpToDateError) {
+	if errors.Is(err, serversync.ErrUpToDate) {
 		w.Header().Set("X-Spool-Head-Commit", plan.Head)
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -372,15 +375,17 @@ func (g *Gateway) handlePull(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, r, g.logger, http.StatusInternalServerError, ErrorCodeInternal, "failed to prepare pull")
 		return
 	}
-	if err := g.pullEngine.ValidatePullPacks(r.Context(), plan); err != nil {
+	manifest, err := g.pullEngine.BuildPullManifest(r.Context(), plan)
+	if err != nil {
 		writeJSONError(w, r, g.logger, http.StatusInternalServerError, ErrorCodeInternal, "failed to open pull pack")
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Type", "application/vnd.spool-rack.pull-envelope")
 	w.Header().Set("Content-Encoding", "zstd")
+	w.Header().Set("X-Spool-Pull-Format", "2")
 	w.Header().Set("X-Spool-Head-Commit", plan.Head)
-	if err := g.pullEngine.StreamPull(r.Context(), plan, w); err != nil {
+	if err := g.pullEngine.StreamPullWithManifest(r.Context(), plan, manifest, w); err != nil {
 		logger := g.logger
 		if logger == nil {
 			logger = defaultLogger
@@ -432,6 +437,7 @@ type pushMetadata struct {
 	BaseCommit   string                    `json:"baseCommit"`
 	TargetCommit string                    `json:"targetCommit"`
 	PackHash     string                    `json:"packHash"`
+	PackFormat   uint32                    `json:"packFormat,omitempty"`
 	Commits      []serversync.CommitRecord `json:"commits,omitempty"`
 }
 
@@ -500,6 +506,7 @@ func (g *Gateway) handlePush(w http.ResponseWriter, r *http.Request) {
 				TargetCommit: meta.TargetCommit,
 				Commits:      meta.Commits,
 				PackHash:     meta.PackHash,
+				PackFormat:   meta.PackFormat,
 				PackStream:   part,
 			}
 			err := g.pushEngine.HandlePush(r.Context(), req)
