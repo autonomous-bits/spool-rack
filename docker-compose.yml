@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: spool-rack-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: spool_rack
+      POSTGRES_USER: spool
+      POSTGRES_PASSWORD: spoolpassword
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spool -d spool_rack"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:

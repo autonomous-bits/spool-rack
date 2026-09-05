@@ -1,0 +1,21 @@
+# Binaries
+bin/
+dist/
+/spool-rack
+
+# Environment & local state
+.env
+.env.local
+tmp/
+scratch/
+
+# OS files
+.DS_Store
+
+# Test coverage & artifacts
+coverage.out
+*.test
+
+# Locks
+*.lock
+.spl/*.lock

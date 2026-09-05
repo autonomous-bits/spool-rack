@@ -1,0 +1,7 @@
+module github.com/autonomous-bits/spool-rack/cmd/spool-rack
+
+go 1.26.0
+
+require github.com/autonomous-bits/spool-rack v0.0.0
+
+replace github.com/autonomous-bits/spool-rack => ../..
