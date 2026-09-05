@@ -240,21 +240,14 @@ func (e *FinalizeEngine) Apply(ctx context.Context, tenantID, repoID string, req
 }
 
 func frameCommitIdentity(commit CommitIdentity) (serversync.CommitIdentity, error) {
-	switch commit.Format {
-	case 0, serversync.CommitFormatLegacy:
-		if commit.ID == "" {
-			return serversync.CommitIdentity{}, fmt.Errorf("%w: missing legacy commit ID", ErrInvalidMergeRequest)
-		}
-		return serversync.LegacyCommitIdentity(commit.ID), nil
-	case serversync.CommitFormatV2:
-		identity := serversync.V2CommitIdentity(commit.ID)
-		if err := identity.Validate(); err != nil {
-			return serversync.CommitIdentity{}, fmt.Errorf("%w: invalid v2 commit identity: %v", ErrInvalidMergeRequest, err)
-		}
-		return identity, nil
-	default:
-		return serversync.CommitIdentity{}, fmt.Errorf("%w: unsupported commit format %d", ErrInvalidMergeRequest, commit.Format)
+	if commit.Format != serversync.CommitFormatV2 {
+		return serversync.CommitIdentity{}, fmt.Errorf("%w: merge parents must use v2 framing", ErrInvalidMergeRequest)
 	}
+	identity := serversync.V2CommitIdentity(commit.ID)
+	if err := identity.Validate(); err != nil {
+		return serversync.CommitIdentity{}, fmt.Errorf("%w: invalid v2 commit identity: %v", ErrInvalidMergeRequest, err)
+	}
+	return identity, nil
 }
 
 func (e *FinalizeEngine) preview(ctx context.Context, tenantID, repoID, sourceBranch, targetBranch string) (*MergePreview, error) {

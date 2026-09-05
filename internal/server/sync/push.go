@@ -120,7 +120,7 @@ func (e *PushEngine) HandlePush(ctx context.Context, req PushRequest) error {
 			return fmt.Errorf("sync: push: register commit %s: %w", c.ID, err)
 		}
 	}
-	if formatted, ok := e.store.(formattedPackStore); ok && normalizePackFormat(req.PackFormat) == PackFormatV2 {
+	if formatted, ok := e.store.(formattedPackStore); ok {
 		if err := formatted.PutPackRangeWithFormat(ctx, req.RepoID, req.PackHash, req.BaseCommit, req.TargetCommit, PackFormatV2); err != nil {
 			return fmt.Errorf("sync: push: register pack range: %w", err)
 		}
@@ -161,24 +161,18 @@ func validatePushRequest(req PushRequest) error {
 		return fmt.Errorf("sync: push: base commit is required")
 	case req.PackHash == "":
 		return fmt.Errorf("sync: push: pack hash is required")
-	case packFormat != PackFormatLegacy && packFormat != PackFormatV2:
-		return fmt.Errorf("sync: push: unsupported pack format %d", req.PackFormat)
+	case packFormat != PackFormatV2:
+		return fmt.Errorf("%w: native pushes require a v2 pack frame", ErrInvalidFrame)
 	}
 	for _, commit := range req.Commits {
 		if err := validateCommitRecord(commit); err != nil {
 			return err
-		}
-		if packFormat == PackFormatLegacy && commit.Identity != nil && commit.Identity.Format == CommitFormatV2 {
-			return fmt.Errorf("%w: v2 commits require a v2 pack frame", ErrInvalidFrame)
 		}
 	}
 	return nil
 }
 
 func (e *PushEngine) writePack(ctx context.Context, scope cas.Scope, req PushRequest) (*PackFrameV2, error) {
-	if normalizePackFormat(req.PackFormat) != PackFormatV2 {
-		return nil, e.driver.WritePack(ctx, scope, req.PackHash, req.PackStream)
-	}
 	if req.PackStream == nil {
 		return nil, fmt.Errorf("v2 pack stream is required")
 	}
@@ -201,9 +195,6 @@ func (e *PushEngine) writePack(ctx context.Context, scope cas.Scope, req PushReq
 	}
 	if frame.Base.ID != req.BaseCommit || frame.Target.ID != req.TargetCommit {
 		return nil, fmt.Errorf("%w: pack frame base/target does not match push metadata", ErrInvalidFrame)
-	}
-	if len(frame.SupplementalCommits) != 0 {
-		return nil, fmt.Errorf("%w: client v2 pushes cannot include supplemental merge commits", ErrInvalidFrame)
 	}
 	if err := validateV2CommitMetadata(req.Commits, frame.Commits); err != nil {
 		return nil, err
@@ -232,6 +223,9 @@ func (e *PushEngine) writePack(ctx context.Context, scope cas.Scope, req PushReq
 }
 
 func (e *PushEngine) validateV2BaseFormat(ctx context.Context, repoID string, frame PackFrameV2) error {
+	if frame.Base.Format != CommitFormatV2 {
+		return fmt.Errorf("%w: native v2 pack base must use v2 framing", ErrInvalidFrame)
+	}
 	metadata, err := e.store.GetCommitMetadata(ctx, repoID, frame.Base.ID)
 	if err != nil {
 		return fmt.Errorf("sync: push: resolve v2 pack base %s: %w", frame.Base.ID, err)
@@ -280,13 +274,18 @@ func validateV2CommitMetadata(records []CommitRecord, frames []CommitFrameV2) er
 		if len(frame.Parents) > 1 {
 			return fmt.Errorf("%w: v2 push metadata cannot represent merge commit %d", ErrInvalidFrame, i)
 		}
+		for _, parent := range frame.Parents {
+			if parent.Format != CommitFormatV2 {
+				return fmt.Errorf("%w: native v2 commits require v2 parents", ErrInvalidFrame)
+			}
+		}
 	}
 	return nil
 }
 
 func normalizePackFormat(format uint32) uint32 {
 	if format == 0 {
-		return PackFormatLegacy
+		return PackFormatV2
 	}
 	return format
 }

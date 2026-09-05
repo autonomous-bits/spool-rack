@@ -375,15 +375,17 @@ func (g *Gateway) handlePull(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, r, g.logger, http.StatusInternalServerError, ErrorCodeInternal, "failed to prepare pull")
 		return
 	}
-	if err := g.pullEngine.ValidatePullPacks(r.Context(), plan); err != nil {
+	manifest, err := g.pullEngine.BuildPullManifest(r.Context(), plan)
+	if err != nil {
 		writeJSONError(w, r, g.logger, http.StatusInternalServerError, ErrorCodeInternal, "failed to open pull pack")
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Type", "application/vnd.spool-rack.pull-envelope")
 	w.Header().Set("Content-Encoding", "zstd")
+	w.Header().Set("X-Spool-Pull-Format", "2")
 	w.Header().Set("X-Spool-Head-Commit", plan.Head)
-	if err := g.pullEngine.StreamPull(r.Context(), plan, w); err != nil {
+	if err := g.pullEngine.StreamPullWithManifest(r.Context(), plan, manifest, w); err != nil {
 		logger := g.logger
 		if logger == nil {
 			logger = defaultLogger

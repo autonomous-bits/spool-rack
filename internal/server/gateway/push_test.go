@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
-	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -19,7 +18,7 @@ import (
 	"lukechampine.com/blake3"
 )
 
-func TestPushSuccess(t *testing.T) {
+func TestPushRejectsLegacyPack(t *testing.T) {
 	t.Parallel()
 
 	driver, err := cas.NewLocalDriver(t.TempDir())
@@ -28,7 +27,6 @@ func TestPushSuccess(t *testing.T) {
 	}
 
 	baseCommit := hashCommitString("commit-a")
-	targetParent := hashCommitString("commit-b")
 	targetCommit := hashCommitString("commit-c")
 	store := &fakeGatewayBranchStore{
 		branchHeads: map[gatewayBranchKey]string{
@@ -43,7 +41,7 @@ func TestPushSuccess(t *testing.T) {
 		})),
 	)
 
-	packData := []byte("gateway push success pack payload")
+	packData := []byte("legacy push payload")
 	req := newPushRequest(t, pushRequestFixture{
 		token:    "contributor-token",
 		tenantID: "tenant-1",
@@ -53,10 +51,7 @@ func TestPushSuccess(t *testing.T) {
 			BaseCommit:   baseCommit,
 			TargetCommit: targetCommit,
 			PackHash:     hashPackBytes(packData),
-			Commits: []serversync.CommitRecord{
-				{ID: targetParent, ParentID: baseCommit, SnapshotRoot: hashCommitString("snap-b"), Author: "alice", Message: "commit b"},
-				{ID: targetCommit, ParentID: targetParent, SnapshotRoot: hashCommitString("snap-c"), Author: "alice", Message: "commit c"},
-			},
+			PackFormat:   1,
 		},
 		packData: packData,
 	})
@@ -64,62 +59,10 @@ func TestPushSuccess(t *testing.T) {
 
 	gw.Routes().ServeHTTP(rec, req)
 
-	assertStatus(t, rec, http.StatusOK)
-	body := decodeBody(t, rec)
-	assertBodyValue(t, body, "branch", "main")
-	assertBodyValue(t, body, "headCommit", targetCommit)
-
-	if store.compareAndSwapCalls != 1 {
-		t.Fatalf("CompareAndSwapBranchRef() calls = %d, want 1", store.compareAndSwapCalls)
-	}
-	if len(store.putCommitCalls) != 2 {
-		t.Fatalf("PutCommit() calls = %d, want 2", len(store.putCommitCalls))
-	}
-	if store.putCommitCalls[0] != (gatewayPutCommitCall{
-		repoID:       "repo-1",
-		commitID:     targetParent,
-		parentID:     baseCommit,
-		snapshotRoot: hashCommitString("snap-b"),
-		author:       "alice",
-		message:      "commit b",
-	}) {
-		t.Fatalf("PutCommit() call 0 = %+v", store.putCommitCalls[0])
-	}
-	if store.putCommitCalls[1] != (gatewayPutCommitCall{
-		repoID:       "repo-1",
-		commitID:     targetCommit,
-		parentID:     targetParent,
-		snapshotRoot: hashCommitString("snap-c"),
-		author:       "alice",
-		message:      "commit c",
-	}) {
-		t.Fatalf("PutCommit() call 1 = %+v", store.putCommitCalls[1])
-	}
-	if got := store.compareAndSwapArgs; got != (gatewayCASArgs{
-		repoID:         "repo-1",
-		branch:         "main",
-		expectedCommit: baseCommit,
-		newCommit:      targetCommit,
-	}) {
-		t.Fatalf("CompareAndSwapBranchRef() args = %+v", got)
-	}
-
-	scope, err := cas.NewScope("tenant-1", "repo-1")
-	if err != nil {
-		t.Fatalf("NewScope() error = %v", err)
-	}
-	rc, err := driver.OpenPack(context.Background(), scope, hashPackBytes(packData))
-	if err != nil {
-		t.Fatalf("OpenPack() error = %v", err)
-	}
-	defer func() { _ = rc.Close() }()
-
-	gotPackData, err := io.ReadAll(rc)
-	if err != nil {
-		t.Fatalf("ReadAll(OpenPack()) error = %v", err)
-	}
-	if !bytes.Equal(gotPackData, packData) {
-		t.Fatalf("OpenPack() payload mismatch: got %q want %q", gotPackData, packData)
+	assertStatus(t, rec, http.StatusBadRequest)
+	assertErrorCode(t, rec, ErrorCodeBadRequest)
+	if len(store.putCommitCalls) != 0 || store.compareAndSwapCalls != 0 {
+		t.Fatalf("legacy push mutated metadata: commits=%d updates=%d", len(store.putCommitCalls), store.compareAndSwapCalls)
 	}
 }
 
@@ -170,7 +113,7 @@ func TestPushForbiddenForViewer(t *testing.T) {
 	}
 }
 
-func TestPushConflictReturnsCurrentHead(t *testing.T) {
+func TestPushRejectsOmittedLegacyPackFormat(t *testing.T) {
 	t.Parallel()
 
 	driver, err := cas.NewLocalDriver(t.TempDir())
@@ -215,10 +158,8 @@ func TestPushConflictReturnsCurrentHead(t *testing.T) {
 
 	gw.Routes().ServeHTTP(rec, req)
 
-	assertStatus(t, rec, http.StatusConflict)
-	assertErrorCode(t, rec, ErrorCodeConflict)
-	body := decodeBody(t, rec)
-	assertBodyValue(t, body, "currentHead", actualHead)
+	assertStatus(t, rec, http.StatusBadRequest)
+	assertErrorCode(t, rec, ErrorCodeBadRequest)
 }
 
 func TestPushRejectsNonMultipartBody(t *testing.T) {
@@ -337,11 +278,11 @@ func TestPushRejectsNonCanonicalV2Snapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	base := hashCommitString("legacy-base")
+	base := hashCommitString("v2-base")
 	snapshot := []byte("not a Rack canonical CBOR snapshot")
 	commit := serversync.CommitFrameV2{
 		Version:      serversync.CommitFormatV2,
-		Parents:      []serversync.CommitIdentity{serversync.LegacyCommitIdentity(base)},
+		Parents:      []serversync.CommitIdentity{serversync.V2CommitIdentity(base)},
 		SnapshotRoot: serversync.ContentID(snapshot),
 		Author:       "Ada",
 		Message:      "reject invalid snapshot",
@@ -352,7 +293,7 @@ func TestPushRejectsNonCanonicalV2Snapshot(t *testing.T) {
 	}
 	pack, err := serversync.MarshalPackFrameV2(serversync.PackFrameV2{
 		Version: serversync.PackFormatV2,
-		Base:    serversync.LegacyCommitIdentity(base),
+		Base:    serversync.V2CommitIdentity(base),
 		Target:  target,
 		Commits: []serversync.CommitFrameV2{commit},
 		Objects: []serversync.PackObjectV2{{ID: serversync.ContentID(snapshot), Data: snapshot}},
@@ -360,7 +301,10 @@ func TestPushRejectsNonCanonicalV2Snapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := &fakeGatewayBranchStore{branchHeads: map[gatewayBranchKey]string{{repoID: "repo-1", branch: "main"}: base}}
+	store := &fakeGatewayBranchStore{
+		branchHeads:  map[gatewayBranchKey]string{{repoID: "repo-1", branch: "main"}: base},
+		commitFormat: map[string]uint32{base: serversync.CommitFormatV2},
+	}
 	gw := New(
 		WithCASDriver(driver),
 		WithBranchStore(store),
@@ -398,7 +342,7 @@ func TestPushAcceptsCanonicalV2Snapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	base := hashCommitString("legacy-base")
+	base := hashCommitString("v2-base")
 	snapshot, err := review.MarshalSnapshotCBOR(review.Snapshot{
 		Version: review.SnapshotVersion,
 		Schema: review.Schema{
@@ -411,7 +355,7 @@ func TestPushAcceptsCanonicalV2Snapshot(t *testing.T) {
 	}
 	commit := serversync.CommitFrameV2{
 		Version:      serversync.CommitFormatV2,
-		Parents:      []serversync.CommitIdentity{serversync.LegacyCommitIdentity(base)},
+		Parents:      []serversync.CommitIdentity{serversync.V2CommitIdentity(base)},
 		SnapshotRoot: serversync.ContentID(snapshot),
 		Author:       "Ada",
 		Message:      "accept canonical snapshot",
@@ -422,7 +366,7 @@ func TestPushAcceptsCanonicalV2Snapshot(t *testing.T) {
 	}
 	pack, err := serversync.MarshalPackFrameV2(serversync.PackFrameV2{
 		Version: serversync.PackFormatV2,
-		Base:    serversync.LegacyCommitIdentity(base),
+		Base:    serversync.V2CommitIdentity(base),
 		Target:  target,
 		Commits: []serversync.CommitFrameV2{commit},
 		Objects: []serversync.PackObjectV2{{ID: serversync.ContentID(snapshot), Data: snapshot}},
@@ -430,7 +374,10 @@ func TestPushAcceptsCanonicalV2Snapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := &fakeGatewayBranchStore{branchHeads: map[gatewayBranchKey]string{{repoID: "repo-1", branch: "main"}: base}}
+	store := &fakeGatewayBranchStore{
+		branchHeads:  map[gatewayBranchKey]string{{repoID: "repo-1", branch: "main"}: base},
+		commitFormat: map[string]uint32{base: serversync.CommitFormatV2},
+	}
 	gw := New(
 		WithCASDriver(driver),
 		WithBranchStore(store),

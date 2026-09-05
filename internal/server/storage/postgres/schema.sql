@@ -134,9 +134,16 @@ CREATE TABLE IF NOT EXISTS branches (
 	CONSTRAINT branches_head_commit_scope_fk
 		FOREIGN KEY (tenant_id, repo_id, head_commit_id)
 		REFERENCES commits(tenant_id, repo_id, id),
-	PRIMARY KEY (repo_id, name),
-	UNIQUE (tenant_id, repo_id, name)
+	PRIMARY KEY (repo_id, name)
 );
+
+-- Leases reference a branch together with its tenant and repository scope.
+-- Keep this candidate key separate and before the lease table so fresh schema
+-- bootstrap can create that foreign key. The conventional constraint-backed
+-- index name lets this remain a no-op for databases created by earlier
+-- schema versions that already have the equivalent unique constraint.
+CREATE UNIQUE INDEX IF NOT EXISTS branches_tenant_id_repo_id_name_key
+	ON branches (tenant_id, repo_id, name);
 
 -- parent_commit_id remains the legacy first-parent representation.  The
 -- normalized table records an ordered parent list so a merge commit can retain

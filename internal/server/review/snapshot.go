@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"regexp"
 	"sort"
 	"strconv"
@@ -399,6 +400,10 @@ func graphValue(value any) (graphcontract.PropertyValue, error) {
 		number, err := strconv.ParseFloat(value.String(), 64)
 		if err != nil || math.IsNaN(number) || math.IsInf(number, 0) {
 			return graphcontract.PropertyValue{}, fmt.Errorf("number %q cannot be represented by graphcontract", value)
+		}
+		exact, ok := new(big.Rat).SetString(value.String())
+		if !ok || exact.Cmp(new(big.Rat).SetFloat64(number)) != 0 {
+			return graphcontract.PropertyValue{}, fmt.Errorf("number %q cannot be represented exactly by graphcontract float64", value)
 		}
 		return graphcontract.FloatPropertyValue(number), nil
 	case []any:

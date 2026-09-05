@@ -26,6 +26,7 @@ func TestPackFrameV2CanonicalRoundTrip(t *testing.T) {
 		Author:       "Ada",
 		Message:      "v2 frame",
 	}
+
 	target, err := commit.Identity()
 	if err != nil {
 		t.Fatal(err)
@@ -56,5 +57,26 @@ func TestPackFrameV2CanonicalRoundTrip(t *testing.T) {
 	noncanonical := append([]byte{0xb8, 0x07}, data[1:]...)
 	if _, err := UnmarshalPackFrameV2(noncanonical); !errors.Is(err, ErrInvalidCanonicalFrame) {
 		t.Fatalf("UnmarshalPackFrameV2(noncanonical) error = %v, want canonical error", err)
+	}
+}
+
+func TestPackFrameV2RequiresObjectsForEveryCommitSnapshot(t *testing.T) {
+	t.Parallel()
+
+	snapshot := []byte("required snapshot")
+	commit := CommitFrameV2{
+		Version: CommitFormatV2, Parents: []CommitIdentity{},
+		SnapshotRoot: ContentID(snapshot), Author: "Ada", Message: "root",
+	}
+	target, err := commit.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = MarshalPackFrameV2(PackFrameV2{
+		Version: PackFormatV2, Target: target, Commits: []CommitFrameV2{commit},
+		Objects: []PackObjectV2{},
+	})
+	if !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("MarshalPackFrameV2() error = %v, want missing snapshot frame error", err)
 	}
 }

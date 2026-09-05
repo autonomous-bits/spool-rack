@@ -164,6 +164,52 @@ func mustCreateBranch(t *testing.T, store *PGStore, ctx context.Context, repoID,
 	}
 }
 
+func TestSchemaBootstrapIncludesMergeLeaseBranchCandidateKey(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	var candidateKeyExists bool
+	err := store.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM pg_index
+			WHERE indexrelid = 'branches_tenant_id_repo_id_name_key'::regclass
+				AND indrelid = 'branches'::regclass
+				AND indisunique
+				AND (
+					SELECT array_agg(attribute.attname ORDER BY key.ordinality)
+					FROM unnest(indkey) WITH ORDINALITY AS key(attnum, ordinality)
+					JOIN pg_attribute AS attribute
+						ON attribute.attrelid = indrelid
+						AND attribute.attnum = key.attnum
+				) = ARRAY['tenant_id', 'repo_id', 'name']::name[]
+		)
+	`).Scan(&candidateKeyExists)
+	if err != nil {
+		t.Fatalf("query branch candidate key: %v", err)
+	}
+	if !candidateKeyExists {
+		t.Fatal("branches tenant/repository/name candidate key is missing")
+	}
+
+	var leaseBranchForeignKeyExists bool
+	err = store.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM pg_constraint
+			WHERE conname = 'target_branch_merge_leases_branch_scope_fk'
+				AND contype = 'f'
+				AND conrelid = 'target_branch_merge_leases'::regclass
+				AND confrelid = 'branches'::regclass
+		)
+	`).Scan(&leaseBranchForeignKeyExists)
+	if err != nil {
+		t.Fatalf("query merge lease branch foreign key: %v", err)
+	}
+	if !leaseBranchForeignKeyExists {
+		t.Fatal("target branch merge leases branch scope foreign key is missing")
+	}
+}
+
 func TestCrossTenantIsolation(t *testing.T) {
 	store, ctx := newTestStore(t)
 

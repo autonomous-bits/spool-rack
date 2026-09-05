@@ -34,8 +34,8 @@ type PushRequest struct {
 	// TargetCommit/BaseCommit, which refer to existing commits.id rows in
 	// PostgreSQL metadata.
 	PackHash string
-	// PackFormat is omitted by JSON v1 clients and therefore defaults to the
-	// opaque legacy framing. Format 2 requires a canonical PackFrameV2.
+	// PackFormat defaults to canonical v2 framing so the JSON control plane
+	// cannot create opaque legacy history.
 	PackFormat uint32
 	PackStream io.Reader
 }

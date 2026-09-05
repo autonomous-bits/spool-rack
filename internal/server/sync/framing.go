@@ -20,8 +20,6 @@ const (
 	CommitFormatLegacy uint32 = 1
 	// CommitFormatV2 identifies a commit ID derived from CommitFrameV2.
 	CommitFormatV2 uint32 = 2
-	// PackFormatLegacy identifies an opaque v1 pack payload.
-	PackFormatLegacy uint32 = 1
 	// PackFormatV2 identifies a canonical Rack pack frame.
 	PackFormatV2 uint32 = 2
 )
@@ -81,8 +79,8 @@ func (id CommitIdentity) validate() error {
 	return nil
 }
 
-// CommitFrameV2 is the canonical preimage of a v2 commit ID. Parents retain
-// their own explicit format, so a migrated DAG does not reinterpret v1 IDs.
+// CommitFrameV2 is the canonical preimage of a v2 commit ID. Parent identity
+// formats are explicit so frame validation never infers an ID's meaning.
 type CommitFrameV2 struct {
 	Version      uint32           `cbor:"1,keyasint"`
 	Parents      []CommitIdentity `cbor:"2,keyasint"`
@@ -139,21 +137,15 @@ type PackObjectV2 struct {
 	Data []byte `cbor:"2,keyasint"`
 }
 
-// PackFrameV2 is the explicit Rack-owned v2 pack format. New packs carry
-// canonical v2 commit preimages and CAS objects. A migration may additionally
-// carry an opaque legacy pack verbatim; it is never decoded or reinterpreted.
+// PackFrameV2 is one bounded, canonical v2 slice of a commit DAG. Its
+// first-parent chain advances Base to Target; merge parents outside that chain
+// are supplied by separately ordered packs in a pull envelope.
 type PackFrameV2 struct {
-	Version       uint32          `cbor:"1,keyasint"`
-	Base          CommitIdentity  `cbor:"2,keyasint"`
-	Target        CommitIdentity  `cbor:"3,keyasint"`
-	Commits       []CommitFrameV2 `cbor:"4,keyasint"`
-	Objects       []PackObjectV2  `cbor:"5,keyasint"`
-	LegacyPackID  string          `cbor:"6,keyasint,omitempty"`
-	LegacyPayload []byte          `cbor:"7,keyasint"`
-	// SupplementalCommits supply non-first-parent ancestry required by an
-	// exported merge. They never advance Base to Target, so Commits remains
-	// the contiguous pack range recorded in PostgreSQL.
-	SupplementalCommits []CommitFrameV2 `cbor:"8,keyasint,omitempty"`
+	Version uint32          `cbor:"1,keyasint"`
+	Base    CommitIdentity  `cbor:"2,keyasint"`
+	Target  CommitIdentity  `cbor:"3,keyasint"`
+	Commits []CommitFrameV2 `cbor:"4,keyasint"`
+	Objects []PackObjectV2  `cbor:"5,keyasint"`
 }
 
 // MarshalPackFrameV2 validates and returns the canonical encoding of frame.
@@ -220,10 +212,10 @@ func (f PackFrameV2) validate() error {
 				previous = identity
 				continue
 			}
-			return fmt.Errorf("%w: commit %d does not continue the declared pack range", ErrInvalidFrame, i)
+			return fmt.Errorf("%w: commit %d does not continue the first-parent pack range", ErrInvalidFrame, i)
 		}
 		if commit.Parents[0] != previous {
-			return fmt.Errorf("%w: commit %d does not continue the declared pack range", ErrInvalidFrame, i)
+			return fmt.Errorf("%w: commit %d does not continue the first-parent pack range", ErrInvalidFrame, i)
 		}
 		identity, err := commit.Identity()
 		if err != nil {
@@ -231,31 +223,8 @@ func (f PackFrameV2) validate() error {
 		}
 		previous = identity
 	}
-	if len(f.Commits) > 0 {
-		if previous != f.Target {
-			return fmt.Errorf("%w: target does not name the final commit frame", ErrInvalidFrame)
-		}
-	}
-	seenCommits := make(map[CommitIdentity]struct{}, len(f.Commits)+len(f.SupplementalCommits))
-	for _, commit := range f.Commits {
-		identity, err := commit.Identity()
-		if err != nil {
-			return err
-		}
-		seenCommits[identity] = struct{}{}
-	}
-	for i, commit := range f.SupplementalCommits {
-		if err := commit.validate(); err != nil {
-			return fmt.Errorf("%w: supplemental commit %d: %v", ErrInvalidFrame, i, err)
-		}
-		identity, err := commit.Identity()
-		if err != nil {
-			return err
-		}
-		if _, duplicate := seenCommits[identity]; duplicate {
-			return fmt.Errorf("%w: duplicate supplemental commit %s", ErrInvalidFrame, identity.ID)
-		}
-		seenCommits[identity] = struct{}{}
+	if previous != f.Target {
+		return fmt.Errorf("%w: target does not name the final commit frame", ErrInvalidFrame)
 	}
 	seen := make(map[string]struct{}, len(f.Objects))
 	for i, object := range f.Objects {
@@ -270,12 +239,13 @@ func (f PackFrameV2) validate() error {
 		}
 		seen[object.ID] = struct{}{}
 	}
-	if (f.LegacyPackID == "") != (f.LegacyPayload == nil) {
-		return fmt.Errorf("%w: legacy pack ID and payload must be supplied together", ErrInvalidFrame)
-	}
-	if f.LegacyPackID != "" {
-		if !validContentID(f.LegacyPackID) || ContentID(f.LegacyPayload) != f.LegacyPackID {
-			return fmt.Errorf("%w: opaque legacy pack hash mismatch", ErrInvalidFrame)
+	for _, commit := range f.Commits {
+		if _, found := seen[commit.SnapshotRoot]; !found {
+			identity, err := commit.Identity()
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("%w: commit %s snapshot %s is not available in the pack", ErrInvalidFrame, identity.ID, commit.SnapshotRoot)
 		}
 	}
 	return nil
