@@ -156,8 +156,17 @@ func TestDecodeSnapshot_LoadsCASObjectAndPreservesCASError(t *testing.T) {
 		t.Fatalf("NewScope() error = %v", err)
 	}
 	root := strings.Repeat("a", 64)
+	data, err := MarshalSnapshotCBOR(Snapshot{
+		Version: SnapshotVersion,
+		Schema:  Schema{NodeLabels: []LabelRule{}, EdgeLabels: []LabelRule{}, Cardinalities: []CardinalityRule{}},
+		Nodes:   []Node{},
+		Edges:   []Edge{},
+	})
+	if err != nil {
+		t.Fatalf("MarshalSnapshotCBOR() error = %v", err)
+	}
 	store := fakeSnapshotStore{data: map[string][]byte{
-		root: []byte(`{"version":1,"schema":{"nodeLabels":[],"edgeLabels":[],"cardinalities":[]},"nodes":[],"edges":[]}`),
+		root: data,
 	}}
 
 	snapshot, err := DecodeSnapshot(context.Background(), &store, scope, root)

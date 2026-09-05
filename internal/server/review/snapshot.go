@@ -58,8 +58,8 @@ var (
 	}.DecMode()
 )
 
-// Snapshot is a versioned, immutable graph value stored as one JSON object in
-// CAS. Its ordered collections are part of the contract: Nodes and Edges are
+// Snapshot is a versioned, immutable graph value stored in a canonical CBOR
+// envelope in CAS. Its ordered collections are part of the contract: Nodes and Edges are
 // sorted by ID; labels, properties, schema rules, and cardinality rules have
 // the ordering validated by Validate. A decoded Snapshot contains no state
 // outside this object, so a merge preview can safely load each of its three
@@ -192,13 +192,8 @@ func DecodeSnapshot(ctx context.Context, objects SnapshotObjectStore, scope cas.
 	return snapshot, nil
 }
 
-// DecodeSnapshotObject decodes a stored review snapshot. JSON is accepted
-// only as the migration bridge for immutable v1 objects; new objects must use
-// DecodeSnapshotCBOR's canonical v2 envelope.
+// DecodeSnapshotObject decodes a canonical CBOR review snapshot from storage.
 func DecodeSnapshotObject(data []byte) (Snapshot, error) {
-	if len(bytes.TrimSpace(data)) > 0 && bytes.TrimSpace(data)[0] == '{' {
-		return DecodeSnapshotJSON(data)
-	}
 	return DecodeSnapshotCBOR(data)
 }
 
@@ -236,9 +231,7 @@ func DecodeSnapshotJSON(data []byte) (Snapshot, error) {
 }
 
 // MarshalSnapshotJSON validates snapshot and returns its deterministic JSON
-// representation for placement in a CAS object. It does not write the object:
-// callers retain control of the CAS scope and the content hash used as its
-// snapshotRoot.
+// representation for the HTTP compatibility bridge.
 func MarshalSnapshotJSON(snapshot Snapshot) ([]byte, error) {
 	if err := snapshot.Validate(); err != nil {
 		return nil, err

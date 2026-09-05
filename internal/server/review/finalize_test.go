@@ -107,7 +107,7 @@ func finalizationFixture(t *testing.T, fastForward bool) (*FinalizeEngine, *fake
 	scope, _ := cas.NewScope("tenant-1", "repo-1")
 	roots := map[string]string{}
 	for id, snapshot := range map[string]Snapshot{"base": base, "source": source, "target": target} {
-		data, err := MarshalSnapshotJSON(snapshot)
+		data, err := MarshalSnapshot(snapshot)
 		if err != nil {
 			t.Fatal(err)
 		}

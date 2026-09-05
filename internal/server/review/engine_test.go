@@ -237,7 +237,7 @@ func testPreviewDependencies(t *testing.T, snapshots map[string]Snapshot, heads,
 	t.Helper()
 	data := make(map[string][]byte, len(snapshots))
 	for root, snapshot := range snapshots {
-		encoded, err := json.Marshal(snapshot)
+		encoded, err := MarshalSnapshotCBOR(snapshot)
 		if err != nil {
 			t.Fatalf("marshal snapshot: %v", err)
 		}
