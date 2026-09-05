@@ -1,4 +1,4 @@
-.PHONY: all build test test-race lint tidy tidy-check fmt fmt-check clean db-up db-down
+.PHONY: all build test test-race test-postgres lint tidy tidy-check fmt fmt-check clean db-up db-down
 
 all: tidy-check lint test test-race build
 
@@ -14,6 +14,9 @@ test:
 test-race:
 	go test -v -race ./...
 	go test -v -race ./cmd/spool-rack/...
+
+test-postgres: db-up
+	go test -v -race ./internal/server/storage/postgres/...
 
 lint: fmt-check
 	golangci-lint run ./...
