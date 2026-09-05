@@ -372,6 +372,123 @@ func TestIsAncestor(t *testing.T) {
 	}
 }
 
+func TestFindLowestCommonAncestor(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-find-lca")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoID := mustCreateRepository(t, store, tenantCtx, "repo-find-lca")
+
+	root := mustPutCommit(t, store, tenantCtx, repoID, "", "snap-root", "alice", "root")
+	base := mustPutCommit(t, store, tenantCtx, repoID, root, "snap-base", "alice", "base")
+	source := mustPutCommit(t, store, tenantCtx, repoID, base, "snap-source", "alice", "source")
+	target := mustPutCommit(t, store, tenantCtx, repoID, base, "snap-target", "bob", "target")
+
+	got, err := store.FindLowestCommonAncestor(tenantCtx, repoID, source, target)
+	if err != nil {
+		t.Fatalf("FindLowestCommonAncestor: %v", err)
+	}
+	if got != base {
+		t.Fatalf("FindLowestCommonAncestor = %q, want %q", got, base)
+	}
+
+	got, err = store.FindLowestCommonAncestor(tenantCtx, repoID, source, source)
+	if err != nil {
+		t.Fatalf("FindLowestCommonAncestor(self): %v", err)
+	}
+	if got != source {
+		t.Fatalf("FindLowestCommonAncestor(self) = %q, want %q", got, source)
+	}
+
+	unrelated := mustPutCommit(t, store, tenantCtx, repoID, "", "snap-unrelated", "bob", "unrelated")
+	got, err = store.FindLowestCommonAncestor(tenantCtx, repoID, source, unrelated)
+	if !errors.Is(err, ErrNoCommonAncestor) {
+		t.Fatalf("FindLowestCommonAncestor(unrelated): expected ErrNoCommonAncestor, got ancestor %q and err %v", got, err)
+	}
+
+	tenantBID := mustCreateTenant(t, store, ctx, "tenant-find-lca-foreign")
+	tenantBCtx := mustTenantContext(t, store, ctx, tenantBID)
+	got, err = store.FindLowestCommonAncestor(tenantBCtx, repoID, source, target)
+	if !errors.Is(err, ErrCommitNotFound) {
+		t.Fatalf("FindLowestCommonAncestor(foreign tenant): expected ErrCommitNotFound, got ancestor %q and err %v", got, err)
+	}
+
+	_, err = store.FindLowestCommonAncestor(context.Background(), repoID, source, target)
+	if !errors.Is(err, ErrMissingTenantContext) {
+		t.Fatalf("FindLowestCommonAncestor(no tenant context): expected ErrMissingTenantContext, got %v", err)
+	}
+}
+
+func TestFindLowestCommonAncestor_HistoryErrorsAndBound(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-lca-history-errors")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoID := mustCreateRepository(t, store, tenantCtx, "repo-lca-history-errors")
+	root := mustPutCommit(t, store, tenantCtx, repoID, "", "snap-root", "alice", "root")
+
+	_, err := store.FindLowestCommonAncestor(tenantCtx, repoID, testCommitID(t.Name(), "missing"), root)
+	if !errors.Is(err, ErrCommitNotFound) {
+		t.Fatalf("FindLowestCommonAncestor(missing): expected ErrCommitNotFound, got %v", err)
+	}
+
+	otherRepoID := mustCreateRepository(t, store, tenantCtx, "repo-other-history")
+	foreignParent := mustPutCommit(t, store, tenantCtx, otherRepoID, "", "snap-foreign", "alice", "foreign")
+	incomplete := mustPutCommit(t, store, tenantCtx, repoID, foreignParent, "snap-incomplete", "alice", "incomplete")
+	_, err = store.FindLowestCommonAncestor(tenantCtx, repoID, incomplete, incomplete)
+	if !errors.Is(err, ErrCommitHistoryIncomplete) {
+		t.Fatalf("FindLowestCommonAncestor(incomplete): expected ErrCommitHistoryIncomplete, got %v", err)
+	}
+
+	tip := root
+	for i := 1; i < maxMergeAncestryCommits; i++ {
+		tip = mustPutCommit(t, store, tenantCtx, repoID, tip, fmt.Sprintf("snap-%d", i), "alice", fmt.Sprintf("commit-%d", i))
+	}
+	if got, err := store.FindLowestCommonAncestor(tenantCtx, repoID, tip, root); err != nil || got != root {
+		t.Fatalf("FindLowestCommonAncestor(%d commits) = (%q, %v), want (%q, nil)", maxMergeAncestryCommits, got, err, root)
+	}
+
+	tooDeep := mustPutCommit(t, store, tenantCtx, repoID, tip, "snap-too-deep", "alice", "too deep")
+	_, err = store.FindLowestCommonAncestor(tenantCtx, repoID, tooDeep, root)
+	if !errors.Is(err, ErrCommitHistoryTooDeep) {
+		t.Fatalf("FindLowestCommonAncestor(over limit): expected ErrCommitHistoryTooDeep, got %v", err)
+	}
+}
+
+func TestGetCommitSnapshotRoot(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantAID := mustCreateTenant(t, store, ctx, "tenant-snapshot-a")
+	tenantBID := mustCreateTenant(t, store, ctx, "tenant-snapshot-b")
+	tenantACtx := mustTenantContext(t, store, ctx, tenantAID)
+	tenantBCtx := mustTenantContext(t, store, ctx, tenantBID)
+	repoID := mustCreateRepository(t, store, tenantACtx, "repo-snapshot")
+	commitID := mustPutCommit(t, store, tenantACtx, repoID, "", "snap-root", "alice", "root")
+
+	got, err := store.GetCommitSnapshotRoot(tenantACtx, repoID, commitID)
+	if err != nil {
+		t.Fatalf("GetCommitSnapshotRoot: %v", err)
+	}
+	if got != "snap-root" {
+		t.Fatalf("GetCommitSnapshotRoot = %q, want %q", got, "snap-root")
+	}
+
+	got, err = store.GetCommitSnapshotRoot(tenantACtx, repoID, testCommitID(t.Name(), "missing"))
+	if !errors.Is(err, ErrCommitNotFound) {
+		t.Fatalf("GetCommitSnapshotRoot(missing): expected ErrCommitNotFound, got root %q and err %v", got, err)
+	}
+
+	got, err = store.GetCommitSnapshotRoot(tenantBCtx, repoID, commitID)
+	if !errors.Is(err, ErrCommitNotFound) {
+		t.Fatalf("GetCommitSnapshotRoot(foreign tenant): expected ErrCommitNotFound, got root %q and err %v", got, err)
+	}
+
+	_, err = store.GetCommitSnapshotRoot(context.Background(), repoID, commitID)
+	if !errors.Is(err, ErrMissingTenantContext) {
+		t.Fatalf("GetCommitSnapshotRoot(no tenant context): expected ErrMissingTenantContext, got %v", err)
+	}
+}
+
 func TestGetPackRanges(t *testing.T) {
 	store, ctx := newTestStore(t)
 

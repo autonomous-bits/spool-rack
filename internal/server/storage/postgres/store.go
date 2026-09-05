@@ -22,6 +22,18 @@ var (
 	ErrBranchNotFound = errors.New("branch not found")
 	// ErrNonFastForward indicates a push cannot be fast-forwarded.
 	ErrNonFastForward = errors.New("non-fast-forward ref update rejected")
+	// ErrCommitNotFound indicates that a requested commit is not visible in the
+	// repository scoped by the current tenant context.
+	ErrCommitNotFound = errors.New("commit not found")
+	// ErrNoCommonAncestor indicates that two complete commit histories do not
+	// share an ancestor.
+	ErrNoCommonAncestor = errors.New("no common ancestor")
+	// ErrCommitHistoryIncomplete indicates that an ancestry chain references a
+	// parent which is not available in the requested repository.
+	ErrCommitHistoryIncomplete = errors.New("commit history is incomplete")
+	// ErrCommitHistoryTooDeep indicates that ancestry could not be resolved
+	// within the bounded merge-history traversal limit.
+	ErrCommitHistoryTooDeep = errors.New("commit history exceeds traversal limit")
 	// ErrMissingTenantContext indicates a caller attempted a tenant-scoped operation
 	// without first attaching a validated tenant identifier to the request context.
 	ErrMissingTenantContext = errors.New("postgres: no tenant context set")
@@ -36,6 +48,8 @@ var (
 type contextKey int
 
 const tenantIDContextKey contextKey = iota
+
+const maxMergeAncestryCommits = 100
 
 // Store defines the metadata store operations for multi-tenant repositories.
 type Store interface {
@@ -68,6 +82,16 @@ type Store interface {
 	// per req-ancestry-verified-remote-fast-forward. If commit does not exist
 	// in the repository, IsAncestor returns false, nil.
 	IsAncestor(ctx context.Context, repoID, ancestorCommit, commit string) (bool, error)
+	// FindLowestCommonAncestor finds the nearest commit shared by sourceCommitID
+	// and targetCommitID, traversing no more than 100 commits from either tip.
+	// It returns ErrCommitNotFound for a missing tip, ErrCommitHistoryIncomplete
+	// for a missing parent in an otherwise-present history,
+	// ErrCommitHistoryTooDeep when the bounded traversal is exhausted, and
+	// ErrNoCommonAncestor when complete histories have no shared ancestor.
+	FindLowestCommonAncestor(ctx context.Context, repoID, sourceCommitID, targetCommitID string) (string, error)
+	// GetCommitSnapshotRoot returns the immutable snapshot root recorded for a
+	// commit, or ErrCommitNotFound when that commit is not visible in repoID.
+	GetCommitSnapshotRoot(ctx context.Context, repoID, commitID string) (string, error)
 	// GetPackRanges returns the pack ranges required to reconstruct the
 	// history from headCommitID back to knownCommitID. Ranges are returned
 	// newest-first so callers can validate the chain and stream it in reverse.
@@ -305,6 +329,132 @@ func (s *PGStore) IsAncestor(ctx context.Context, repoID, ancestorCommit, commit
 	}
 
 	return found, nil
+}
+
+// FindLowestCommonAncestor returns the nearest shared ancestor of source and
+// target. Merge preview only needs a bounded history window, so each recursive
+// query is capped at maxMergeAncestryCommits commits.
+func (s *PGStore) FindLowestCommonAncestor(ctx context.Context, repoID, sourceCommitID, targetCommitID string) (string, error) {
+	if _, err := requireTenantID(ctx); err != nil {
+		return "", fmt.Errorf("postgres: find lowest common ancestor: %w", err)
+	}
+
+	var ancestor string
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		sourceHistory, err := collectMergeAncestry(ctx, tx, repoID, sourceCommitID)
+		if err != nil {
+			return fmt.Errorf("postgres: find lowest common ancestor: source history: %w", err)
+		}
+		targetHistory, err := collectMergeAncestry(ctx, tx, repoID, targetCommitID)
+		if err != nil {
+			return fmt.Errorf("postgres: find lowest common ancestor: target history: %w", err)
+		}
+
+		bestDistance := -1
+		bestMaximumDepth := -1
+		for commitID, sourceDepth := range sourceHistory {
+			targetDepth, ok := targetHistory[commitID]
+			if !ok {
+				continue
+			}
+
+			distance := sourceDepth + targetDepth
+			maximumDepth := max(sourceDepth, targetDepth)
+			if bestDistance == -1 ||
+				distance < bestDistance ||
+				(distance == bestDistance && maximumDepth < bestMaximumDepth) ||
+				(distance == bestDistance && maximumDepth == bestMaximumDepth && commitID < ancestor) {
+				ancestor = commitID
+				bestDistance = distance
+				bestMaximumDepth = maximumDepth
+			}
+		}
+		if ancestor == "" {
+			return ErrNoCommonAncestor
+		}
+		return nil
+	}); err != nil {
+		return "", err
+	}
+
+	return ancestor, nil
+}
+
+// GetCommitSnapshotRoot resolves a commit's snapshot root without exposing
+// metadata belonging to another tenant or repository.
+func (s *PGStore) GetCommitSnapshotRoot(ctx context.Context, repoID, commitID string) (string, error) {
+	if _, err := requireTenantID(ctx); err != nil {
+		return "", fmt.Errorf("postgres: get commit snapshot root: %w", err)
+	}
+
+	var snapshotRoot string
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, `
+			SELECT snapshot_root
+			FROM commits
+			WHERE repo_id = $1 AND id = $2
+		`, repoID, commitID).Scan(&snapshotRoot); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("postgres: get commit snapshot root: %w", ErrCommitNotFound)
+			}
+			return fmt.Errorf("postgres: get commit snapshot root: query commit: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return "", err
+	}
+
+	return snapshotRoot, nil
+}
+
+func collectMergeAncestry(ctx context.Context, tx pgx.Tx, repoID, commitID string) (map[string]int, error) {
+	rows, err := tx.Query(ctx, `
+		WITH RECURSIVE ancestry AS (
+			SELECT id, parent_commit_id, 0 AS depth
+			FROM commits
+			WHERE repo_id = $1 AND id = $2
+			UNION ALL
+			SELECT c.id, c.parent_commit_id, a.depth + 1
+			FROM commits c
+			JOIN ancestry a ON c.id = a.parent_commit_id
+			WHERE c.repo_id = $1 AND a.depth < $3
+		)
+		SELECT id, COALESCE(parent_commit_id, ''), depth
+		FROM ancestry
+		ORDER BY depth ASC
+	`, repoID, commitID, maxMergeAncestryCommits-1)
+	if err != nil {
+		return nil, fmt.Errorf("query ancestry: %w", err)
+	}
+	defer rows.Close()
+
+	history := make(map[string]int, maxMergeAncestryCommits)
+	var parentCommitID string
+	rowCount := 0
+	for rows.Next() {
+		var (
+			id    string
+			depth int
+		)
+		if err := rows.Scan(&id, &parentCommitID, &depth); err != nil {
+			return nil, fmt.Errorf("scan ancestry: %w", err)
+		}
+		history[id] = depth
+		rowCount++
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate ancestry: %w", err)
+	}
+	if len(history) == 0 {
+		return nil, ErrCommitNotFound
+	}
+	if parentCommitID == "" {
+		return history, nil
+	}
+	if rowCount == maxMergeAncestryCommits {
+		return nil, ErrCommitHistoryTooDeep
+	}
+	return nil, ErrCommitHistoryIncomplete
 }
 
 // GetPackRanges traverses packs from a branch head toward a known ancestor.

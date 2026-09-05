@@ -9,6 +9,7 @@ import (
 	"regexp"
 
 	"github.com/autonomous-bits/spool-rack/internal/server/auth"
+	"github.com/autonomous-bits/spool-rack/internal/server/review"
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/cas"
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/postgres"
 	serversync "github.com/autonomous-bits/spool-rack/internal/server/sync"
@@ -16,13 +17,14 @@ import (
 
 // Gateway routes incoming requests, extracts tenant context, and manages endpoints.
 type Gateway struct {
-	logger      *slog.Logger
-	verifier    auth.Verifier
-	casDriver   cas.Driver
-	branchStore serversync.BranchStore
-	pushEngine  *serversync.PushEngine
-	pullEngine  *serversync.PullEngine
-	mux         *http.ServeMux
+	logger        *slog.Logger
+	verifier      auth.Verifier
+	casDriver     cas.Driver
+	branchStore   serversync.BranchStore
+	pushEngine    *serversync.PushEngine
+	pullEngine    *serversync.PullEngine
+	previewEngine review.Engine
+	mux           *http.ServeMux
 }
 
 // Option configures a Gateway during construction.
@@ -49,6 +51,11 @@ func WithBranchStore(store serversync.BranchStore) Option {
 	return func(g *Gateway) { g.branchStore = store }
 }
 
+// WithPreviewEngine configures the Gateway's merge preview engine.
+func WithPreviewEngine(engine review.Engine) Option {
+	return func(g *Gateway) { g.previewEngine = engine }
+}
+
 // New constructs an initialized API Gateway. When no verifier is provided,
 // it defaults to auth.PermissiveVerifier{} for zero-config local development
 // and MVP wiring; this MUST be overridden with WithVerifier before any
@@ -66,6 +73,11 @@ func New(opts ...Option) *Gateway {
 	if g.casDriver != nil && g.branchStore != nil {
 		g.pushEngine = serversync.NewPushEngine(g.casDriver, g.branchStore)
 		g.pullEngine = serversync.NewPullEngine(g.casDriver, g.branchStore)
+		if g.previewEngine == nil {
+			if metadataStore, ok := g.branchStore.(review.MetadataStore); ok {
+				g.previewEngine = review.NewPreviewEngine(g.casDriver, metadataStore)
+			}
+		}
 	}
 	g.registerRoutes()
 	return g
@@ -94,6 +106,62 @@ func (g *Gateway) registerRoutes() {
 			),
 		),
 	)
+	g.mux.Handle("POST /api/v1/repos/{repo}/merge/preview",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleViewer)(http.HandlerFunc(g.handleMergePreview)),
+			),
+		),
+	)
+}
+
+type mergePreviewRequest struct {
+	SourceBranch *string `json:"sourceBranch"`
+	TargetBranch *string `json:"targetBranch"`
+}
+
+func (g *Gateway) handleMergePreview(w http.ResponseWriter, r *http.Request) {
+	if g.previewEngine == nil {
+		writeJSONError(w, r, g.logger, http.StatusNotImplemented, ErrorCodeNotImplemented, "merge preview is not configured on this server")
+		return
+	}
+
+	var request mergePreviewRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "request must contain valid JSON")
+		return
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "request must contain exactly one JSON object")
+		return
+	}
+	if request.SourceBranch == nil || *request.SourceBranch == "" || request.TargetBranch == nil || *request.TargetBranch == "" {
+		writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "sourceBranch and targetBranch are required")
+		return
+	}
+
+	tenantID, _ := TenantIDFromContext(r.Context())
+	scope, _ := ScopeFromContext(r.Context())
+	preview, err := g.previewEngine.PreviewMerge(r.Context(), tenantID, scope.RepoID(), *request.SourceBranch, *request.TargetBranch)
+	if errors.Is(err, postgres.ErrBranchNotFound) {
+		writeJSONError(w, r, g.logger, http.StatusNotFound, ErrorCodeNotFound, "branch not found")
+		return
+	}
+	if errors.Is(err, review.ErrInvalidPreviewRequest) {
+		writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, err.Error())
+		return
+	}
+	if err != nil {
+		writeJSONError(w, r, g.logger, http.StatusInternalServerError, ErrorCodeInternal, "failed to preview merge")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(preview)
 }
 
 func (g *Gateway) handlePull(w http.ResponseWriter, r *http.Request) {
