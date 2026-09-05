@@ -45,8 +45,8 @@ var (
 // LocalDriver is a filesystem-backed implementation of Driver. It stores
 // immutable objects and zstd-compressed packfiles under a shared root
 // directory, natively fencing every operation to its caller-supplied Scope
-// by deterministically partitioning storage paths as
-// "<root>/tenants/<tenantID>/repos/<repoID>/...". Content-addressed
+// by deterministically partitioning storage paths under opaque, fixed-width
+// directory keys derived from each tenant/repository identifier. Content-addressed
 // BLAKE3-256 hashes verify integrity, and crash-consistent
 // temp-file-then-rename writes guarantee durability.
 //
@@ -259,11 +259,14 @@ func (d *LocalDriver) WritePack(ctx context.Context, scope Scope, packHash strin
 }
 
 // scopeRoot returns the tenant/repository-partitioned root directory for
-// scope, verifying the resulting path cannot escape d.root even if a future
-// bug loosened Scope's own validation (defense in depth against directory
-// traversal).
+// scope, mapping externally supplied scope identifiers to opaque hex keys
+// before constructing any filesystem path. This keeps path expressions free
+// of raw request-derived strings while still deterministically fencing every
+// scope to its own on-disk partition.
 func (d *LocalDriver) scopeRoot(scope Scope) (string, error) {
-	return safeJoin(d.root, tenantsDir, scope.TenantID(), reposDir, scope.RepoID())
+	tenantKey := scopeStorageKey(scope.TenantID())
+	repoKey := scopeStorageKey(scope.RepoID())
+	return safeJoin(d.root, tenantsDir, tenantKey, reposDir, repoKey)
 }
 
 // scopeTmpDir returns scope's private temporary-file staging directory,
@@ -291,7 +294,11 @@ func (d *LocalDriver) objectPath(scope Scope, hash string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return safeJoin(root, objectsDir, hash[:2], hash[2:])
+	canonicalHash, err := canonicalHashString(hash)
+	if err != nil {
+		return "", err
+	}
+	return safeJoin(root, objectsDir, canonicalHash[:2], canonicalHash[2:])
 }
 
 func (d *LocalDriver) packPath(scope Scope, packHash string) (string, error) {
@@ -299,7 +306,11 @@ func (d *LocalDriver) packPath(scope Scope, packHash string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return safeJoin(root, packsDir, packHash+".spack")
+	canonicalHash, err := canonicalHashString(packHash)
+	if err != nil {
+		return "", err
+	}
+	return safeJoin(root, packsDir, canonicalHash+".spack")
 }
 
 // validateHash rejects any hash that is not a well-formed lowercase hex
@@ -309,10 +320,26 @@ func validateHash(hash string) error {
 	if len(hash) != hashHexLen {
 		return fmt.Errorf("%w: expected %d hex characters, got %d", ErrInvalidHash, hashHexLen, len(hash))
 	}
-	if _, err := hex.DecodeString(hash); err != nil {
+	if _, err := canonicalHashString(hash); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidHash, err)
 	}
 	return nil
+}
+
+func canonicalHashString(hash string) (string, error) {
+	decoded, err := hex.DecodeString(hash)
+	if err != nil {
+		return "", err
+	}
+	if len(decoded) != hashSize {
+		return "", fmt.Errorf("decoded hash must be %d bytes, got %d", hashSize, len(decoded))
+	}
+	return hex.EncodeToString(decoded), nil
+}
+
+func scopeStorageKey(scopeID string) string {
+	sum := blake3.Sum256([]byte(scopeID))
+	return hex.EncodeToString(sum[:])
 }
 
 // safeJoin joins elems onto root and verifies, via filepath.Rel, that the
