@@ -95,6 +95,15 @@ ALTER TABLE commits ADD CONSTRAINT commits_object_format_check CHECK (object_for
 
 CREATE INDEX IF NOT EXISTS commits_repo_id_idx ON commits (repo_id);
 
+-- default_branch names the repository's protected branch, per
+-- adr-immutable-commit-retention-on-branch-deletion and
+-- req-remote-branch-lifecycle-and-safe-deletion: the first branch ever
+-- created for a repository (see PGStore.CreateBranch) is recorded here and
+-- DeleteBranch refuses to remove it. Nullable and defaultless, matching the
+-- additive branches.deleted_at precedent below, so a repository with no
+-- branches yet simply has no default until one is created.
+ALTER TABLE repositories ADD COLUMN IF NOT EXISTS default_branch text;
+
 -- Supersede the legacy denormalized first-parent column on databases created
 -- before the canonical graphcontract parent collection was adopted.
 ALTER TABLE commits DROP CONSTRAINT IF EXISTS commits_parent_scope_fk;

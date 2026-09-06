@@ -22,6 +22,19 @@ const (
 	ErrorCodeNotFound = "not_found"
 	// ErrorCodeInternal identifies an unexpected server-side failure.
 	ErrorCodeInternal = "internal_error"
+	// ErrorCodeBranchAlreadyExists identifies a branch create request that
+	// reused a name already taken within the repository.
+	ErrorCodeBranchAlreadyExists = "branch_already_exists"
+	// ErrorCodeBranchSourceNotFound identifies a branch create request whose
+	// sourceBranch or sourceCommit could not be resolved.
+	ErrorCodeBranchSourceNotFound = "branch_source_not_found"
+	// ErrorCodeBranchNotFound identifies a branch lifecycle request (get
+	// default, delete) targeting a branch that does not exist.
+	ErrorCodeBranchNotFound = "branch_not_found"
+	// ErrorCodeBranchProtected identifies a delete request rejected because
+	// the target branch is the repository's default branch, per
+	// req-remote-branch-lifecycle-and-safe-deletion.
+	ErrorCodeBranchProtected = "branch_protected"
 )
 
 type errorEnvelope struct {

@@ -479,6 +479,116 @@ func TestGetBranchRef_NotFound(t *testing.T) {
 	}
 }
 
+func TestCreateBranch_FirstBranchBecomesDefault(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-first-default")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoID := mustCreateRepository(t, store, tenantCtx, "repo-first-default")
+
+	commitID := mustPutCommit(t, store, tenantCtx, repoID, "", "snap-1", "author", "initial")
+	mustCreateBranch(t, store, tenantCtx, repoID, "main", commitID)
+
+	defaultRef, err := store.GetDefaultBranch(tenantCtx, repoID)
+	if err != nil {
+		t.Fatalf("GetDefaultBranch: %v", err)
+	}
+	if defaultRef.Name != "main" || defaultRef.HeadCommitID != commitID {
+		t.Fatalf("GetDefaultBranch = %+v, want name=main head=%q", defaultRef, commitID)
+	}
+
+	// A second branch must not become (or replace) the default.
+	second := mustPutCommit(t, store, tenantCtx, repoID, commitID, "snap-2", "author", "second")
+	mustCreateBranch(t, store, tenantCtx, repoID, "feature", second)
+
+	defaultRef, err = store.GetDefaultBranch(tenantCtx, repoID)
+	if err != nil {
+		t.Fatalf("GetDefaultBranch after second branch: %v", err)
+	}
+	if defaultRef.Name != "main" {
+		t.Fatalf("GetDefaultBranch after second branch = %+v, want default to remain main", defaultRef)
+	}
+}
+
+func TestGetDefaultBranch_NotSet(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-no-default")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoID := mustCreateRepository(t, store, tenantCtx, "repo-no-default")
+
+	if _, err := store.GetDefaultBranch(tenantCtx, repoID); !errors.Is(err, ErrDefaultBranchNotSet) {
+		t.Fatalf("GetDefaultBranch: expected ErrDefaultBranchNotSet, got %v", err)
+	}
+}
+
+func TestCreateBranch_DuplicateNameRejected(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-dup-branch")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoID := mustCreateRepository(t, store, tenantCtx, "repo-dup-branch")
+
+	commitID := mustPutCommit(t, store, tenantCtx, repoID, "", "snap-1", "author", "initial")
+	mustCreateBranch(t, store, tenantCtx, repoID, "main", commitID)
+
+	if err := store.CreateBranch(tenantCtx, repoID, "main", commitID); !errors.Is(err, ErrBranchAlreadyExists) {
+		t.Fatalf("CreateBranch duplicate: expected ErrBranchAlreadyExists, got %v", err)
+	}
+}
+
+func TestCreateBranch_MissingSourceCommitRejected(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-missing-commit")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoID := mustCreateRepository(t, store, tenantCtx, "repo-missing-commit")
+
+	if err := store.CreateBranch(tenantCtx, repoID, "main", "does-not-exist"); !errors.Is(err, ErrCommitNotFound) {
+		t.Fatalf("CreateBranch missing commit: expected ErrCommitNotFound, got %v", err)
+	}
+}
+
+func TestDeleteBranch_ProtectsDefaultBranch(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-protect-default")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoID := mustCreateRepository(t, store, tenantCtx, "repo-protect-default")
+
+	commitID := mustPutCommit(t, store, tenantCtx, repoID, "", "snap-1", "author", "initial")
+	mustCreateBranch(t, store, tenantCtx, repoID, "main", commitID)
+
+	if err := store.DeleteBranch(tenantCtx, repoID, "main"); !errors.Is(err, ErrDefaultBranchProtected) {
+		t.Fatalf("DeleteBranch default branch: expected ErrDefaultBranchProtected, got %v", err)
+	}
+
+	refs, err := store.ListBranchRefs(tenantCtx, repoID)
+	if err != nil {
+		t.Fatalf("ListBranchRefs: %v", err)
+	}
+	if len(refs) != 1 || refs[0].Deleted {
+		t.Fatalf("ListBranchRefs = %+v, want main untouched and live", refs)
+	}
+}
+
+func TestGetDefaultBranch_CrossTenantIsolation(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantAID := mustCreateTenant(t, store, ctx, "tenant-default-a")
+	tenantACtx := mustTenantContext(t, store, ctx, tenantAID)
+	repoAID := mustCreateRepository(t, store, tenantACtx, "repo-default-a")
+	commitA := mustPutCommit(t, store, tenantACtx, repoAID, "", "snap-a", "author", "a")
+	mustCreateBranch(t, store, tenantACtx, repoAID, "main", commitA)
+
+	tenantBID := mustCreateTenant(t, store, ctx, "tenant-default-b")
+	tenantBCtx := mustTenantContext(t, store, ctx, tenantBID)
+
+	if _, err := store.GetDefaultBranch(tenantBCtx, repoAID); !errors.Is(err, ErrRepositoryNotFound) {
+		t.Fatalf("GetDefaultBranch cross-tenant: expected ErrRepositoryNotFound, got %v", err)
+	}
+}
+
 func TestIsAncestor(t *testing.T) {
 	store, ctx := newTestStore(t)
 

@@ -30,6 +30,8 @@ type Gateway struct {
 	mergeEngine   review.Finalizer
 	auditLogger   *audit.Logger
 	mux           *http.ServeMux
+
+	branchLifecycleStore BranchLifecycleStore
 }
 
 // Option configures a Gateway during construction.
@@ -72,6 +74,16 @@ func WithAuditLogger(logger *audit.Logger) Option {
 	return func(g *Gateway) { g.auditLogger = logger }
 }
 
+// WithBranchLifecycleStore overrides the Gateway's branch lifecycle store
+// directly. It is normally inferred automatically from WithBranchStore (when
+// that store also implements BranchLifecycleStore, as postgres.Store does),
+// but this override lets callers configure branch lifecycle management
+// independently — for example, tests that only need this narrow slice of
+// postgres.Store without a full serversync.BranchStore.
+func WithBranchLifecycleStore(store BranchLifecycleStore) Option {
+	return func(g *Gateway) { g.branchLifecycleStore = store }
+}
+
 // New constructs an initialized API Gateway. When no verifier is provided,
 // it defaults to auth.PermissiveVerifier{} for zero-config local development
 // and MVP wiring; this MUST be overridden with WithVerifier before any
@@ -104,6 +116,11 @@ func New(opts ...Option) *Gateway {
 			if mergeStore, ok := g.branchStore.(review.MergeStore); ok {
 				g.mergeEngine = review.NewFinalizeEngine(g.casDriver, mergeStore)
 			}
+		}
+	}
+	if g.branchLifecycleStore == nil && g.branchStore != nil {
+		if lifecycleStore, ok := g.branchStore.(BranchLifecycleStore); ok {
+			g.branchLifecycleStore = lifecycleStore
 		}
 	}
 	g.registerRoutes()
@@ -160,6 +177,34 @@ func (g *Gateway) registerRoutes() {
 		Authenticate(g.logger, g.verifier)(
 			RequireRepoScope(g.logger)(
 				RequireRole(g.logger, auth.RoleContributor)(http.HandlerFunc(g.handleMergeApply)),
+			),
+		),
+	)
+	g.mux.Handle("POST /api/v1/repos/{repo}/branches",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleContributor)(http.HandlerFunc(g.handleCreateBranch)),
+			),
+		),
+	)
+	g.mux.Handle("GET /api/v1/repos/{repo}/branches",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleViewer)(http.HandlerFunc(g.handleListBranches)),
+			),
+		),
+	)
+	g.mux.Handle("GET /api/v1/repos/{repo}/branches/default",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleViewer)(http.HandlerFunc(g.handleDefaultBranch)),
+			),
+		),
+	)
+	g.mux.Handle("DELETE /api/v1/repos/{repo}/branches/{name}",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleContributor)(http.HandlerFunc(g.handleDeleteBranch)),
 			),
 		),
 	)
