@@ -23,6 +23,18 @@ var (
 	ErrRepositoryNotFound = errors.New("repository not found")
 	// ErrBranchNotFound indicates the requested branch ref was not found.
 	ErrBranchNotFound = errors.New("branch not found")
+	// ErrBranchAlreadyExists indicates a branch create request reused a name
+	// already taken within the repository, including a soft-deleted branch's
+	// name (branch names remain reserved after deletion per
+	// adr-immutable-commit-retention-on-branch-deletion).
+	ErrBranchAlreadyExists = errors.New("postgres: branch already exists")
+	// ErrDefaultBranchProtected indicates a caller attempted to delete a
+	// repository's default branch, which is rejected per
+	// req-remote-branch-lifecycle-and-safe-deletion.
+	ErrDefaultBranchProtected = errors.New("postgres: cannot delete the repository's default branch")
+	// ErrDefaultBranchNotSet indicates a repository has not yet had any
+	// branch created, so it has no default branch to discover.
+	ErrDefaultBranchNotSet = errors.New("postgres: repository has no default branch")
 	// ErrNonFastForward indicates a push cannot be fast-forwarded.
 	ErrNonFastForward = errors.New("non-fast-forward ref update rejected")
 	// ErrCommitNotFound indicates that a requested commit is not visible in the
@@ -95,7 +107,12 @@ type Store interface {
 	// returns its generated UUID.
 	CreateRepository(ctx context.Context, name string) (string, error)
 	// CreateBranch creates a branch ref within the tenant carried by ctx pointing
-	// at the supplied head commit.
+	// at the supplied head commit. If repoID has no branches yet, the newly
+	// created branch is atomically recorded as the repository's default
+	// branch (see GetDefaultBranch, DeleteBranch). Returns
+	// ErrBranchAlreadyExists if name is already taken (including by a
+	// soft-deleted branch) and ErrCommitNotFound if headCommitID does not
+	// exist in repoID.
 	CreateBranch(ctx context.Context, repoID, name, headCommitID string) error
 	// PutCommit registers a canonical Spool commit and its complete ordered
 	// parent collection. It is idempotent only for identical immutable metadata.
@@ -169,6 +186,11 @@ type Store interface {
 	// soft-deleted ones, scoped to the tenant carried by ctx. Retention uses
 	// this to root reachability on both live and deleted branch history.
 	ListBranchRefs(ctx context.Context, repoID string) ([]BranchRef, error)
+	// GetDefaultBranch returns the name and current head commit of repoID's
+	// default branch — the first branch ever created for the repository via
+	// CreateBranch — scoped to the tenant carried by ctx. Returns
+	// ErrDefaultBranchNotSet if repoID has not yet had a branch created.
+	GetDefaultBranch(ctx context.Context, repoID string) (BranchRef, error)
 	// CommitAncestryIDs returns commitID and every ancestor commit reachable
 	// through ordered parents, scoped to repoID within the tenant carried by
 	// ctx. Returns ErrCommitNotFound if commitID does not exist.
@@ -409,7 +431,12 @@ func (s *PGStore) CreateRepository(ctx context.Context, name string) (string, er
 	return repoID, nil
 }
 
-// CreateBranch inserts a branch ref scoped to the tenant carried by ctx.
+// CreateBranch inserts a branch ref scoped to the tenant carried by ctx. When
+// repoID has no branches yet, the new branch is atomically recorded as the
+// repository's default branch (see GetDefaultBranch, DeleteBranch): the
+// repository row is locked for the duration of the transaction so concurrent
+// "first branch" creates cannot race past each other and disagree about
+// which branch became the default.
 func (s *PGStore) CreateBranch(ctx context.Context, repoID, name, headCommitID string) error {
 	tenantID, err := requireTenantID(ctx)
 	if err != nil {
@@ -417,8 +444,30 @@ func (s *PGStore) CreateBranch(ctx context.Context, repoID, name, headCommitID s
 	}
 
 	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		var defaultBranch *string
+		if err := tx.QueryRow(ctx, `
+			SELECT default_branch FROM repositories WHERE id = $1 AND tenant_id = $2 FOR UPDATE
+		`, repoID, tenantID).Scan(&defaultBranch); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("postgres: create branch %q for repo %s: %w", name, repoID, ErrRepositoryNotFound)
+			}
+			return fmt.Errorf("postgres: create branch %q for repo %s: lock repository: %w", name, repoID, err)
+		}
+
 		if _, err := tx.Exec(ctx, `INSERT INTO branches (tenant_id, repo_id, name, head_commit_id) VALUES ($1, $2, $3, $4)`, tenantID, repoID, name, headCommitID); err != nil {
+			if isUniqueViolation(err) {
+				return fmt.Errorf("postgres: create branch %q for repo %s: %w", name, repoID, ErrBranchAlreadyExists)
+			}
+			if isForeignKeyViolation(err) {
+				return fmt.Errorf("postgres: create branch %q for repo %s: %w", name, repoID, ErrCommitNotFound)
+			}
 			return fmt.Errorf("postgres: create branch %q for repo %s: insert branch: %w", name, repoID, err)
+		}
+
+		if defaultBranch == nil {
+			if _, err := tx.Exec(ctx, `UPDATE repositories SET default_branch = $1 WHERE id = $2 AND tenant_id = $3`, name, repoID, tenantID); err != nil {
+				return fmt.Errorf("postgres: create branch %q for repo %s: set default branch: %w", name, repoID, err)
+			}
 		}
 		return nil
 	}); err != nil {
@@ -1281,13 +1330,27 @@ func (s *PGStore) GetNativeObjectLocation(ctx context.Context, repoID, objectID 
 // DeleteBranch soft-deletes a branch ref scoped to the tenant carried by ctx.
 // See adr-immutable-commit-retention-on-branch-deletion: the row and its
 // head_commit_id are never removed, only marked deleted, so retention can
-// keep treating its history as reachable.
+// keep treating its history as reachable. Returns ErrDefaultBranchProtected
+// without modifying any row if name is repoID's default branch, per
+// req-remote-branch-lifecycle-and-safe-deletion.
 func (s *PGStore) DeleteBranch(ctx context.Context, repoID, name string) error {
-	if _, err := requireTenantID(ctx); err != nil {
+	tenantID, err := requireTenantID(ctx)
+	if err != nil {
 		return fmt.Errorf("postgres: delete branch %q for repo %s: %w", name, repoID, err)
 	}
 
 	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		var defaultBranch *string
+		if err := tx.QueryRow(ctx, `SELECT default_branch FROM repositories WHERE id = $1 AND tenant_id = $2`, repoID, tenantID).Scan(&defaultBranch); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("postgres: delete branch %q for repo %s: %w", name, repoID, ErrRepositoryNotFound)
+			}
+			return fmt.Errorf("postgres: delete branch %q for repo %s: query repository: %w", name, repoID, err)
+		}
+		if defaultBranch != nil && *defaultBranch == name {
+			return fmt.Errorf("postgres: delete branch %q for repo %s: %w", name, repoID, ErrDefaultBranchProtected)
+		}
+
 		result, err := tx.Exec(ctx, `
 			UPDATE branches
 			SET deleted_at = now()
@@ -1343,7 +1406,47 @@ func (s *PGStore) ListBranchRefs(ctx context.Context, repoID string) ([]BranchRe
 	return refs, nil
 }
 
-// CommitAncestryIDs returns commitID and every ancestor commit reachable
+// GetDefaultBranch returns the name and current head commit of repoID's
+// default branch — the first branch ever created for the repository via
+// CreateBranch — scoped to the tenant carried by ctx. Returns
+// ErrDefaultBranchNotSet if repoID has not yet had a branch created.
+func (s *PGStore) GetDefaultBranch(ctx context.Context, repoID string) (BranchRef, error) {
+	tenantID, err := requireTenantID(ctx)
+	if err != nil {
+		return BranchRef{}, fmt.Errorf("postgres: get default branch for repo %s: %w", repoID, err)
+	}
+
+	var ref BranchRef
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		var defaultBranch *string
+		if err := tx.QueryRow(ctx, `SELECT default_branch FROM repositories WHERE id = $1 AND tenant_id = $2`, repoID, tenantID).Scan(&defaultBranch); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("postgres: get default branch for repo %s: %w", repoID, ErrRepositoryNotFound)
+			}
+			return fmt.Errorf("postgres: get default branch for repo %s: query repository: %w", repoID, err)
+		}
+		if defaultBranch == nil {
+			return fmt.Errorf("postgres: get default branch for repo %s: %w", repoID, ErrDefaultBranchNotSet)
+		}
+
+		ref.Name = *defaultBranch
+		if err := tx.QueryRow(ctx, `
+			SELECT head_commit_id, deleted_at IS NOT NULL
+			FROM branches
+			WHERE repo_id = $1 AND name = $2
+		`, repoID, *defaultBranch).Scan(&ref.HeadCommitID, &ref.Deleted); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("postgres: get default branch for repo %s: %w", repoID, ErrBranchNotFound)
+			}
+			return fmt.Errorf("postgres: get default branch for repo %s: query branch: %w", repoID, err)
+		}
+		return nil
+	}); err != nil {
+		return BranchRef{}, err
+	}
+	return ref, nil
+}
+
 // through ordered parents, scoped to repoID within the tenant carried by
 // ctx. Unlike collectMergeAncestry, traversal is bounded by the much larger
 // maxRetentionAncestryCommits, since retention must see whole-repository
@@ -1802,4 +1905,9 @@ func newOpaqueToken() (string, error) {
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+func isForeignKeyViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23503"
 }

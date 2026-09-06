@@ -14,6 +14,9 @@ func TestDeleteBranch_SoftDeletesAndRetainsHead(t *testing.T) {
 	repoID := mustCreateRepository(t, store, tenantCtx, "repo-branch-delete")
 
 	commitID := mustPutCommit(t, store, tenantCtx, repoID, "", "snap-1", "author", "initial")
+	// "main" is created first so it becomes the repo's default branch,
+	// leaving "feature" free to be deleted in this test.
+	mustCreateBranch(t, store, tenantCtx, repoID, "main", commitID)
 	mustCreateBranch(t, store, tenantCtx, repoID, "feature", commitID)
 
 	if err := store.DeleteBranch(tenantCtx, repoID, "feature"); err != nil {
@@ -24,11 +27,17 @@ func TestDeleteBranch_SoftDeletesAndRetainsHead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListBranchRefs: %v", err)
 	}
-	if len(refs) != 1 {
-		t.Fatalf("ListBranchRefs = %+v, want exactly one soft-deleted branch retained", refs)
+	var featureRef *BranchRef
+	for i := range refs {
+		if refs[i].Name == "feature" {
+			featureRef = &refs[i]
+		}
 	}
-	if refs[0].Name != "feature" || refs[0].HeadCommitID != commitID || !refs[0].Deleted {
-		t.Fatalf("ListBranchRefs[0] = %+v, want deleted branch with head %q retained", refs[0], commitID)
+	if featureRef == nil {
+		t.Fatalf("ListBranchRefs = %+v, want %q retained", refs, "feature")
+	}
+	if featureRef.HeadCommitID != commitID || !featureRef.Deleted {
+		t.Fatalf("ListBranchRefs feature entry = %+v, want deleted branch with head %q retained", featureRef, commitID)
 	}
 
 	// Deleting again must fail: the branch is already gone, not resurrect-able
