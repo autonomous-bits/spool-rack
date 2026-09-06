@@ -258,6 +258,29 @@ func (d *LocalDriver) WritePack(ctx context.Context, scope Scope, packHash strin
 	return nil
 }
 
+// DeletePack removes a packfile by packfile hash, fenced to scope. It is not
+// part of the Driver interface: retention/GC callers type-assert for it
+// (see retention.PackDeleter) so that a Driver implementation without
+// physical deletion support degrades gracefully rather than breaking the
+// build. Removing an absent pack is a no-op, since the desired end state —
+// no such pack on disk — already holds.
+func (d *LocalDriver) DeletePack(ctx context.Context, scope Scope, packHash string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := validateHash(packHash); err != nil {
+		return err
+	}
+	path, err := d.packPath(scope, packHash)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("cas: delete pack %s: %w", packHash, err)
+	}
+	return nil
+}
+
 // scopeRoot returns the tenant/repository-partitioned root directory for
 // scope, mapping externally supplied scope identifiers to opaque hex keys
 // before constructing any filesystem path. This keeps path expressions free
