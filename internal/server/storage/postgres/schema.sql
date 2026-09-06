@@ -140,6 +140,14 @@ CREATE TABLE IF NOT EXISTS branches (
 	PRIMARY KEY (repo_id, name)
 );
 
+-- Branch deletion is a soft delete: per
+-- adr-immutable-commit-retention-on-branch-deletion, removing a branch must
+-- never delete the historical commits or audit trail it referenced. Keeping
+-- the row (with its head_commit_id intact) instead of deleting it lets
+-- retention/GC keep treating a deleted branch's history as a valid
+-- reachability root exactly like a live one.
+ALTER TABLE branches ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
+
 -- Leases reference a branch together with its tenant and repository scope.
 -- Keep this candidate key separate and before the lease table so fresh schema
 -- bootstrap can create that foreign key. The conventional constraint-backed
@@ -219,6 +227,49 @@ CREATE TABLE IF NOT EXISTS native_pack_objects (
 
 CREATE INDEX IF NOT EXISTS native_pack_objects_pack_idx ON native_pack_objects (repo_id, pack_id);
 
+-- Active transactions root retention for in-flight work that has not yet
+-- become reachable through any branch ref — most importantly a concurrent
+-- push in progress, whose objects must never be collected out from under it.
+-- A row may anchor a commit_id, an object_id, or both; deliberately no
+-- foreign keys are placed on either column, since a transaction may need to
+-- reserve an identifier before any other table has a row for it yet.
+CREATE TABLE IF NOT EXISTS repo_active_transactions (
+	tenant_id uuid NOT NULL REFERENCES tenants(id),
+	repo_id uuid NOT NULL REFERENCES repositories(id),
+	transaction_id text NOT NULL,
+	commit_id text,
+	object_id text,
+	expires_at timestamptz,
+	created_at timestamptz NOT NULL DEFAULT now(),
+	CONSTRAINT repo_active_transactions_repository_scope_fk
+		FOREIGN KEY (tenant_id, repo_id)
+		REFERENCES repositories(tenant_id, id),
+	CONSTRAINT repo_active_transactions_root_check
+		CHECK (commit_id IS NOT NULL OR object_id IS NOT NULL),
+	PRIMARY KEY (tenant_id, repo_id, transaction_id)
+);
+
+-- Audit records satisfy req-tenant-audit-and-access-logging generally, and
+-- specifically anchor retention for any commit or object a compliance trail
+-- must keep referring to independent of current branch state. Like
+-- repo_active_transactions, commit_id/object_id are intentionally
+-- unconstrained by foreign keys.
+CREATE TABLE IF NOT EXISTS audit_records (
+	id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+	tenant_id uuid NOT NULL REFERENCES tenants(id),
+	repo_id uuid NOT NULL REFERENCES repositories(id),
+	event_type text NOT NULL,
+	subject text NOT NULL,
+	commit_id text,
+	object_id text,
+	created_at timestamptz NOT NULL DEFAULT now(),
+	CONSTRAINT audit_records_repository_scope_fk
+		FOREIGN KEY (tenant_id, repo_id)
+		REFERENCES repositories(tenant_id, id)
+);
+
+CREATE INDEX IF NOT EXISTS audit_records_repo_idx ON audit_records (repo_id, created_at);
+
 CREATE TABLE IF NOT EXISTS target_branch_merge_leases (
 	tenant_id uuid NOT NULL REFERENCES tenants(id),
 	repo_id uuid NOT NULL REFERENCES repositories(id),
@@ -261,6 +312,8 @@ ALTER TABLE branches ENABLE ROW LEVEL SECURITY;
 ALTER TABLE target_branch_merge_leases ENABLE ROW LEVEL SECURITY;
 ALTER TABLE native_packs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE native_pack_objects ENABLE ROW LEVEL SECURITY;
+ALTER TABLE repo_active_transactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_records ENABLE ROW LEVEL SECURITY;
 
 -- current_setting(..., true) returns NULL instead of raising if the tenant
 -- context was never set on the session. That fail-closed behaviour is
@@ -320,9 +373,21 @@ CREATE POLICY tenant_isolation ON native_pack_objects
 	USING (tenant_id = current_setting('app.current_tenant_id', true)::uuid)
 	WITH CHECK (tenant_id = current_setting('app.current_tenant_id', true)::uuid);
 
+DROP POLICY IF EXISTS tenant_isolation ON repo_active_transactions;
+CREATE POLICY tenant_isolation ON repo_active_transactions
+	FOR ALL
+	USING (tenant_id = current_setting('app.current_tenant_id', true)::uuid)
+	WITH CHECK (tenant_id = current_setting('app.current_tenant_id', true)::uuid);
+
+DROP POLICY IF EXISTS tenant_isolation ON audit_records;
+CREATE POLICY tenant_isolation ON audit_records
+	FOR ALL
+	USING (tenant_id = current_setting('app.current_tenant_id', true)::uuid)
+	WITH CHECK (tenant_id = current_setting('app.current_tenant_id', true)::uuid);
+
 -- Grant the application only the privileges needed for ordinary CRUD access to
 -- metadata rows. Schema changes, ownership, and any RLS-bypass capability
 -- remain with the migration/admin role, which keeps the blast radius of an
 -- application credential compromise as small as this control plane allows.
 GRANT USAGE ON SCHEMA public TO spool_app;
-GRANT SELECT, INSERT, UPDATE, DELETE ON tenants, repositories, commits, commit_parents, pack_ranges, branches, target_branch_merge_leases, native_packs, native_pack_objects TO spool_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON tenants, repositories, commits, commit_parents, pack_ranges, branches, target_branch_merge_leases, native_packs, native_pack_objects, repo_active_transactions, audit_records TO spool_app;

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"time"
 
 	"github.com/autonomous-bits/spool/graphcontract"
@@ -62,7 +63,10 @@ var (
 	// deliberately returned for both an absent object and one that exists
 	// only under a different tenant.
 	ErrNativeObjectNotFound = errors.New("postgres: native pack object not found")
-	errNilContext           = errors.New("postgres: nil context")
+	// ErrActiveTransactionNotFound indicates the requested retention-anchoring
+	// active transaction row is not visible for the tenant carried by ctx.
+	ErrActiveTransactionNotFound = errors.New("postgres: active transaction not found")
+	errNilContext                = errors.New("postgres: nil context")
 
 	uuidV4Pattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 )
@@ -72,6 +76,12 @@ type contextKey int
 const tenantIDContextKey contextKey = iota
 
 const maxMergeAncestryCommits = 100
+
+// maxRetentionAncestryCommits bounds how far CommitAncestryIDs will traverse
+// from a single tip. Retention needs to see whole-repository history rather
+// than the shallow merge-preview window above, so this is far larger, while
+// still guarding against unbounded traversal work.
+const maxRetentionAncestryCommits = 200000
 
 // Store defines the metadata store operations for multi-tenant repositories.
 type Store interface {
@@ -148,6 +158,90 @@ type Store interface {
 	// tenant, which RLS and the repo scope keep indistinguishable from an
 	// absent object.
 	GetNativeObjectLocation(ctx context.Context, repoID, objectID string) (NativeObjectLocation, error)
+	// DeleteBranch soft-deletes a branch ref by setting deleted_at, scoped to
+	// the tenant carried by ctx. The row and its head_commit_id are retained
+	// per adr-immutable-commit-retention-on-branch-deletion, so retention/GC
+	// can keep treating a deleted branch's history as a valid reachability
+	// root. Returns ErrBranchNotFound if the branch does not exist or is
+	// already deleted.
+	DeleteBranch(ctx context.Context, repoID, name string) error
+	// ListBranchRefs returns every branch ref for repoID, including
+	// soft-deleted ones, scoped to the tenant carried by ctx. Retention uses
+	// this to root reachability on both live and deleted branch history.
+	ListBranchRefs(ctx context.Context, repoID string) ([]BranchRef, error)
+	// CommitAncestryIDs returns commitID and every ancestor commit reachable
+	// through ordered parents, scoped to repoID within the tenant carried by
+	// ctx. Returns ErrCommitNotFound if commitID does not exist.
+	CommitAncestryIDs(ctx context.Context, repoID, commitID string) ([]string, error)
+	// PutActiveTransaction registers (or replaces) a retention-anchoring
+	// active transaction row scoped to the tenant carried by ctx. At least
+	// one of commitID or objectID must be non-empty.
+	PutActiveTransaction(ctx context.Context, repoID, transactionID, commitID, objectID string) error
+	// ListActiveTransactions returns every active transaction row for repoID
+	// scoped to the tenant carried by ctx.
+	ListActiveTransactions(ctx context.Context, repoID string) ([]ActiveTransaction, error)
+	// DeleteActiveTransaction removes an active transaction row, scoped to
+	// the tenant carried by ctx, once the transaction it anchors has
+	// completed or aborted. Returns ErrActiveTransactionNotFound if absent.
+	DeleteActiveTransaction(ctx context.Context, repoID, transactionID string) error
+	// PutAuditRecord appends an immutable audit trail row scoped to the
+	// tenant carried by ctx, satisfying
+	// req-tenant-audit-and-access-logging. At least one of commitID or
+	// objectID may be set to anchor retention for that identifier.
+	PutAuditRecord(ctx context.Context, repoID, eventType, subject, commitID, objectID string) error
+	// ListAuditRecords returns every audit record for repoID scoped to the
+	// tenant carried by ctx.
+	ListAuditRecords(ctx context.Context, repoID string) ([]AuditRecord, error)
+	// ListNativePacks returns every indexed native pack's identity, CAS pack
+	// hash, and linked commit (if any) for repoID scoped to the tenant
+	// carried by ctx.
+	ListNativePacks(ctx context.Context, repoID string) ([]NativePackSummary, error)
+	// ListNativePackObjectIDs returns a map from every indexed native pack
+	// object ID to the pack ID that contains it, for repoID scoped to the
+	// tenant carried by ctx.
+	ListNativePackObjectIDs(ctx context.Context, repoID string) (map[string]string, error)
+	// DeleteNativePack removes a native pack's object index rows and its
+	// pack metadata row, scoped to the tenant carried by ctx. It does not
+	// touch the underlying CAS pack blob.
+	DeleteNativePack(ctx context.Context, repoID, packID string) error
+}
+
+// BranchRef identifies a branch ref's current or last-known head commit,
+// including branches that have been soft-deleted per
+// adr-immutable-commit-retention-on-branch-deletion.
+type BranchRef struct {
+	Name         string
+	HeadCommitID string
+	Deleted      bool
+}
+
+// ActiveTransaction anchors retention for in-flight work — most importantly
+// a concurrent push — that has not yet become reachable through any branch
+// ref. CommitID and/or ObjectID may be empty depending on which identifier
+// the transaction is anchoring.
+type ActiveTransaction struct {
+	TransactionID string
+	CommitID      string
+	ObjectID      string
+}
+
+// AuditRecord is one tenant-scoped audit trail entry. CommitID and/or
+// ObjectID may be empty when the event does not anchor retention for either.
+type AuditRecord struct {
+	ID        string
+	EventType string
+	Subject   string
+	CommitID  string
+	ObjectID  string
+}
+
+// NativePackSummary identifies one indexed native pack's identity, CAS pack
+// hash, and linked commit (empty when the pack has not yet been associated
+// with a registered commit).
+type NativePackSummary struct {
+	PackID      string
+	CASPackHash string
+	CommitID    string
 }
 
 // PackRange identifies one immutable pack and the commit interval it contains.
@@ -1182,6 +1276,417 @@ func (s *PGStore) GetNativeObjectLocation(ctx context.Context, repoID, objectID 
 	loc.UncompressedSize = uint64(uncompressedSize)
 	loc.CRC32 = uint32(crc32Value)
 	return loc, nil
+}
+
+// DeleteBranch soft-deletes a branch ref scoped to the tenant carried by ctx.
+// See adr-immutable-commit-retention-on-branch-deletion: the row and its
+// head_commit_id are never removed, only marked deleted, so retention can
+// keep treating its history as reachable.
+func (s *PGStore) DeleteBranch(ctx context.Context, repoID, name string) error {
+	if _, err := requireTenantID(ctx); err != nil {
+		return fmt.Errorf("postgres: delete branch %q for repo %s: %w", name, repoID, err)
+	}
+
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		result, err := tx.Exec(ctx, `
+			UPDATE branches
+			SET deleted_at = now()
+			WHERE repo_id = $1 AND name = $2 AND deleted_at IS NULL
+		`, repoID, name)
+		if err != nil {
+			return fmt.Errorf("postgres: delete branch %q for repo %s: %w", name, repoID, err)
+		}
+		if result.RowsAffected() == 0 {
+			return ErrBranchNotFound
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ListBranchRefs returns every branch ref for repoID, including soft-deleted
+// ones, scoped to the tenant carried by ctx.
+func (s *PGStore) ListBranchRefs(ctx context.Context, repoID string) ([]BranchRef, error) {
+	if _, err := requireTenantID(ctx); err != nil {
+		return nil, fmt.Errorf("postgres: list branch refs for repo %s: %w", repoID, err)
+	}
+
+	refs := make([]BranchRef, 0)
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT name, head_commit_id, deleted_at IS NOT NULL
+			FROM branches
+			WHERE repo_id = $1
+			ORDER BY name
+		`, repoID)
+		if err != nil {
+			return fmt.Errorf("postgres: list branch refs for repo %s: query branches: %w", repoID, err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var ref BranchRef
+			if err := rows.Scan(&ref.Name, &ref.HeadCommitID, &ref.Deleted); err != nil {
+				return fmt.Errorf("postgres: list branch refs for repo %s: scan branch: %w", repoID, err)
+			}
+			refs = append(refs, ref)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("postgres: list branch refs for repo %s: iterate branches: %w", repoID, err)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return refs, nil
+}
+
+// CommitAncestryIDs returns commitID and every ancestor commit reachable
+// through ordered parents, scoped to repoID within the tenant carried by
+// ctx. Unlike collectMergeAncestry, traversal is bounded by the much larger
+// maxRetentionAncestryCommits, since retention must see whole-repository
+// history rather than a shallow merge-preview window.
+func (s *PGStore) CommitAncestryIDs(ctx context.Context, repoID, commitID string) ([]string, error) {
+	if _, err := requireTenantID(ctx); err != nil {
+		return nil, fmt.Errorf("postgres: commit ancestry for repo %s: %w", repoID, err)
+	}
+
+	var ids []string
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		visited := make(map[string]struct{}, 256)
+		queue := []string{commitID}
+		for len(queue) > 0 {
+			current := queue[0]
+			queue = queue[1:]
+			if _, seen := visited[current]; seen {
+				continue
+			}
+
+			var exists bool
+			if err := tx.QueryRow(ctx, `
+				SELECT EXISTS (SELECT 1 FROM commits WHERE repo_id = $1 AND id = $2)
+			`, repoID, current).Scan(&exists); err != nil {
+				return fmt.Errorf("postgres: commit ancestry for repo %s: query commit %s: %w", repoID, current, err)
+			}
+			if !exists {
+				if len(visited) == 0 {
+					return ErrCommitNotFound
+				}
+				return ErrCommitHistoryIncomplete
+			}
+			if len(visited) == maxRetentionAncestryCommits {
+				return ErrCommitHistoryTooDeep
+			}
+			visited[current] = struct{}{}
+
+			parents, err := commitParentIDs(ctx, tx, repoID, current)
+			if err != nil {
+				return fmt.Errorf("postgres: commit ancestry for repo %s: %w", repoID, err)
+			}
+			for _, parentID := range parents {
+				if _, seen := visited[parentID]; !seen {
+					queue = append(queue, parentID)
+				}
+			}
+		}
+
+		ids = make([]string, 0, len(visited))
+		for id := range visited {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+// PutActiveTransaction registers (or replaces) a retention-anchoring active
+// transaction row scoped to the tenant carried by ctx.
+func (s *PGStore) PutActiveTransaction(ctx context.Context, repoID, transactionID, commitID, objectID string) error {
+	tenantID, err := requireTenantID(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres: put active transaction for repo %s: %w", repoID, err)
+	}
+	if transactionID == "" {
+		return fmt.Errorf("postgres: put active transaction for repo %s: transaction ID is required", repoID)
+	}
+	if commitID == "" && objectID == "" {
+		return fmt.Errorf("postgres: put active transaction for repo %s: commit ID or object ID is required", repoID)
+	}
+
+	commit := nullableText(commitID)
+	object := nullableText(objectID)
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO repo_active_transactions (tenant_id, repo_id, transaction_id, commit_id, object_id)
+			VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT (tenant_id, repo_id, transaction_id)
+			DO UPDATE SET commit_id = EXCLUDED.commit_id, object_id = EXCLUDED.object_id
+		`, tenantID, repoID, transactionID, commit, object); err != nil {
+			return fmt.Errorf("postgres: put active transaction for repo %s: insert active transaction: %w", repoID, err)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ListActiveTransactions returns every active transaction row for repoID
+// scoped to the tenant carried by ctx.
+func (s *PGStore) ListActiveTransactions(ctx context.Context, repoID string) ([]ActiveTransaction, error) {
+	if _, err := requireTenantID(ctx); err != nil {
+		return nil, fmt.Errorf("postgres: list active transactions for repo %s: %w", repoID, err)
+	}
+
+	txns := make([]ActiveTransaction, 0)
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT transaction_id, commit_id, object_id
+			FROM repo_active_transactions
+			WHERE repo_id = $1
+			ORDER BY transaction_id
+		`, repoID)
+		if err != nil {
+			return fmt.Errorf("postgres: list active transactions for repo %s: query: %w", repoID, err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var txn ActiveTransaction
+			var commit, object *string
+			if err := rows.Scan(&txn.TransactionID, &commit, &object); err != nil {
+				return fmt.Errorf("postgres: list active transactions for repo %s: scan: %w", repoID, err)
+			}
+			if commit != nil {
+				txn.CommitID = *commit
+			}
+			if object != nil {
+				txn.ObjectID = *object
+			}
+			txns = append(txns, txn)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("postgres: list active transactions for repo %s: iterate: %w", repoID, err)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return txns, nil
+}
+
+// DeleteActiveTransaction removes an active transaction row scoped to the
+// tenant carried by ctx.
+func (s *PGStore) DeleteActiveTransaction(ctx context.Context, repoID, transactionID string) error {
+	if _, err := requireTenantID(ctx); err != nil {
+		return fmt.Errorf("postgres: delete active transaction for repo %s: %w", repoID, err)
+	}
+
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		result, err := tx.Exec(ctx, `
+			DELETE FROM repo_active_transactions WHERE repo_id = $1 AND transaction_id = $2
+		`, repoID, transactionID)
+		if err != nil {
+			return fmt.Errorf("postgres: delete active transaction for repo %s: %w", repoID, err)
+		}
+		if result.RowsAffected() == 0 {
+			return ErrActiveTransactionNotFound
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+// PutAuditRecord appends an immutable audit trail row scoped to the tenant
+// carried by ctx.
+func (s *PGStore) PutAuditRecord(ctx context.Context, repoID, eventType, subject, commitID, objectID string) error {
+	tenantID, err := requireTenantID(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres: put audit record for repo %s: %w", repoID, err)
+	}
+	if eventType == "" || subject == "" {
+		return fmt.Errorf("postgres: put audit record for repo %s: event type and subject are required", repoID)
+	}
+
+	commit := nullableText(commitID)
+	object := nullableText(objectID)
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO audit_records (tenant_id, repo_id, event_type, subject, commit_id, object_id)
+			VALUES ($1, $2, $3, $4, $5, $6)
+		`, tenantID, repoID, eventType, subject, commit, object); err != nil {
+			return fmt.Errorf("postgres: put audit record for repo %s: insert audit record: %w", repoID, err)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ListAuditRecords returns every audit record for repoID scoped to the
+// tenant carried by ctx.
+func (s *PGStore) ListAuditRecords(ctx context.Context, repoID string) ([]AuditRecord, error) {
+	if _, err := requireTenantID(ctx); err != nil {
+		return nil, fmt.Errorf("postgres: list audit records for repo %s: %w", repoID, err)
+	}
+
+	records := make([]AuditRecord, 0)
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT id, event_type, subject, commit_id, object_id
+			FROM audit_records
+			WHERE repo_id = $1
+			ORDER BY created_at
+		`, repoID)
+		if err != nil {
+			return fmt.Errorf("postgres: list audit records for repo %s: query: %w", repoID, err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var record AuditRecord
+			var commit, object *string
+			if err := rows.Scan(&record.ID, &record.EventType, &record.Subject, &commit, &object); err != nil {
+				return fmt.Errorf("postgres: list audit records for repo %s: scan: %w", repoID, err)
+			}
+			if commit != nil {
+				record.CommitID = *commit
+			}
+			if object != nil {
+				record.ObjectID = *object
+			}
+			records = append(records, record)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("postgres: list audit records for repo %s: iterate: %w", repoID, err)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return records, nil
+}
+
+// ListNativePacks returns every indexed native pack's identity, CAS pack
+// hash, and linked commit for repoID scoped to the tenant carried by ctx.
+func (s *PGStore) ListNativePacks(ctx context.Context, repoID string) ([]NativePackSummary, error) {
+	if _, err := requireTenantID(ctx); err != nil {
+		return nil, fmt.Errorf("postgres: list native packs for repo %s: %w", repoID, err)
+	}
+
+	packs := make([]NativePackSummary, 0)
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT pack_id, cas_pack_hash, commit_id
+			FROM native_packs
+			WHERE repo_id = $1
+			ORDER BY pack_id
+		`, repoID)
+		if err != nil {
+			return fmt.Errorf("postgres: list native packs for repo %s: query: %w", repoID, err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var pack NativePackSummary
+			var commit *string
+			if err := rows.Scan(&pack.PackID, &pack.CASPackHash, &commit); err != nil {
+				return fmt.Errorf("postgres: list native packs for repo %s: scan: %w", repoID, err)
+			}
+			if commit != nil {
+				pack.CommitID = *commit
+			}
+			packs = append(packs, pack)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("postgres: list native packs for repo %s: iterate: %w", repoID, err)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return packs, nil
+}
+
+// ListNativePackObjectIDs returns a map from every indexed native pack
+// object ID to the pack ID that contains it, for repoID scoped to the
+// tenant carried by ctx.
+func (s *PGStore) ListNativePackObjectIDs(ctx context.Context, repoID string) (map[string]string, error) {
+	if _, err := requireTenantID(ctx); err != nil {
+		return nil, fmt.Errorf("postgres: list native pack object IDs for repo %s: %w", repoID, err)
+	}
+
+	objects := make(map[string]string)
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT object_id, pack_id
+			FROM native_pack_objects
+			WHERE repo_id = $1
+		`, repoID)
+		if err != nil {
+			return fmt.Errorf("postgres: list native pack object IDs for repo %s: query: %w", repoID, err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var objectID, packID string
+			if err := rows.Scan(&objectID, &packID); err != nil {
+				return fmt.Errorf("postgres: list native pack object IDs for repo %s: scan: %w", repoID, err)
+			}
+			objects[objectID] = packID
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("postgres: list native pack object IDs for repo %s: iterate: %w", repoID, err)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return objects, nil
+}
+
+// DeleteNativePack removes a native pack's object index rows and its pack
+// metadata row, scoped to the tenant carried by ctx. It does not touch the
+// underlying CAS pack blob; callers decide separately whether that blob is
+// still referenced by any retained pack.
+func (s *PGStore) DeleteNativePack(ctx context.Context, repoID, packID string) error {
+	if _, err := requireTenantID(ctx); err != nil {
+		return fmt.Errorf("postgres: delete native pack for repo %s: %w", repoID, err)
+	}
+
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM native_pack_objects WHERE repo_id = $1 AND pack_id = $2
+		`, repoID, packID); err != nil {
+			return fmt.Errorf("postgres: delete native pack for repo %s: delete objects: %w", repoID, err)
+		}
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM native_packs WHERE repo_id = $1 AND pack_id = $2
+		`, repoID, packID); err != nil {
+			return fmt.Errorf("postgres: delete native pack for repo %s: delete pack: %w", repoID, err)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+// nullableText converts an empty string to a nil driver value so optional
+// text columns store SQL NULL instead of an empty string.
+func nullableText(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 func (s *PGStore) withTenantTx(ctx context.Context, fn func(ctx context.Context, tx pgx.Tx) error) error {
