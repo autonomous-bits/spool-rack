@@ -173,6 +173,52 @@ ALTER TABLE commit_parents DROP CONSTRAINT IF EXISTS commit_parents_parent_posit
 ALTER TABLE commit_parents ALTER COLUMN parent_position TYPE integer;
 ALTER TABLE commit_parents ADD CONSTRAINT commit_parents_parent_position_check CHECK (parent_position >= 1);
 
+-- Native packs are the immutable, verified binary pack containers described
+-- by graphcontract/pack.go (distinct from the legacy CBOR PackFrameV2 used by
+-- the sync engine). Each row records the pack's client-supplied PackID
+-- alongside the content hash under which its raw bytes are stored in CAS, and
+-- optionally the commit the pack was uploaded to make reachable.
+CREATE TABLE IF NOT EXISTS native_packs (
+	tenant_id uuid NOT NULL REFERENCES tenants(id),
+	repo_id uuid NOT NULL REFERENCES repositories(id),
+	pack_id text NOT NULL,
+	cas_pack_hash text NOT NULL,
+	commit_id text,
+	object_count integer NOT NULL CHECK (object_count >= 0),
+	created_at timestamptz NOT NULL DEFAULT now(),
+	CONSTRAINT native_packs_repository_scope_fk
+		FOREIGN KEY (tenant_id, repo_id)
+		REFERENCES repositories(tenant_id, id),
+	CONSTRAINT native_packs_commit_scope_fk
+		FOREIGN KEY (tenant_id, repo_id, commit_id)
+		REFERENCES commits(tenant_id, repo_id, id),
+	PRIMARY KEY (tenant_id, repo_id, pack_id)
+);
+
+-- Native pack objects index every verified object reachable through a native
+-- pack by its content-derived object ID, scoped strictly to one tenant's
+-- repository. The unique constraint on (tenant_id, repo_id, object_id) is a
+-- deliberate content-addressed dedup: since an object ID is a hash of its
+-- canonical bytes, any two verified entries sharing an object ID must carry
+-- identical content, so only the first indexed location needs to be kept.
+CREATE TABLE IF NOT EXISTS native_pack_objects (
+	tenant_id uuid NOT NULL REFERENCES tenants(id),
+	repo_id uuid NOT NULL REFERENCES repositories(id),
+	pack_id text NOT NULL,
+	object_id text NOT NULL,
+	pack_offset bigint NOT NULL CHECK (pack_offset >= 0),
+	compressed_size bigint NOT NULL CHECK (compressed_size > 0),
+	uncompressed_size bigint NOT NULL CHECK (uncompressed_size > 0),
+	crc32 bigint NOT NULL CHECK (crc32 >= 0 AND crc32 <= 4294967295),
+	created_at timestamptz NOT NULL DEFAULT now(),
+	CONSTRAINT native_pack_objects_pack_scope_fk
+		FOREIGN KEY (tenant_id, repo_id, pack_id)
+		REFERENCES native_packs(tenant_id, repo_id, pack_id),
+	PRIMARY KEY (tenant_id, repo_id, object_id)
+);
+
+CREATE INDEX IF NOT EXISTS native_pack_objects_pack_idx ON native_pack_objects (repo_id, pack_id);
+
 CREATE TABLE IF NOT EXISTS target_branch_merge_leases (
 	tenant_id uuid NOT NULL REFERENCES tenants(id),
 	repo_id uuid NOT NULL REFERENCES repositories(id),
@@ -213,6 +259,8 @@ ALTER TABLE commit_parents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pack_ranges ENABLE ROW LEVEL SECURITY;
 ALTER TABLE branches ENABLE ROW LEVEL SECURITY;
 ALTER TABLE target_branch_merge_leases ENABLE ROW LEVEL SECURITY;
+ALTER TABLE native_packs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE native_pack_objects ENABLE ROW LEVEL SECURITY;
 
 -- current_setting(..., true) returns NULL instead of raising if the tenant
 -- context was never set on the session. That fail-closed behaviour is
@@ -260,9 +308,21 @@ CREATE POLICY tenant_isolation ON target_branch_merge_leases
 	USING (tenant_id = current_setting('app.current_tenant_id', true)::uuid)
 	WITH CHECK (tenant_id = current_setting('app.current_tenant_id', true)::uuid);
 
+DROP POLICY IF EXISTS tenant_isolation ON native_packs;
+CREATE POLICY tenant_isolation ON native_packs
+	FOR ALL
+	USING (tenant_id = current_setting('app.current_tenant_id', true)::uuid)
+	WITH CHECK (tenant_id = current_setting('app.current_tenant_id', true)::uuid);
+
+DROP POLICY IF EXISTS tenant_isolation ON native_pack_objects;
+CREATE POLICY tenant_isolation ON native_pack_objects
+	FOR ALL
+	USING (tenant_id = current_setting('app.current_tenant_id', true)::uuid)
+	WITH CHECK (tenant_id = current_setting('app.current_tenant_id', true)::uuid);
+
 -- Grant the application only the privileges needed for ordinary CRUD access to
 -- metadata rows. Schema changes, ownership, and any RLS-bypass capability
 -- remain with the migration/admin role, which keeps the blast radius of an
 -- application credential compromise as small as this control plane allows.
 GRANT USAGE ON SCHEMA public TO spool_app;
-GRANT SELECT, INSERT, UPDATE, DELETE ON tenants, repositories, commits, commit_parents, pack_ranges, branches, target_branch_merge_leases TO spool_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON tenants, repositories, commits, commit_parents, pack_ranges, branches, target_branch_merge_leases, native_packs, native_pack_objects TO spool_app;
