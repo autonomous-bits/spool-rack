@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"regexp"
 
+	"github.com/autonomous-bits/spool/graphcontract"
+
 	"github.com/autonomous-bits/spool-rack/internal/server/auth"
 	"github.com/autonomous-bits/spool-rack/internal/server/review"
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/cas"
@@ -394,11 +396,30 @@ func (g *Gateway) handlePull(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// healthzGraphContract reports the graphcontract pack format versions this
+// server understands, so clients (e.g. the Spool CLI) can negotiate
+// compatibility before push/pull.
+type healthzGraphContract struct {
+	PackFormatVersion         uint32 `json:"packFormatVersion"`
+	PackIndexFormatVersion    uint32 `json:"packIndexFormatVersion"`
+	PackManifestFormatVersion uint32 `json:"packManifestFormatVersion"`
+}
+
+type healthzResponse struct {
+	Status        string               `json:"status"`
+	GraphContract healthzGraphContract `json:"graphcontract"`
+}
+
 func (g *Gateway) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"status": "healthy",
+	_ = json.NewEncoder(w).Encode(healthzResponse{
+		Status: "healthy",
+		GraphContract: healthzGraphContract{
+			PackFormatVersion:         graphcontract.PackFormatVersion,
+			PackIndexFormatVersion:    graphcontract.PackIndexFormatVersion,
+			PackManifestFormatVersion: graphcontract.PackManifestFormatVersion,
+		},
 	})
 }
 
