@@ -28,7 +28,7 @@ type errorEnvelope struct {
 	Error         string `json:"error"`
 	Message       string `json:"message"`
 	CurrentHead   string `json:"currentHead,omitempty"`
-	CorrelationID string `json:"correlationId,omitempty"`
+	CorrelationID string `json:"correlationId"`
 }
 
 var defaultLogger = slog.New(slog.NewJSONHandler(os.Stderr, nil))
