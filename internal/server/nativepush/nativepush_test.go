@@ -204,7 +204,7 @@ func (f *fakeIndexStore) GetNativeObjectLocation(ctx context.Context, repoID, ob
 	return loc, nil
 }
 
-// --- fake serversync.BranchStore. ---
+// --- fake nativepush.Store. ---
 
 type fakeBranchStore struct {
 	branchHeads  map[string]string
@@ -213,6 +213,10 @@ type fakeBranchStore struct {
 	putCommitCalls      []graphcontract.ObjectID
 	getBranchRefCalls   int
 	compareAndSwapCalls int
+	publishCalls        int
+
+	transactions map[string]postgres.NativePushResult
+	activeTxns   map[string]bool
 }
 
 func (f *fakeBranchStore) SetTenantContext(ctx context.Context, _ string) (context.Context, error) {
@@ -270,7 +274,59 @@ func (f *fakeBranchStore) CompareAndSwapBranchRef(_ context.Context, _, branch, 
 	return nil
 }
 
-var _ serversync.BranchStore = (*fakeBranchStore)(nil)
+// PublishNativePush mimics postgres.PGStore.PublishNativePush's idempotency
+// contract closely enough for Engine tests: an already-committed
+// IdempotencyKey short-circuits with the prior result and performs no
+// writes, and a genuinely new publish only advances branchHeads when the
+// current head still matches BaseCommit.
+func (f *fakeBranchStore) PublishNativePush(ctx context.Context, pub postgres.NativePushPublication) (postgres.NativePushResult, error) {
+	f.publishCalls++
+	if f.transactions == nil {
+		f.transactions = make(map[string]postgres.NativePushResult)
+	}
+	if result, ok := f.transactions[pub.IdempotencyKey]; ok {
+		result.AlreadyApplied = true
+		return result, nil
+	}
+
+	actualHead, ok := f.branchHeads[pub.Branch]
+	if !ok {
+		return postgres.NativePushResult{}, postgres.ErrBranchNotFound
+	}
+	if actualHead != pub.BaseCommit {
+		return postgres.NativePushResult{}, &postgres.NonFastForwardHeadError{ActualHead: actualHead}
+	}
+
+	for _, record := range pub.Commits {
+		if err := f.PutCommit(ctx, pub.RepoID, record.ID, record.Commit); err != nil {
+			return postgres.NativePushResult{}, err
+		}
+	}
+	f.branchHeads[pub.Branch] = pub.TargetCommit
+	f.compareAndSwapCalls++
+
+	result := postgres.NativePushResult{Head: pub.TargetCommit}
+	f.transactions[pub.IdempotencyKey] = result
+	return result, nil
+}
+
+func (f *fakeBranchStore) PutActiveTransaction(_ context.Context, _, transactionID, _, _ string) error {
+	if f.activeTxns == nil {
+		f.activeTxns = make(map[string]bool)
+	}
+	f.activeTxns[transactionID] = true
+	return nil
+}
+
+func (f *fakeBranchStore) DeleteActiveTransaction(_ context.Context, _, transactionID string) error {
+	if !f.activeTxns[transactionID] {
+		return postgres.ErrActiveTransactionNotFound
+	}
+	delete(f.activeTxns, transactionID)
+	return nil
+}
+
+var _ Store = (*fakeBranchStore)(nil)
 
 // --- fixture assembling a single, valid native push. ---
 
@@ -345,7 +401,7 @@ func TestHandlePushValidPushAdvancesRefExactlyOnce(t *testing.T) {
 	}
 }
 
-func TestHandlePushRetryAfterSuccessIsRejectedNonFastForward(t *testing.T) {
+func TestHandlePushRetryAfterSuccessReturnsSameResult(t *testing.T) {
 	t.Parallel()
 	fx := newPushFixture(t)
 	ctx := context.Background()
@@ -355,17 +411,22 @@ func TestHandlePushRetryAfterSuccessIsRejectedNonFastForward(t *testing.T) {
 	}
 	head := fx.branchStore.branchHeads["main"]
 	casCallsAfterFirst := fx.branchStore.compareAndSwapCalls
+	putCommitCallsAfterFirst := len(fx.branchStore.putCommitCalls)
 
-	err := fx.engine.HandlePush(ctx, fx.req)
-	var nffErr *serversync.NonFastForwardError
-	if !errors.As(err, &nffErr) {
-		t.Fatalf("HandlePush() retry error = %v, want NonFastForwardError", err)
+	if err := fx.engine.HandlePush(ctx, fx.req); err != nil {
+		t.Fatalf("HandlePush() retry error = %v, want nil (retry of an already-applied push must succeed)", err)
 	}
 	if fx.branchStore.branchHeads["main"] != head {
 		t.Fatalf("branch head changed on retry: got %q, want unchanged %q", fx.branchStore.branchHeads["main"], head)
 	}
 	if fx.branchStore.compareAndSwapCalls != casCallsAfterFirst {
-		t.Fatalf("CompareAndSwapBranchRef called again on retry: calls = %d, want unchanged %d", fx.branchStore.compareAndSwapCalls, casCallsAfterFirst)
+		t.Fatalf("branch ref advanced again on retry: calls = %d, want unchanged %d", fx.branchStore.compareAndSwapCalls, casCallsAfterFirst)
+	}
+	if len(fx.branchStore.putCommitCalls) != putCommitCallsAfterFirst {
+		t.Fatalf("commit registered again on retry: calls = %d, want unchanged %d", len(fx.branchStore.putCommitCalls), putCommitCallsAfterFirst)
+	}
+	if fx.branchStore.publishCalls != 2 {
+		t.Fatalf("PublishNativePush calls = %d, want 2 (first call plus retry)", fx.branchStore.publishCalls)
 	}
 }
 

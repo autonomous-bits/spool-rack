@@ -265,6 +265,34 @@ CREATE TABLE IF NOT EXISTS repo_active_transactions (
 	PRIMARY KEY (tenant_id, repo_id, transaction_id)
 );
 
+-- Native push transactions make internal/server/nativepush's HandlePush
+-- retry-safe (goal-rack-upload-idempotency): a durable record of one
+-- completed publish, keyed by (tenant_id, repo_id, idempotency_key) where
+-- idempotency_key is the verified pack's client-supplied PackID. Rows are
+-- only ever written by PGStore.PublishNativePush's single database
+-- transaction that also registers the pushed commits and advances the
+-- branch ref, so a row can never exist without its commits and ref update
+-- having actually happened, and a rolled-back attempt leaves no row at all
+-- (freeing the idempotency key for a genuine retry). A retried push that
+-- reuses an already-committed idempotency key is recognized here and returns
+-- the original outcome instead of re-executing or misdiagnosing the write as
+-- a non-fast-forward conflict.
+CREATE TABLE IF NOT EXISTS native_push_transactions (
+	tenant_id uuid NOT NULL REFERENCES tenants(id),
+	repo_id uuid NOT NULL REFERENCES repositories(id),
+	idempotency_key text NOT NULL,
+	branch text NOT NULL,
+	base_commit_id text NOT NULL,
+	target_commit_id text NOT NULL,
+	status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'committed')),
+	created_at timestamptz NOT NULL DEFAULT now(),
+	completed_at timestamptz,
+	CONSTRAINT native_push_transactions_repository_scope_fk
+		FOREIGN KEY (tenant_id, repo_id)
+		REFERENCES repositories(tenant_id, id),
+	PRIMARY KEY (tenant_id, repo_id, idempotency_key)
+);
+
 -- Audit records satisfy req-tenant-audit-and-access-logging generally, and
 -- specifically anchor retention for any commit or object a compliance trail
 -- must keep referring to independent of current branch state. Like
@@ -330,6 +358,7 @@ ALTER TABLE native_packs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE native_pack_objects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE repo_active_transactions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_records ENABLE ROW LEVEL SECURITY;
+ALTER TABLE native_push_transactions ENABLE ROW LEVEL SECURITY;
 
 -- current_setting(..., true) returns NULL instead of raising if the tenant
 -- context was never set on the session. That fail-closed behaviour is
@@ -401,9 +430,15 @@ CREATE POLICY tenant_isolation ON audit_records
 	USING (tenant_id = current_setting('app.current_tenant_id', true)::uuid)
 	WITH CHECK (tenant_id = current_setting('app.current_tenant_id', true)::uuid);
 
+DROP POLICY IF EXISTS tenant_isolation ON native_push_transactions;
+CREATE POLICY tenant_isolation ON native_push_transactions
+	FOR ALL
+	USING (tenant_id = current_setting('app.current_tenant_id', true)::uuid)
+	WITH CHECK (tenant_id = current_setting('app.current_tenant_id', true)::uuid);
+
 -- Grant the application only the privileges needed for ordinary CRUD access to
 -- metadata rows. Schema changes, ownership, and any RLS-bypass capability
 -- remain with the migration/admin role, which keeps the blast radius of an
 -- application credential compromise as small as this control plane allows.
 GRANT USAGE ON SCHEMA public TO spool_app;
-GRANT SELECT, INSERT, UPDATE, DELETE ON tenants, repositories, commits, commit_parents, pack_ranges, branches, target_branch_merge_leases, native_packs, native_pack_objects, repo_active_transactions, audit_records TO spool_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON tenants, repositories, commits, commit_parents, pack_ranges, branches, target_branch_merge_leases, native_packs, native_pack_objects, repo_active_transactions, audit_records, native_push_transactions TO spool_app;
