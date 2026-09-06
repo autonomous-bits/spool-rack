@@ -103,26 +103,43 @@ type packedObject struct {
 	data       []byte
 }
 
-// formattedCommitStore is the optional capability a BranchStore may offer to
-// record a commit's explicit framing format. Mirrors the equivalent
-// unexported interface in the sync package: Go interfaces are structural, so
-// the same postgres.Store implementation satisfies both independently
-// declared interfaces without either package needing to import the other's
-// unexported type.
-type formattedCommitStore interface {
-	PutCommitWithFormat(context.Context, string, graphcontract.ObjectID, graphcontract.Commit, uint32) error
+// Store is the storage capability Engine depends on. It embeds
+// serversync.BranchStore for the read-side operations HandlePush relies on
+// to verify a push (resolving commit metadata, checking ancestry, reading
+// pack ranges), and adds the durable, transactional publish and
+// retention-anchoring operations that make native push retry-safe: see
+// PublishNativePush for the idempotency guarantee, and HandlePush for how
+// PutActiveTransaction/DeleteActiveTransaction protect a verified pack's
+// objects from concurrent retention collection while a push is in flight.
+type Store interface {
+	serversync.BranchStore
+	// PublishNativePush durably registers this push's commits and advances
+	// Branch in a single transaction keyed by an idempotency token, so a
+	// retried push recognizes and returns its own prior success instead of
+	// re-publishing or misdiagnosing a non-fast-forward conflict.
+	PublishNativePush(ctx context.Context, pub postgres.NativePushPublication) (postgres.NativePushResult, error)
+	// PutActiveTransaction anchors retention for a verified pack's objects
+	// while HandlePush is validating and publishing it, so a concurrent
+	// retention pass cannot collect objects an in-flight (or crashed,
+	// resumable) push has already durably indexed but not yet made
+	// reachable through any commit or branch ref.
+	PutActiveTransaction(ctx context.Context, repoID, transactionID, commitID, objectID string) error
+	// DeleteActiveTransaction releases the anchor registered by
+	// PutActiveTransaction once HandlePush's outcome (success or rejection)
+	// is final.
+	DeleteActiveTransaction(ctx context.Context, repoID, transactionID string) error
 }
 
 // Engine persists verified native packs and advances branch refs only after
 // the pack, its commits, and their graph snapshots are all proven valid.
 type Engine struct {
 	indexer *nativeindex.Indexer
-	store   serversync.BranchStore
+	store   Store
 }
 
 // NewEngine constructs an Engine backed by a native pack indexer and branch
 // metadata storage.
-func NewEngine(indexer *nativeindex.Indexer, store serversync.BranchStore) *Engine {
+func NewEngine(indexer *nativeindex.Indexer, store Store) *Engine {
 	return &Engine{indexer: indexer, store: store}
 }
 
@@ -133,6 +150,14 @@ func NewEngine(indexer *nativeindex.Indexer, store serversync.BranchStore) *Engi
 // schema-invalid graph state, a disconnected/missing reference, or a
 // non-fast-forward attempt — leaves Branch and all commit metadata
 // completely unchanged.
+//
+// HandlePush is retry-safe (goal-rack-upload-idempotency): the verified
+// pack's own PackID is used, unmodified, as an idempotency token. A client
+// that retries a push it never saw the response for (the pack, and every
+// commit and ref update it produced, already fully applied) receives the
+// same successful outcome instead of a confusing non-fast-forward rejection
+// — see postgres.PGStore.PublishNativePush for how the durable upload
+// transaction recognizes and short-circuits such a retry.
 func (e *Engine) HandlePush(ctx context.Context, req PushRequest) error {
 	if err := validatePushRequest(req); err != nil {
 		return err
@@ -151,6 +176,30 @@ func (e *Engine) HandlePush(ctx context.Context, req PushRequest) error {
 	if err != nil {
 		return fmt.Errorf("nativepush: set tenant context: %w", err)
 	}
+
+	// Step 2: anchor retention on the verified pack's target commit object
+	// for the remainder of this push. The pack's objects are now durably
+	// indexed but not yet reachable from any commit or branch ref; without
+	// this anchor a concurrent retention pass — or a crash that leaves this
+	// push interrupted and later resumed by a retry — could collect them
+	// out from under the in-flight publish. The transaction ID is the
+	// pack's own idempotency token, so re-registering it on a retry is a
+	// harmless no-op, and it is always released once this call's outcome
+	// (success or rejection) is final.
+	transactionID := string(req.PackID)
+	if err := e.store.PutActiveTransaction(tenantCtx, req.RepoID, transactionID, "", req.TargetCommit); err != nil {
+		return fmt.Errorf("nativepush: anchor retention for pack %s: %w", req.PackID, err)
+	}
+	defer func() {
+		if delErr := e.store.DeleteActiveTransaction(tenantCtx, req.RepoID, transactionID); delErr != nil && !errors.Is(delErr, postgres.ErrActiveTransactionNotFound) {
+			// Best-effort cleanup: leaving the anchor behind only over-retains
+			// a verified, harmless pack until a future retention pass or
+			// manual cleanup removes it. It never affects correctness of
+			// readable committed history, so a cleanup failure must not
+			// override this call's actual result.
+			_ = delErr
+		}
+	}()
 
 	packed, err := decodePackedObjects(req.PackData, req.PackEntries)
 	if err != nil {
@@ -177,35 +226,31 @@ func (e *Engine) HandlePush(ctx context.Context, req PushRequest) error {
 		return err
 	}
 
-	// Step: check fast-forward before publishing anything, so a
-	// non-fast-forward push (the common, expected rejection case, not just a
-	// concurrent race) never registers a commit row that no branch will ever
-	// reach.
-	actualHead, err := e.store.GetBranchRef(tenantCtx, req.RepoID, req.Branch)
-	if err != nil {
-		return fmt.Errorf("nativepush: get branch ref: %w", err)
+	// Step 3: all pack, DAG, schema, and fast-forward verification has
+	// succeeded (fast-forward is verified, and the branch ref advanced,
+	// inside PublishNativePush's single durable transaction — see its
+	// doc comment for why the check cannot safely happen as a separate,
+	// earlier step). Publish every commit and advance the branch ref
+	// atomically, keyed by this push's idempotency token so a retry of an
+	// already-applied push is recognized instead of re-executed.
+	publication := postgres.NativePushPublication{
+		RepoID:         req.RepoID,
+		Branch:         req.Branch,
+		IdempotencyKey: transactionID,
+		BaseCommit:     req.BaseCommit,
+		TargetCommit:   req.TargetCommit,
+		Commits:        make([]postgres.NativePushCommit, len(req.Commits)),
 	}
-	if actualHead != req.BaseCommit {
-		return e.diagnoseNonFastForward(tenantCtx, req, actualHead)
-	}
-
-	// Step: all pack, DAG, schema, and fast-forward verification has
-	// succeeded. Only now does the pipeline publish commit metadata and
-	// advance the branch ref.
-	for _, record := range req.Commits {
-		if err := e.putCommit(tenantCtx, req.RepoID, record); err != nil {
-			return fmt.Errorf("nativepush: register commit %s: %w", record.ID, err)
-		}
+	for i, record := range req.Commits {
+		publication.Commits[i] = postgres.NativePushCommit{ID: record.ID, Commit: record.Commit, Format: CommitFormatNative}
 	}
 
-	if err := e.store.CompareAndSwapBranchRef(tenantCtx, req.RepoID, req.Branch, req.BaseCommit, req.TargetCommit); err != nil {
-		if errors.Is(err, postgres.ErrNonFastForward) {
-			return &serversync.NonFastForwardError{
-				ActualHead: actualHead,
-				Guidance:   "remote branch changed concurrently; pull the latest changes and retry your push",
-			}
+	if _, err := e.store.PublishNativePush(tenantCtx, publication); err != nil {
+		var nffErr *postgres.NonFastForwardHeadError
+		if errors.As(err, &nffErr) {
+			return e.diagnoseNonFastForward(tenantCtx, req, nffErr.ActualHead)
 		}
-		return fmt.Errorf("nativepush: advance branch ref: %w", err)
+		return fmt.Errorf("nativepush: publish push: %w", err)
 	}
 
 	return nil
@@ -352,13 +397,6 @@ func (e *Engine) verifyCommitSnapshot(ctx context.Context, req PushRequest, reco
 		return fmt.Errorf("%w: commit %s snapshot %s: %w", ErrInvalidNativePush, record.ID, commit.Snapshot, err)
 	}
 	return nil
-}
-
-func (e *Engine) putCommit(ctx context.Context, repoID string, record CommitRecord) error {
-	if formatted, ok := e.store.(formattedCommitStore); ok {
-		return formatted.PutCommitWithFormat(ctx, repoID, record.ID, record.Commit, CommitFormatNative)
-	}
-	return e.store.PutCommit(ctx, repoID, record.ID, record.Commit)
 }
 
 func (e *Engine) diagnoseNonFastForward(ctx context.Context, req PushRequest, actualHead string) error {

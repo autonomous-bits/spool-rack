@@ -1286,3 +1286,198 @@ func TestApplyMerge_RejectsWrongOwnerWithoutConsumingLease(t *testing.T) {
 		t.Fatalf("owner lease after rejected ApplyMerge: %v", err)
 	}
 }
+
+func TestPublishNativePush_RetryReturnsSameCommittedResult(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-publish-retry")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoID := mustCreateRepository(t, store, tenantCtx, "repo-publish-retry")
+	base := mustPutCommit(t, store, tenantCtx, repoID, "", "snap-base", "alice", "base")
+	mustCreateBranch(t, store, tenantCtx, repoID, "main", base)
+
+	target := testCommitID(t.Name(), "target")
+	commit := graphcontract.Commit{
+		Snapshot: "snap-target", Author: "alice", Message: "native push",
+		Time: time.Unix(0, 0), Parents: []graphcontract.ObjectID{graphcontract.ObjectID(base)},
+	}
+	pub := NativePushPublication{
+		RepoID: repoID, Branch: "main", IdempotencyKey: "pack-" + t.Name(),
+		BaseCommit: base, TargetCommit: target,
+		Commits: []NativePushCommit{{ID: graphcontract.ObjectID(target), Commit: commit, Format: 1}},
+	}
+
+	result, err := store.PublishNativePush(tenantCtx, pub)
+	if err != nil {
+		t.Fatalf("PublishNativePush first call: %v", err)
+	}
+	if result.AlreadyApplied || result.Head != target {
+		t.Fatalf("PublishNativePush first call = %+v, want a fresh publish to %q", result, target)
+	}
+
+	retryResult, err := store.PublishNativePush(tenantCtx, pub)
+	if err != nil {
+		t.Fatalf("PublishNativePush retry: %v", err)
+	}
+	if !retryResult.AlreadyApplied || retryResult.Head != target {
+		t.Fatalf("PublishNativePush retry = %+v, want AlreadyApplied to %q", retryResult, target)
+	}
+
+	head, err := store.GetBranchRef(tenantCtx, repoID, "main")
+	if err != nil || head != target {
+		t.Fatalf("GetBranchRef after retry = (%q, %v), want (%q, nil)", head, err, target)
+	}
+
+	var commitCount int
+	if err := store.withTenantTx(tenantCtx, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT count(*) FROM commits WHERE repo_id = $1 AND id = $2`, repoID, target).Scan(&commitCount)
+	}); err != nil {
+		t.Fatalf("count commit rows: %v", err)
+	}
+	if commitCount != 1 {
+		t.Fatalf("commit rows for %q = %d, want 1 (no duplicate insert on retry)", target, commitCount)
+	}
+}
+
+func TestPublishNativePush_NonFastForwardLeavesNoRows(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-publish-nff")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoID := mustCreateRepository(t, store, tenantCtx, "repo-publish-nff")
+	base := mustPutCommit(t, store, tenantCtx, repoID, "", "snap-base", "alice", "base")
+	other := mustPutCommit(t, store, tenantCtx, repoID, base, "snap-other", "alice", "other")
+	mustCreateBranch(t, store, tenantCtx, repoID, "main", other) // actual head is "other", not "base"
+
+	target := testCommitID(t.Name(), "target")
+	commit := graphcontract.Commit{
+		Snapshot: "snap-target", Author: "alice", Message: "native push",
+		Time: time.Unix(0, 0), Parents: []graphcontract.ObjectID{graphcontract.ObjectID(base)},
+	}
+	pub := NativePushPublication{
+		RepoID: repoID, Branch: "main", IdempotencyKey: "pack-" + t.Name(),
+		BaseCommit: base, TargetCommit: target,
+		Commits: []NativePushCommit{{ID: graphcontract.ObjectID(target), Commit: commit, Format: 1}},
+	}
+
+	_, err := store.PublishNativePush(tenantCtx, pub)
+	var nffErr *NonFastForwardHeadError
+	if !errors.As(err, &nffErr) || nffErr.ActualHead != other {
+		t.Fatalf("PublishNativePush non-fast-forward: err = %v, want *NonFastForwardHeadError{ActualHead: %q}", err, other)
+	}
+
+	head, err := store.GetBranchRef(tenantCtx, repoID, "main")
+	if err != nil || head != other {
+		t.Fatalf("GetBranchRef after failed publish = (%q, %v), want unchanged (%q, nil)", head, err, other)
+	}
+	if _, err := store.GetCommitMetadata(tenantCtx, repoID, target); !errors.Is(err, ErrCommitNotFound) {
+		t.Fatalf("GetCommitMetadata after failed publish = %v, want ErrCommitNotFound (no partial commit row)", err)
+	}
+
+	// The idempotency key must not be left claimed by the failed attempt, so
+	// a corrected retry reusing the same key can still proceed.
+	var txnCount int
+	if err := store.withTenantTx(tenantCtx, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT count(*) FROM native_push_transactions WHERE repo_id = $1 AND idempotency_key = $2`, repoID, pub.IdempotencyKey).Scan(&txnCount)
+	}); err != nil {
+		t.Fatalf("count native_push_transactions rows: %v", err)
+	}
+	if txnCount != 0 {
+		t.Fatalf("native_push_transactions rows for failed publish = %d, want 0", txnCount)
+	}
+}
+
+func TestPublishNativePush_ConcurrentRetriesAdvanceRefExactlyOnce(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-publish-concurrent")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoID := mustCreateRepository(t, store, tenantCtx, "repo-publish-concurrent")
+	base := mustPutCommit(t, store, tenantCtx, repoID, "", "snap-base", "alice", "base")
+	mustCreateBranch(t, store, tenantCtx, repoID, "main", base)
+
+	target := testCommitID(t.Name(), "target")
+	commit := graphcontract.Commit{
+		Snapshot: "snap-target", Author: "alice", Message: "native push",
+		Time: time.Unix(0, 0), Parents: []graphcontract.ObjectID{graphcontract.ObjectID(base)},
+	}
+	pub := NativePushPublication{
+		RepoID: repoID, Branch: "main", IdempotencyKey: "pack-" + t.Name(),
+		BaseCommit: base, TargetCommit: target,
+		Commits: []NativePushCommit{{ID: graphcontract.ObjectID(target), Commit: commit, Format: 1}},
+	}
+
+	const workers = 8
+	results := make([]NativePushResult, workers)
+	errs := make([]error, workers)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func(i int) {
+			defer wg.Done()
+			results[i], errs[i] = store.PublishNativePush(tenantCtx, pub)
+		}(i)
+	}
+	wg.Wait()
+
+	var freshCount int
+	for i := 0; i < workers; i++ {
+		if errs[i] != nil {
+			t.Fatalf("PublishNativePush worker %d: unexpected error %v", i, errs[i])
+		}
+		if results[i].Head != target {
+			t.Fatalf("PublishNativePush worker %d Head = %q, want %q", i, results[i].Head, target)
+		}
+		if !results[i].AlreadyApplied {
+			freshCount++
+		}
+	}
+	if freshCount != 1 {
+		t.Fatalf("fresh (non-AlreadyApplied) PublishNativePush results = %d, want exactly 1", freshCount)
+	}
+
+	head, err := store.GetBranchRef(tenantCtx, repoID, "main")
+	if err != nil || head != target {
+		t.Fatalf("GetBranchRef after concurrent retries = (%q, %v), want (%q, nil)", head, err, target)
+	}
+}
+
+func TestPublishNativePush_IdempotencyKeyReusedForDifferentPushRejected(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-publish-conflict")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoID := mustCreateRepository(t, store, tenantCtx, "repo-publish-conflict")
+	base := mustPutCommit(t, store, tenantCtx, repoID, "", "snap-base", "alice", "base")
+	mustCreateBranch(t, store, tenantCtx, repoID, "main", base)
+
+	target := testCommitID(t.Name(), "target")
+	commit := graphcontract.Commit{
+		Snapshot: "snap-target", Author: "alice", Message: "native push",
+		Time: time.Unix(0, 0), Parents: []graphcontract.ObjectID{graphcontract.ObjectID(base)},
+	}
+	key := "pack-" + t.Name()
+	pub := NativePushPublication{
+		RepoID: repoID, Branch: "main", IdempotencyKey: key,
+		BaseCommit: base, TargetCommit: target,
+		Commits: []NativePushCommit{{ID: graphcontract.ObjectID(target), Commit: commit, Format: 1}},
+	}
+	if _, err := store.PublishNativePush(tenantCtx, pub); err != nil {
+		t.Fatalf("PublishNativePush initial: %v", err)
+	}
+
+	otherTarget := testCommitID(t.Name(), "other-target")
+	otherPub := pub
+	otherPub.TargetCommit = otherTarget
+	otherPub.Commits = []NativePushCommit{{ID: graphcontract.ObjectID(otherTarget), Commit: commit, Format: 1}}
+
+	_, err := store.PublishNativePush(tenantCtx, otherPub)
+	if !errors.Is(err, ErrNativePushIdempotencyConflict) {
+		t.Fatalf("PublishNativePush reused idempotency key: err = %v, want ErrNativePushIdempotencyConflict", err)
+	}
+
+	head, err := store.GetBranchRef(tenantCtx, repoID, "main")
+	if err != nil || head != target {
+		t.Fatalf("GetBranchRef after rejected reuse = (%q, %v), want unchanged (%q, nil)", head, err, target)
+	}
+}

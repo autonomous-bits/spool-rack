@@ -78,7 +78,16 @@ var (
 	// ErrActiveTransactionNotFound indicates the requested retention-anchoring
 	// active transaction row is not visible for the tenant carried by ctx.
 	ErrActiveTransactionNotFound = errors.New("postgres: active transaction not found")
-	errNilContext                = errors.New("postgres: nil context")
+	// ErrInvalidNativePushPublication indicates a PublishNativePush call was
+	// missing required fields.
+	ErrInvalidNativePushPublication = errors.New("postgres: invalid native push publication")
+	// ErrNativePushIdempotencyConflict indicates a PublishNativePush call
+	// reused an idempotency key that was already committed for a different
+	// branch, base commit, or target commit. A genuine retry of the same
+	// push always supplies identical values, so this can only mean the
+	// idempotency key (the pack's PackID) was reused for an unrelated push.
+	ErrNativePushIdempotencyConflict = errors.New("postgres: native push idempotency key reused with different push parameters")
+	errNilContext                    = errors.New("postgres: nil context")
 
 	uuidV4Pattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 )
@@ -226,6 +235,21 @@ type Store interface {
 	// pack metadata row, scoped to the tenant carried by ctx. It does not
 	// touch the underlying CAS pack blob.
 	DeleteNativePack(ctx context.Context, repoID, packID string) error
+	// PublishNativePush durably and atomically registers every commit in a
+	// verified native push and advances its branch ref, keyed by
+	// pub.IdempotencyKey (the verified pack's PackID). A single database
+	// transaction performs the commit registration, the branch
+	// compare-and-swap, and the idempotency record together, so a failure at
+	// any point leaves no commit row, no ref advancement, and no
+	// idempotency record behind. A retried call reusing an
+	// already-committed IdempotencyKey performs no writes and returns the
+	// original result with AlreadyApplied set, instead of re-executing the
+	// publish or misdiagnosing it as a non-fast-forward conflict. Returns a
+	// *NonFastForwardHeadError wrapping ErrNonFastForward when the branch's
+	// actual head does not match pub.BaseCommit for a genuinely new push,
+	// and ErrNativePushIdempotencyConflict when IdempotencyKey was
+	// previously committed with different branch/base/target values.
+	PublishNativePush(ctx context.Context, pub NativePushPublication) (NativePushResult, error)
 }
 
 // BranchRef identifies a branch ref's current or last-known head commit,
@@ -280,6 +304,58 @@ type CommitMetadata struct {
 	ID           string
 	SnapshotRoot string
 	Format       uint32
+}
+
+// NativePushCommit is one commit to register as part of a durable
+// PublishNativePush publish, oldest-ancestor-first.
+type NativePushCommit struct {
+	ID     graphcontract.ObjectID
+	Commit graphcontract.Commit
+	Format uint32
+}
+
+// NativePushPublication describes one durable, idempotent native push
+// publish: registering every pushed commit and advancing Branch atomically,
+// keyed by IdempotencyKey (the verified pack's PackID) so a retried push
+// that already succeeded is recognized and returns its prior result instead
+// of re-executing, or misdiagnosing, the write. See PublishNativePush.
+type NativePushPublication struct {
+	RepoID         string
+	Branch         string
+	IdempotencyKey string
+	BaseCommit     string
+	TargetCommit   string
+	Commits        []NativePushCommit
+}
+
+// NativePushResult reports the outcome of PublishNativePush.
+type NativePushResult struct {
+	// AlreadyApplied is true when IdempotencyKey names a previously
+	// committed publish: no commit rows or branch ref were written by this
+	// call.
+	AlreadyApplied bool
+	// Head is the branch head this publish (fresh or already applied)
+	// establishes: always equal to TargetCommit.
+	Head string
+}
+
+// NonFastForwardHeadError reports the branch's actual head when
+// PublishNativePush rejects a genuinely new push as non-fast-forward, so
+// callers can diagnose whether the actual head is a descendant of the
+// pushed base (needs pull + retry) or represents diverged history.
+type NonFastForwardHeadError struct {
+	ActualHead string
+}
+
+func (e *NonFastForwardHeadError) Error() string {
+	if e == nil || e.ActualHead == "" {
+		return ErrNonFastForward.Error()
+	}
+	return fmt.Sprintf("%s: actual head %s", ErrNonFastForward, e.ActualHead)
+}
+
+func (e *NonFastForwardHeadError) Unwrap() error {
+	return ErrNonFastForward
 }
 
 // MergeLeaseRequest identifies the merge preview that is reserving a target
@@ -496,80 +572,92 @@ func (s *PGStore) putCommit(ctx context.Context, repoID string, commitID graphco
 	if err != nil {
 		return fmt.Errorf("postgres: put commit for repo %s: %w", repoID, err)
 	}
-	normalized, err := commit.Normalize()
-	if err != nil {
-		return fmt.Errorf("postgres: put commit for repo %s: canonical commit: %w", repoID, err)
-	}
 
 	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
-		result, err := tx.Exec(ctx, `
-			INSERT INTO commits (id, tenant_id, repo_id, snapshot_root, object_format, author, message, commit_time)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-			ON CONFLICT (tenant_id, repo_id, id) DO NOTHING
-		`, string(commitID), tenantID, repoID, string(normalized.Snapshot), format, normalized.Author, normalized.Message, normalized.Time)
-		if err != nil {
-			return fmt.Errorf("postgres: put commit for repo %s: insert commit: %w", repoID, err)
-		}
-		existingCommit := result.RowsAffected() == 0
-		if existingCommit {
-			var existing struct {
-				snapshotRoot string
-				format       uint32
-				author       string
-				message      string
-				time         time.Time
-			}
-			if err := tx.QueryRow(ctx, `
-				SELECT snapshot_root, object_format, author, message, commit_time
-				FROM commits
-				WHERE tenant_id = $1 AND repo_id = $2 AND id = $3
-				FOR KEY SHARE
-			`, tenantID, repoID, string(commitID)).Scan(
-				&existing.snapshotRoot, &existing.format, &existing.author, &existing.message, &existing.time,
-			); err != nil {
-				return fmt.Errorf("postgres: put commit for repo %s: read existing commit: %w", repoID, err)
-			}
-			if existing.snapshotRoot != string(normalized.Snapshot) || existing.format != format ||
-				existing.author != normalized.Author || existing.message != normalized.Message ||
-				!existing.time.Equal(normalized.Time) {
-				return ErrImmutableMetadataMismatch
-			}
-		}
-
-		existingParents, err := commitParentIDs(ctx, tx, repoID, string(commitID))
-		if err != nil {
-			return fmt.Errorf("postgres: put commit for repo %s: read existing parents: %w", repoID, err)
-		}
-		if existingCommit {
-			if len(existingParents) != len(normalized.Parents) {
-				return ErrImmutableMetadataMismatch
-			}
-			for i, parent := range normalized.Parents {
-				if existingParents[i] != string(parent) {
-					return ErrImmutableMetadataMismatch
-				}
-			}
-			return nil
-		}
-		if len(normalized.Parents) == 0 {
-			return nil
-		}
-		parentIDs := make([]string, len(normalized.Parents))
-		for i, parent := range normalized.Parents {
-			parentIDs[i] = string(parent)
-		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO commit_parents (tenant_id, repo_id, commit_id, parent_position, parent_commit_id)
-			SELECT $1, $2, $3, parent_position, parent_commit_id
-			FROM unnest($4::text[]) WITH ORDINALITY AS parent(parent_commit_id, parent_position)
-		`, tenantID, repoID, string(commitID), parentIDs); err != nil {
-			return fmt.Errorf("postgres: put commit for repo %s: insert commit parents: %w", repoID, err)
-		}
-		return nil
+		return putCommitTx(ctx, tx, tenantID, repoID, commitID, commit, format)
 	}); err != nil {
-		return err
+		return fmt.Errorf("postgres: put commit for repo %s: %w", repoID, err)
 	}
 
+	return nil
+}
+
+// putCommitTx inserts a content-addressed commit row and its ordered parent
+// collection using an already-open transaction, so callers that must publish
+// several rows atomically alongside a commit (PublishNativePush's durable
+// upload transaction, in particular) can do so without nesting a second,
+// independent database transaction. Re-registering the same commitID with
+// identical immutable metadata is a no-op; a mismatch returns
+// ErrImmutableMetadataMismatch.
+func putCommitTx(ctx context.Context, tx pgx.Tx, tenantID, repoID string, commitID graphcontract.ObjectID, commit graphcontract.Commit, format uint32) error {
+	normalized, err := commit.Normalize()
+	if err != nil {
+		return fmt.Errorf("canonical commit: %w", err)
+	}
+
+	result, err := tx.Exec(ctx, `
+		INSERT INTO commits (id, tenant_id, repo_id, snapshot_root, object_format, author, message, commit_time)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (tenant_id, repo_id, id) DO NOTHING
+	`, string(commitID), tenantID, repoID, string(normalized.Snapshot), format, normalized.Author, normalized.Message, normalized.Time)
+	if err != nil {
+		return fmt.Errorf("insert commit: %w", err)
+	}
+	existingCommit := result.RowsAffected() == 0
+	if existingCommit {
+		var existing struct {
+			snapshotRoot string
+			format       uint32
+			author       string
+			message      string
+			time         time.Time
+		}
+		if err := tx.QueryRow(ctx, `
+			SELECT snapshot_root, object_format, author, message, commit_time
+			FROM commits
+			WHERE tenant_id = $1 AND repo_id = $2 AND id = $3
+			FOR KEY SHARE
+		`, tenantID, repoID, string(commitID)).Scan(
+			&existing.snapshotRoot, &existing.format, &existing.author, &existing.message, &existing.time,
+		); err != nil {
+			return fmt.Errorf("read existing commit: %w", err)
+		}
+		if existing.snapshotRoot != string(normalized.Snapshot) || existing.format != format ||
+			existing.author != normalized.Author || existing.message != normalized.Message ||
+			!existing.time.Equal(normalized.Time) {
+			return ErrImmutableMetadataMismatch
+		}
+	}
+
+	existingParents, err := commitParentIDs(ctx, tx, repoID, string(commitID))
+	if err != nil {
+		return fmt.Errorf("read existing parents: %w", err)
+	}
+	if existingCommit {
+		if len(existingParents) != len(normalized.Parents) {
+			return ErrImmutableMetadataMismatch
+		}
+		for i, parent := range normalized.Parents {
+			if existingParents[i] != string(parent) {
+				return ErrImmutableMetadataMismatch
+			}
+		}
+		return nil
+	}
+	if len(normalized.Parents) == 0 {
+		return nil
+	}
+	parentIDs := make([]string, len(normalized.Parents))
+	for i, parent := range normalized.Parents {
+		parentIDs[i] = string(parent)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO commit_parents (tenant_id, repo_id, commit_id, parent_position, parent_commit_id)
+		SELECT $1, $2, $3, parent_position, parent_commit_id
+		FROM unnest($4::text[]) WITH ORDINALITY AS parent(parent_commit_id, parent_position)
+	`, tenantID, repoID, string(commitID), parentIDs); err != nil {
+		return fmt.Errorf("insert commit parents: %w", err)
+	}
 	return nil
 }
 
@@ -1221,6 +1309,116 @@ func (s *PGStore) CompareAndSwapBranchRef(ctx context.Context, repoID, branch, e
 	}
 
 	return nil
+}
+
+// PublishNativePush durably and atomically publishes a fully verified native
+// push: every commit it carries plus the branch ref advance are registered
+// together in one database transaction, so a failure at any point (a
+// concurrent non-fast-forward, a canceled request, a crashed process) leaves
+// no commit row and no ref advancement behind. This is what makes native
+// push retry-safe, per goal-rack-upload-idempotency: pub.IdempotencyKey (the
+// verified pack's own PackID, already unique per tenant/repository) claims
+// exactly one durable outcome for a push. A client that retries after never
+// observing the first attempt's response reuses the same PackID/TargetCommit
+// identity, so this method recognizes the retry and returns the original
+// result — instead of re-running the publish, and instead of the retry's
+// GetBranchRef now seeing TargetCommit as the actual head and incorrectly
+// falling into a non-fast-forward diagnosis for what was actually its own
+// prior success.
+//
+// The claim itself is what serializes concurrent callers: the first
+// statement in the transaction is an INSERT into native_push_transactions
+// keyed by (tenant_id, repo_id, idempotency_key). PostgreSQL forces any
+// concurrent transaction inserting the same key to wait for this one to
+// commit or roll back before proceeding, so two concurrent retries can never
+// both believe they are the first to publish — the loser either observes the
+// winner's committed row (and short-circuits below) or, if the winner
+// instead failed and rolled back, is freed to become the new attempt.
+func (s *PGStore) PublishNativePush(ctx context.Context, pub NativePushPublication) (NativePushResult, error) {
+	tenantID, err := requireTenantID(ctx)
+	if err != nil {
+		return NativePushResult{}, fmt.Errorf("postgres: publish native push: %w", err)
+	}
+	if pub.RepoID == "" || pub.Branch == "" || pub.IdempotencyKey == "" ||
+		pub.BaseCommit == "" || pub.TargetCommit == "" || len(pub.Commits) == 0 {
+		return NativePushResult{}, fmt.Errorf("postgres: publish native push: %w", ErrInvalidNativePushPublication)
+	}
+
+	var result NativePushResult
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		claimed, err := tx.Exec(ctx, `
+			INSERT INTO native_push_transactions (tenant_id, repo_id, idempotency_key, branch, base_commit_id, target_commit_id, status)
+			VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+			ON CONFLICT (tenant_id, repo_id, idempotency_key) DO NOTHING
+		`, tenantID, pub.RepoID, pub.IdempotencyKey, pub.Branch, pub.BaseCommit, pub.TargetCommit)
+		if err != nil {
+			return fmt.Errorf("claim idempotency key %q: %w", pub.IdempotencyKey, err)
+		}
+
+		if claimed.RowsAffected() == 0 {
+			var existing struct {
+				branch string
+				base   string
+				target string
+				status string
+			}
+			if err := tx.QueryRow(ctx, `
+				SELECT branch, base_commit_id, target_commit_id, status
+				FROM native_push_transactions
+				WHERE tenant_id = $1 AND repo_id = $2 AND idempotency_key = $3
+			`, tenantID, pub.RepoID, pub.IdempotencyKey).Scan(&existing.branch, &existing.base, &existing.target, &existing.status); err != nil {
+				return fmt.Errorf("read existing native push transaction %q: %w", pub.IdempotencyKey, err)
+			}
+			if existing.branch != pub.Branch || existing.base != pub.BaseCommit || existing.target != pub.TargetCommit {
+				return ErrNativePushIdempotencyConflict
+			}
+			if existing.status != "committed" {
+				return fmt.Errorf("native push transaction %q has unexpected status %q", pub.IdempotencyKey, existing.status)
+			}
+			result = NativePushResult{AlreadyApplied: true, Head: existing.target}
+			return nil
+		}
+
+		head, err := branchHeadForUpdate(ctx, tx, pub.RepoID, pub.Branch)
+		if err != nil {
+			return err
+		}
+		if head != pub.BaseCommit {
+			return &NonFastForwardHeadError{ActualHead: head}
+		}
+
+		for _, record := range pub.Commits {
+			if err := putCommitTx(ctx, tx, tenantID, pub.RepoID, record.ID, record.Commit, record.Format); err != nil {
+				return fmt.Errorf("register commit %s: %w", record.ID, err)
+			}
+		}
+
+		updated, err := tx.Exec(ctx, `
+			UPDATE branches
+			SET head_commit_id = $1, updated_at = now()
+			WHERE repo_id = $2 AND name = $3 AND head_commit_id = $4
+		`, pub.TargetCommit, pub.RepoID, pub.Branch, pub.BaseCommit)
+		if err != nil {
+			return fmt.Errorf("advance branch ref: %w", err)
+		}
+		if updated.RowsAffected() != 1 {
+			return &NonFastForwardHeadError{ActualHead: head}
+		}
+
+		if _, err := tx.Exec(ctx, `
+			UPDATE native_push_transactions
+			SET status = 'committed', completed_at = now()
+			WHERE tenant_id = $1 AND repo_id = $2 AND idempotency_key = $3
+		`, tenantID, pub.RepoID, pub.IdempotencyKey); err != nil {
+			return fmt.Errorf("record native push transaction: %w", err)
+		}
+
+		result = NativePushResult{AlreadyApplied: false, Head: pub.TargetCommit}
+		return nil
+	}); err != nil {
+		return NativePushResult{}, fmt.Errorf("postgres: publish native push: %w", err)
+	}
+	return result, nil
 }
 
 // PutNativePack registers a verified native Spool pack and the location of
