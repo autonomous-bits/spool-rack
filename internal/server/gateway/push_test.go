@@ -343,10 +343,8 @@ func TestPushAcceptsCanonicalV2Snapshot(t *testing.T) {
 	base := hashCommitString("v2-base")
 	snapshot, err := review.MarshalSnapshotCBOR(review.Snapshot{
 		Version: review.SnapshotVersion,
-		Schema: review.Schema{
-			NodeLabels: []review.LabelRule{}, EdgeLabels: []review.LabelRule{}, Cardinalities: []review.CardinalityRule{},
-		},
-		Nodes: []review.Node{}, Edges: []review.Edge{},
+		Schema:  review.Schema{Version: 1, Permissive: true},
+		Nodes:   map[string]review.Node{}, Edges: map[string]review.Edge{},
 	})
 	if err != nil {
 		t.Fatal(err)

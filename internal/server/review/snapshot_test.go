@@ -2,192 +2,154 @@ package review
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/cas"
+	"github.com/autonomous-bits/spool/graphcontract"
 )
 
-func TestDecodeSnapshotJSON_ValidatesVersionedGraphAndSchema(t *testing.T) {
+func TestSnapshotRoundTripPreservesCanonicalContract(t *testing.T) {
 	t.Parallel()
 
-	snapshot, err := DecodeSnapshotJSON([]byte(`{
-		"version": 1,
-		"schema": {
-			"nodeLabels": [
-				{"label": "Person", "properties": [{"name": "name", "type": "string", "required": true}]},
-				{"label": "Team", "properties": []}
-			],
-			"edgeLabels": [{"label": "MEMBER_OF", "properties": []}],
-			"cardinalities": [{"edgeLabel": "MEMBER_OF", "fromLabel": "Person", "toLabel": "Team", "min": 1, "max": 1}]
-		},
-		"nodes": [
-			{"id": "team-1", "labels": ["Team"], "properties": []},
-			{"id": "user-1", "labels": ["Person"], "properties": [{"name": "name", "type": "string", "value": "Ada"}]}
-		],
-		"edges": [
-			{"id": "membership-1", "from": "user-1", "to": "team-1", "labels": ["MEMBER_OF"], "properties": []}
-		]
-	}`))
+	snapshot := testSnapshot(testNode("node", "Person", "external_id", graphcontract.IntegerPropertyValue(1)))
+	data, err := MarshalSnapshotCBOR(snapshot)
 	if err != nil {
-		t.Fatalf("DecodeSnapshotJSON() error = %v", err)
+		t.Fatal(err)
 	}
-	if snapshot.Version != SnapshotVersion {
-		t.Fatalf("Version = %d, want %d", snapshot.Version, SnapshotVersion)
-	}
-	if got := snapshot.Nodes[1].Properties[0].Value; string(got) != `"Ada"` {
-		t.Fatalf("property value = %s, want %q", got, `"Ada"`)
-	}
-	if got := *snapshot.Schema.Cardinalities[0].Max; got != 1 {
-		t.Fatalf("cardinality max = %d, want 1", got)
-	}
-	encoded, err := MarshalSnapshotJSON(snapshot)
+	decoded, err := DecodeSnapshotCBOR(data)
 	if err != nil {
-		t.Fatalf("MarshalSnapshotJSON() error = %v", err)
+		t.Fatal(err)
 	}
-	if strings.Contains(string(encoded), "\n") {
-		t.Fatalf("MarshalSnapshotJSON() = %q, want compact deterministic JSON", encoded)
+	if !reflect.DeepEqual(decoded, snapshot) {
+		t.Fatalf("decoded snapshot = %#v, want %#v", decoded, snapshot)
 	}
-	if _, err := DecodeSnapshotJSON(encoded); err != nil {
-		t.Fatalf("DecodeSnapshotJSON(MarshalSnapshotJSON()) error = %v", err)
+	if _, err := DecodeSnapshotJSON([]byte(`{}`)); !errors.Is(err, ErrUnsupportedSnapshotVersion) {
+		t.Fatalf("DecodeSnapshotJSON() error = %v, want unsupported version", err)
+	}
+	if _, err := MarshalSnapshotJSON(snapshot); !errors.Is(err, ErrUnsupportedSnapshotVersion) {
+		t.Fatalf("MarshalSnapshotJSON() error = %v, want unsupported version", err)
 	}
 }
 
-func TestDecodeSnapshotJSON_RejectsStrictContractViolations(t *testing.T) {
+func TestDecodeSnapshotObjectRejectsLegacyJSONWithMigrationGuidance(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name string
-		json string
-		err  error
-	}{
-		{
-			name: "unknown field",
-			json: `{"version":1,"schema":{"nodeLabels":[],"edgeLabels":[],"cardinalities":[]},"nodes":[],"edges":[],"other":true}`,
-			err:  ErrInvalidSnapshot,
-		},
-		{
-			name: "duplicate field",
-			json: `{"version":1,"version":1,"schema":{"nodeLabels":[],"edgeLabels":[],"cardinalities":[]},"nodes":[],"edges":[]}`,
-			err:  ErrInvalidSnapshot,
-		},
-		{
-			name: "malformed JSON",
-			json: `{"version":1,"schema":{"nodeLabels":[],"edgeLabels":[],"cardinalities":[]},"nodes":[],"edges":[]`,
-			err:  ErrInvalidSnapshot,
-		},
-		{
-			name: "unsupported version",
-			json: `{"version":2,"schema":{"nodeLabels":[],"edgeLabels":[],"cardinalities":[]},"nodes":[],"edges":[]}`,
-			err:  ErrUnsupportedSnapshotVersion,
-		},
-		{
-			name: "nondeterministic node order",
-			json: `{"version":1,"schema":{"nodeLabels":[],"edgeLabels":[],"cardinalities":[]},"nodes":[{"id":"b","labels":["N"],"properties":[]},{"id":"a","labels":["N"],"properties":[]}],"edges":[]}`,
-			err:  ErrInvalidSnapshot,
-		},
-		{
-			name: "typed property mismatch",
-			json: `{"version":1,"schema":{"nodeLabels":[],"edgeLabels":[],"cardinalities":[]},"nodes":[{"id":"a","labels":["N"],"properties":[{"name":"count","type":"number","value":"one"}]}],"edges":[]}`,
-			err:  ErrInvalidSnapshot,
-		},
+	_, err := DecodeSnapshotObject([]byte(`{"version":1,"schema":{},"nodes":[],"edges":[]}`))
+	if !errors.Is(err, ErrUnsupportedSnapshotVersion) ||
+		!strings.Contains(err.Error(), "legacy JSON review snapshots are unsupported") {
+		t.Fatalf("DecodeSnapshotObject() error = %v, want actionable legacy-format rejection", err)
 	}
+}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := DecodeSnapshotJSON([]byte(tc.json))
-			if !errors.Is(err, tc.err) {
-				t.Fatalf("DecodeSnapshotJSON() error = %v, want errors.Is(..., %v)", err, tc.err)
+func TestDecodeSnapshotLoadsCanonicalObjectAndPreservesCASError(t *testing.T) {
+	t.Parallel()
+
+	scope, err := cas.NewScope("tenant-a", "repo-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := MarshalSnapshotCBOR(testSnapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := strings.Repeat("a", 64)
+	store := fakeSnapshotStore{data: map[string][]byte{root: data}}
+	if _, err := DecodeSnapshot(context.Background(), &store, scope, root); err != nil {
+		t.Fatal(err)
+	}
+	if store.gotHash != root || store.gotScope != scope {
+		t.Fatalf("Get() scope/hash = %#v/%q, want %#v/%q", store.gotScope, store.gotHash, scope, root)
+	}
+	if _, err := DecodeSnapshot(context.Background(), &fakeSnapshotStore{err: cas.ErrNotFound}, scope, root); !errors.Is(err, cas.ErrNotFound) {
+		t.Fatalf("DecodeSnapshot() error = %v, want wrapped not found", err)
+	}
+}
+
+func TestSchemaParityFixtures(t *testing.T) {
+	fixtureRoot := spoolSchemaFixtureRoot(t)
+	paths, err := filepath.Glob(filepath.Join(fixtureRoot, "*.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range paths {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			var fixture schemaFixture
+			decodeFixture(t, path, &fixture)
+			schemaData, err := os.ReadFile(filepath.Join(fixtureRoot, fixture.Schema))
+			if err != nil {
+				t.Fatal(err)
+			}
+			schema, err := graphcontract.DecodeSchemaTOML(schemaData)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = graphcontract.ValidateSchemaSnapshot(schema, fixture.Nodes, fixture.Edges)
+			if len(fixture.Violations) == 0 {
+				if err != nil {
+					t.Fatalf("validate %s fixture: %v", fixture.Candidate, err)
+				}
+				return
+			}
+			var validation *graphcontract.SchemaValidationError
+			if !errors.As(err, &validation) {
+				t.Fatalf("validation error = %v, want normalized schema violations", err)
+			}
+			if !reflect.DeepEqual(validation.Violations, fixture.Violations) {
+				t.Fatalf("violations = %#v, want %#v", validation.Violations, fixture.Violations)
+			}
+			snapshot := Snapshot{Version: SnapshotVersion, Schema: schema, Nodes: fixture.Nodes, Edges: fixture.Edges}
+			if err := snapshot.Validate(); !errors.Is(err, graphcontract.ErrSchemaValidation) {
+				t.Fatalf("Rack snapshot validation = %v, want canonical schema error", err)
 			}
 		})
 	}
 }
 
-func TestDecodeSnapshotJSON_ReportsSchemaAndCardinalityContext(t *testing.T) {
-	t.Parallel()
-
-	_, err := DecodeSnapshotJSON([]byte(`{
-		"version": 1,
-		"schema": {
-			"nodeLabels": [{"label": "Person", "properties": [{"name": "name", "type": "string", "required": true}]}],
-			"edgeLabels": [{"label": "MEMBER_OF", "properties": []}],
-			"cardinalities": [{"edgeLabel": "MEMBER_OF", "fromLabel": "Person", "toLabel": "Team", "min": 1}]
-		},
-		"nodes": [{"id": "user-1", "labels": ["Person"], "properties": []}],
-		"edges": []
-	}`))
-	if !errors.Is(err, ErrSchemaViolation) {
-		t.Fatalf("DecodeSnapshotJSON() error = %v, want schema violation", err)
+func TestSchemaParityRejectsInvalidSchemaFixture(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join(spoolSchemaFixtureRoot(t), "invalid-schema.toml"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), `node "user-1"`) || !strings.Contains(err.Error(), `property "name"`) {
-		t.Fatalf("schema error = %q, want node and property context", err)
-	}
-
-	_, err = DecodeSnapshotJSON([]byte(`{
-		"version": 1,
-		"schema": {
-			"nodeLabels": [
-				{"label": "Person", "properties": [{"name": "name", "type": "string", "required": true}]},
-				{"label": "Team", "properties": []}
-			],
-			"edgeLabels": [{"label": "MEMBER_OF", "properties": []}],
-			"cardinalities": [{"edgeLabel": "MEMBER_OF", "fromLabel": "Person", "toLabel": "Team", "min": 1}]
-		},
-		"nodes": [
-			{"id": "team-1", "labels": ["Team"], "properties": []},
-			{"id": "user-1", "labels": ["Person"], "properties": [{"name": "name", "type": "string", "value": "Ada"}]}
-		],
-		"edges": []
-	}`))
-	if !errors.Is(err, ErrSchemaViolation) {
-		t.Fatalf("DecodeSnapshotJSON() error = %v, want cardinality violation", err)
-	}
-	if !strings.Contains(err.Error(), `node "user-1"`) || !strings.Contains(err.Error(), "below minimum") {
-		t.Fatalf("cardinality error = %q, want node and lower-bound context", err)
+	if _, err := graphcontract.DecodeSchemaTOML(data); !errors.Is(err, graphcontract.ErrInvalidSchemaTOML) {
+		t.Fatalf("DecodeSchemaTOML() error = %v, want canonical TOML error", err)
 	}
 }
 
-func TestDecodeSnapshot_LoadsCASObjectAndPreservesCASError(t *testing.T) {
-	t.Parallel()
+type schemaFixture struct {
+	FormatVersion int                             `json:"format_version"`
+	Candidate     string                          `json:"candidate"`
+	Schema        string                          `json:"schema"`
+	Nodes         map[string]graphcontract.Node   `json:"nodes"`
+	Edges         map[string]graphcontract.Edge   `json:"edges"`
+	Violations    []graphcontract.SchemaViolation `json:"violations"`
+}
 
-	scope, err := cas.NewScope("tenant-a", "repo-a")
+func decodeFixture(t *testing.T, path string, destination any) {
+	t.Helper()
+	data, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("NewScope() error = %v", err)
+		t.Fatal(err)
 	}
-	root := strings.Repeat("a", 64)
-	data, err := MarshalSnapshotCBOR(Snapshot{
-		Version: SnapshotVersion,
-		Schema:  Schema{NodeLabels: []LabelRule{}, EdgeLabels: []LabelRule{}, Cardinalities: []CardinalityRule{}},
-		Nodes:   []Node{},
-		Edges:   []Edge{},
-	})
-	if err != nil {
-		t.Fatalf("MarshalSnapshotCBOR() error = %v", err)
+	if err := json.Unmarshal(data, destination); err != nil {
+		t.Fatal(err)
 	}
-	store := fakeSnapshotStore{data: map[string][]byte{
-		root: data,
-	}}
+}
 
-	snapshot, err := DecodeSnapshot(context.Background(), &store, scope, root)
+func spoolSchemaFixtureRoot(t *testing.T) string {
+	t.Helper()
+	command := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/autonomous-bits/spool")
+	output, err := command.Output()
 	if err != nil {
-		t.Fatalf("DecodeSnapshot() error = %v", err)
+		t.Fatalf("locate Spool module: %v", err)
 	}
-	if len(snapshot.Nodes) != 0 || len(snapshot.Edges) != 0 {
-		t.Fatalf("DecodeSnapshot() = %+v, want empty graph", snapshot)
-	}
-	if store.gotHash != root || store.gotScope != scope {
-		t.Fatalf("Get() called with hash=%q scope=%+v, want hash=%q scope=%+v", store.gotHash, store.gotScope, root, scope)
-	}
-
-	_, err = DecodeSnapshot(context.Background(), &fakeSnapshotStore{err: cas.ErrNotFound}, scope, root)
-	if !errors.Is(err, cas.ErrNotFound) {
-		t.Fatalf("DecodeSnapshot() error = %v, want wrapped cas.ErrNotFound", err)
-	}
-	_, err = DecodeSnapshot(context.Background(), &store, scope, "not-a-cas-hash")
-	if !errors.Is(err, ErrInvalidSnapshotRoot) {
-		t.Fatalf("DecodeSnapshot() invalid root error = %v, want ErrInvalidSnapshotRoot", err)
-	}
+	return filepath.Join(strings.TrimSpace(string(output)), "graphcontract", "testdata", "schema", "v1")
 }
 
 type fakeSnapshotStore struct {
@@ -198,8 +160,7 @@ type fakeSnapshotStore struct {
 }
 
 func (s *fakeSnapshotStore) Get(_ context.Context, scope cas.Scope, hash string) ([]byte, error) {
-	s.gotHash = hash
-	s.gotScope = scope
+	s.gotHash, s.gotScope = hash, scope
 	if s.err != nil {
 		return nil, s.err
 	}
