@@ -1,5 +1,7 @@
 github.com/autonomous-bits/spool v1.3.0 h1:6UQDr13PG7M8a2UfMaQ0HCuh1r3Om0H51NtJt8u52Lw=
 github.com/autonomous-bits/spool v1.3.0/go.mod h1:T1/9FhPYDh75Ku5gEYJ5zWPE5E/AIs/2me32xMCiFF4=
+github.com/autonomous-bits/spool v1.3.1-0.20260905220021-0a76e81d2988 h1:DphhSpowLMqVunhSvi/RuBEZIU6vCU+QCDbq8TQ4Fs4=
+github.com/autonomous-bits/spool v1.3.1-0.20260905220021-0a76e81d2988/go.mod h1:T1/9FhPYDh75Ku5gEYJ5zWPE5E/AIs/2me32xMCiFF4=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=

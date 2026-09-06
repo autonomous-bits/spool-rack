@@ -206,11 +206,17 @@ func (e *FinalizeEngine) Apply(ctx context.Context, tenantID, repoID string, req
 		SnapshotRoot: snapshotRoot,
 		Author:       request.Author,
 		Message:      request.Message,
+		Time:         e.now(),
 	}
-	commitIdentity, err := commitFrame.Identity()
+	commit, err := commitFrame.Commit()
+	if err != nil {
+		return ApplyResult{}, fmt.Errorf("review: build merged commit: %w", err)
+	}
+	commitID, err := serversync.CommitObjectID(commit)
 	if err != nil {
 		return ApplyResult{}, fmt.Errorf("review: frame merged commit: %w", err)
 	}
+	commitIdentity := serversync.V2CommitIdentity(string(commitID))
 	packData, err := serversync.MarshalPackFrameV2(serversync.PackFrameV2{
 		Version: serversync.PackFormatV2,
 		Base:    targetIdentity,
@@ -232,7 +238,7 @@ func (e *FinalizeEngine) Apply(ctx context.Context, tenantID, repoID string, req
 		RepoID: repoID, TargetBranch: request.TargetBranch, Subject: request.Subject, LeaseToken: request.LeaseToken,
 		SourceCommitID: preview.SourceCommit.ID, TargetCommitID: preview.TargetCommit.ID, BaseCommitID: preview.BaseCommit.ID,
 		ResultCommitID: commitIdentity.ID, SnapshotRoot: snapshotRoot, Author: request.Author, Message: request.Message, PackHash: packHash,
-		CommitFormat: serversync.CommitFormatV2, PackFormat: serversync.PackFormatV2,
+		CommitFormat: serversync.CommitFormatV2, PackFormat: serversync.PackFormatV2, CommitTime: commitFrame.Time,
 	}); err != nil {
 		return ApplyResult{}, fmt.Errorf("review: apply merge: %w", err)
 	}

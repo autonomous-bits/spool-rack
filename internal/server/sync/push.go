@@ -9,6 +9,7 @@ import (
 
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/cas"
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/postgres"
+	"github.com/autonomous-bits/spool/graphcontract"
 )
 
 // ErrNonFastForward indicates a push was rejected because advancing the remote
@@ -20,7 +21,7 @@ var ErrNonFastForward = errors.New("sync: non-fast-forward push rejected")
 // PostgreSQL-backed Store.
 type BranchStore interface {
 	SetTenantContext(ctx context.Context, tenantID string) (context.Context, error)
-	PutCommit(ctx context.Context, repoID, commitID, parentCommitID, snapshotRoot, author, message string) error
+	PutCommit(ctx context.Context, repoID string, commitID graphcontract.ObjectID, commit graphcontract.Commit) error
 	PutPackRange(ctx context.Context, repoID, packHash, baseCommitID, targetCommitID string) error
 	GetCommitMetadata(ctx context.Context, repoID, commitID string) (postgres.CommitMetadata, error)
 	GetBranchRef(ctx context.Context, repoID, branch string) (string, error)
@@ -32,7 +33,7 @@ type BranchStore interface {
 var _ BranchStore = (postgres.Store)(nil)
 
 type formattedCommitStore interface {
-	PutCommitWithFormat(context.Context, string, string, string, string, string, string, uint32) error
+	PutCommitWithFormat(context.Context, string, graphcontract.ObjectID, graphcontract.Commit, uint32) error
 }
 
 type formattedPackStore interface {
@@ -110,13 +111,13 @@ func (e *PushEngine) HandlePush(ctx context.Context, req PushRequest) error {
 		if err := validateCommitRecord(c); err != nil {
 			return err
 		}
-		if formatted, ok := e.store.(formattedCommitStore); ok && c.Identity != nil {
-			if err := formatted.PutCommitWithFormat(ctx, req.RepoID, c.ID, c.ParentID, c.SnapshotRoot, c.Author, c.Message, c.Identity.Format); err != nil {
+		if formatted, ok := e.store.(formattedCommitStore); ok {
+			if err := formatted.PutCommitWithFormat(ctx, req.RepoID, c.ID, c.Commit, CommitFormatV2); err != nil {
 				return fmt.Errorf("sync: push: register commit %s: %w", c.ID, err)
 			}
 			continue
 		}
-		if err := e.store.PutCommit(ctx, req.RepoID, c.ID, c.ParentID, c.SnapshotRoot, c.Author, c.Message); err != nil {
+		if err := e.store.PutCommit(ctx, req.RepoID, c.ID, c.Commit); err != nil {
 			return fmt.Errorf("sync: push: register commit %s: %w", c.ID, err)
 		}
 	}
@@ -230,21 +231,19 @@ func (e *PushEngine) validateV2BaseFormat(ctx context.Context, repoID string, fr
 	if err != nil {
 		return fmt.Errorf("sync: push: resolve v2 pack base %s: %w", frame.Base.ID, err)
 	}
-	if metadata.Format != frame.Base.Format {
-		return fmt.Errorf("%w: v2 pack base %s has format %d, frame declares %d", ErrInvalidFrame, frame.Base.ID, metadata.Format, frame.Base.Format)
+	if metadata.Format != CommitFormatV2 {
+		return fmt.Errorf("%w: v2 pack base %s has format %d", ErrInvalidFrame, frame.Base.ID, metadata.Format)
 	}
 	return nil
 }
 
 func validateCommitRecord(record CommitRecord) error {
-	if record.Identity == nil {
-		return nil
+	identity, err := CommitObjectID(record.Commit)
+	if err != nil {
+		return fmt.Errorf("%w: commit record: %v", ErrInvalidFrame, err)
 	}
-	if record.Identity.ID != record.ID {
+	if record.ID != identity {
 		return fmt.Errorf("%w: commit record identity does not match ID", ErrInvalidFrame)
-	}
-	if err := record.Identity.validate(); err != nil {
-		return err
 	}
 	return nil
 }
@@ -254,30 +253,17 @@ func validateV2CommitMetadata(records []CommitRecord, frames []CommitFrameV2) er
 		return fmt.Errorf("%w: v2 pack and metadata must contain the same commits", ErrInvalidFrame)
 	}
 	for i, frame := range frames {
-		identity, err := frame.Identity()
+		commit, err := frame.Commit()
+		if err != nil {
+			return err
+		}
+		identity, err := CommitObjectID(commit)
 		if err != nil {
 			return err
 		}
 		record := records[i]
-		if record.Identity == nil || record.Identity.Format != CommitFormatV2 || *record.Identity != identity ||
-			record.ID != identity.ID || record.SnapshotRoot != frame.SnapshotRoot ||
-			record.Author != frame.Author || record.Message != frame.Message {
+		if record.ID != identity || !record.Commit.Equal(commit) {
 			return fmt.Errorf("%w: commit metadata %d does not match its v2 frame", ErrInvalidFrame, i)
-		}
-		expectedParent := ""
-		if len(frame.Parents) > 0 {
-			expectedParent = frame.Parents[0].ID
-		}
-		if record.ParentID != expectedParent {
-			return fmt.Errorf("%w: commit metadata %d has the wrong first parent", ErrInvalidFrame, i)
-		}
-		if len(frame.Parents) > 1 {
-			return fmt.Errorf("%w: v2 push metadata cannot represent merge commit %d", ErrInvalidFrame, i)
-		}
-		for _, parent := range frame.Parents {
-			if parent.Format != CommitFormatV2 {
-				return fmt.Errorf("%w: native v2 commits require v2 parents", ErrInvalidFrame)
-			}
 		}
 	}
 	return nil

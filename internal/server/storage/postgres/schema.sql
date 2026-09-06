@@ -74,22 +74,25 @@ CREATE TABLE IF NOT EXISTS commits (
 	id text NOT NULL,
 	tenant_id uuid NOT NULL REFERENCES tenants(id),
 	repo_id uuid NOT NULL REFERENCES repositories(id),
-	parent_commit_id text,
 	snapshot_root text NOT NULL,
 	object_format smallint NOT NULL DEFAULT 1 CHECK (object_format IN (1, 2)),
 	author text NOT NULL,
 	message text NOT NULL,
+	commit_time timestamptz NOT NULL,
 	created_at timestamptz NOT NULL DEFAULT now(),
 	PRIMARY KEY (tenant_id, repo_id, id),
 	CONSTRAINT commits_repository_scope_fk
 		FOREIGN KEY (tenant_id, repo_id)
-		REFERENCES repositories(tenant_id, id),
-	CONSTRAINT commits_parent_scope_fk
-		FOREIGN KEY (tenant_id, repo_id, parent_commit_id)
-		REFERENCES commits(tenant_id, repo_id, id)
+		REFERENCES repositories(tenant_id, id)
 );
 
 CREATE INDEX IF NOT EXISTS commits_repo_id_idx ON commits (repo_id);
+
+-- Supersede the legacy denormalized first-parent column on databases created
+-- before the canonical graphcontract parent collection was adopted.
+ALTER TABLE commits DROP CONSTRAINT IF EXISTS commits_parent_scope_fk;
+ALTER TABLE commits DROP COLUMN IF EXISTS parent_commit_id;
+ALTER TABLE commits ADD COLUMN IF NOT EXISTS commit_time timestamptz NOT NULL DEFAULT 'epoch';
 
 -- Pack ranges connect the immutable CAS payload created by a push to the
 -- commit interval it contains. Pull traverses these ranges backwards from a
@@ -145,14 +148,13 @@ CREATE TABLE IF NOT EXISTS branches (
 CREATE UNIQUE INDEX IF NOT EXISTS branches_tenant_id_repo_id_name_key
 	ON branches (tenant_id, repo_id, name);
 
--- parent_commit_id remains the legacy first-parent representation.  The
--- normalized table records an ordered parent list so a merge commit can retain
--- both its target (position 1) and source (position 2) histories.
+-- The normalized table is the sole ordered parent representation. A canonical
+-- graphcontract.Commit permits zero or more parents.
 CREATE TABLE IF NOT EXISTS commit_parents (
 	tenant_id uuid NOT NULL REFERENCES tenants(id),
 	repo_id uuid NOT NULL REFERENCES repositories(id),
 	commit_id text NOT NULL,
-	parent_position smallint NOT NULL CHECK (parent_position BETWEEN 1 AND 2),
+	parent_position integer NOT NULL CHECK (parent_position >= 1),
 	parent_commit_id text NOT NULL,
 	CONSTRAINT commit_parents_commit_scope_fk
 		FOREIGN KEY (tenant_id, repo_id, commit_id)
@@ -167,14 +169,9 @@ CREATE TABLE IF NOT EXISTS commit_parents (
 );
 
 CREATE INDEX IF NOT EXISTS commit_parents_parent_idx ON commit_parents (repo_id, parent_commit_id);
-
--- Backfill pre-existing linear commits.  The conflict clause makes repeated
--- schema application safe and preserves any already-recorded merge parent.
-INSERT INTO commit_parents (tenant_id, repo_id, commit_id, parent_position, parent_commit_id)
-SELECT tenant_id, repo_id, id, 1, parent_commit_id
-FROM commits
-WHERE parent_commit_id IS NOT NULL
-ON CONFLICT (tenant_id, repo_id, commit_id, parent_position) DO NOTHING;
+ALTER TABLE commit_parents DROP CONSTRAINT IF EXISTS commit_parents_parent_position_check;
+ALTER TABLE commit_parents ALTER COLUMN parent_position TYPE integer;
+ALTER TABLE commit_parents ADD CONSTRAINT commit_parents_parent_position_check CHECK (parent_position >= 1);
 
 CREATE TABLE IF NOT EXISTS target_branch_merge_leases (
 	tenant_id uuid NOT NULL REFERENCES tenants(id),

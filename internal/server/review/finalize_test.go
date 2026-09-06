@@ -7,6 +7,8 @@ import (
 	"errors"
 	"io"
 	"testing"
+
+	"github.com/autonomous-bits/spool/graphcontract"
 	"time"
 
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/cas"
@@ -297,7 +299,7 @@ func (s *fakeFinalizeStore) GetPackRanges(_ context.Context, _ string, head, kno
 	}
 	return nil, errors.New("unexpected pull range")
 }
-func (s *fakeFinalizeStore) PutCommit(context.Context, string, string, string, string, string, string) error {
+func (s *fakeFinalizeStore) PutCommit(context.Context, string, graphcontract.ObjectID, graphcontract.Commit) error {
 	return errors.New("unexpected push commit")
 }
 func (s *fakeFinalizeStore) PutPackRange(context.Context, string, string, string, string) error {
