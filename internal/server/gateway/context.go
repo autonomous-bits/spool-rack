@@ -14,6 +14,7 @@ const (
 	scopeContextKey
 	credentialContextKey
 	claimsContextKey
+	correlationIDContextKey
 )
 
 // TenantIDFromContext returns the tenant identity extracted at ingress and
@@ -56,6 +57,14 @@ func RoleFromContext(ctx context.Context) (auth.Role, bool) {
 	return claims.Role, true
 }
 
+// CorrelationIDFromContext returns the correlation ID extracted from (or
+// generated for) the inbound request by the CorrelationID middleware, so
+// downstream handlers can tie audit events and error responses back to it.
+func CorrelationIDFromContext(ctx context.Context) (string, bool) {
+	correlationID, ok := ctx.Value(correlationIDContextKey).(string)
+	return correlationID, ok
+}
+
 func withTenantID(ctx context.Context, tenantID string) context.Context {
 	return context.WithValue(ctx, tenantIDContextKey, tenantID)
 }
@@ -70,4 +79,8 @@ func withCredential(ctx context.Context, cred auth.Credential) context.Context {
 
 func withClaims(ctx context.Context, claims *auth.Claims) context.Context {
 	return context.WithValue(ctx, claimsContextKey, claims)
+}
+
+func withCorrelationID(ctx context.Context, correlationID string) context.Context {
+	return context.WithValue(ctx, correlationIDContextKey, correlationID)
 }

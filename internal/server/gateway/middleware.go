@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"crypto/rand"
+	"fmt"
 	"log/slog"
 	"net/http"
 
@@ -10,6 +12,45 @@ import (
 
 // HeaderTenantID is the request header carrying the caller's tenant identifier.
 const HeaderTenantID = "X-Tenant-ID"
+
+// HeaderCorrelationID is the request/response header carrying the
+// correlation ID used to tie a Spool CLI operation to its Rack audit
+// events, per spec-cli-rack-operational-error-and-audit-contract.
+const HeaderCorrelationID = "X-Correlation-Id"
+
+// CorrelationID returns middleware that extracts the caller-supplied
+// X-Correlation-Id request header, or generates a new UUIDv4 when absent,
+// stores it in the request context (see CorrelationIDFromContext), and sets
+// it on the response header for both success and error responses. It must
+// be mounted outermost so every route — including unauthenticated ones —
+// reports a correlation ID.
+func CorrelationID() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			correlationID := r.Header.Get(HeaderCorrelationID)
+			if correlationID == "" {
+				correlationID = newCorrelationID()
+			}
+
+			w.Header().Set(HeaderCorrelationID, correlationID)
+			ctx := withCorrelationID(r.Context(), correlationID)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// newCorrelationID generates a random UUIDv4 (RFC 4122) string.
+func newCorrelationID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand.Read on the standard reader does not fail in practice;
+		// this is an intentionally inert fallback rather than a panic.
+		return "00000000-0000-4000-8000-000000000000"
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant 10
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
 
 // Authenticate returns middleware that extracts the caller's credential,
 // verifies it statelessly via verifier, and injects the resulting Claims
@@ -73,7 +114,8 @@ func RequireRepoScope(logger *slog.Logger) func(http.Handler) http.Handler {
 			repoID := r.PathValue("repo")
 			scope, err := cas.NewScope(tenantID, repoID)
 			if err != nil {
-				writeJSONError(w, r, logger, http.StatusBadRequest, ErrorCodeBadRequest, err.Error())
+				logRejection(logger, r, "rejected invalid repo scope", err)
+				writeJSONError(w, r, logger, http.StatusBadRequest, ErrorCodeBadRequest, "invalid tenant or repository identifier")
 				return
 			}
 

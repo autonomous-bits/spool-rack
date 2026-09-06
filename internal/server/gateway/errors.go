@@ -25,9 +25,10 @@ const (
 )
 
 type errorEnvelope struct {
-	Error       string `json:"error"`
-	Message     string `json:"message"`
-	CurrentHead string `json:"currentHead,omitempty"`
+	Error         string `json:"error"`
+	Message       string `json:"message"`
+	CurrentHead   string `json:"currentHead,omitempty"`
+	CorrelationID string `json:"correlationId"`
 }
 
 var defaultLogger = slog.New(slog.NewJSONHandler(os.Stderr, nil))
@@ -44,6 +45,11 @@ func writeJSONErrorEnvelope(w http.ResponseWriter, r *http.Request, logger *slog
 	if logger == nil {
 		logger = defaultLogger
 	}
+	if envelope.CorrelationID == "" {
+		if correlationID, ok := CorrelationIDFromContext(r.Context()); ok {
+			envelope.CorrelationID = correlationID
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -56,5 +62,25 @@ func writeJSONErrorEnvelope(w http.ResponseWriter, r *http.Request, logger *slog
 		"method", r.Method,
 		"path", r.URL.Path,
 		"message", envelope.Message,
+		"correlationId", envelope.CorrelationID,
+	)
+}
+
+// logRejection records the full internal detail of err server-side only,
+// for cases where the client-visible errorEnvelope message must instead be a
+// stable, sanitized string free of internal detail or cross-tenant data
+// (per spec-cli-rack-operational-error-and-audit-contract). It never writes
+// anything to the response.
+func logRejection(logger *slog.Logger, r *http.Request, action string, err error) {
+	if logger == nil {
+		logger = defaultLogger
+	}
+	correlationID, _ := CorrelationIDFromContext(r.Context())
+	logger.Warn(
+		action,
+		"method", r.Method,
+		"path", r.URL.Path,
+		"error", err,
+		"correlationId", correlationID,
 	)
 }
