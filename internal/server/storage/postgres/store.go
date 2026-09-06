@@ -57,7 +57,12 @@ var (
 	ErrMergeLeaseMismatch = errors.New("postgres: merge apply does not match lease")
 	// ErrInvalidMergeLease indicates invalid lease acquisition input.
 	ErrInvalidMergeLease = errors.New("postgres: invalid target branch merge lease")
-	errNilContext        = errors.New("postgres: nil context")
+	// ErrNativeObjectNotFound indicates the requested native pack object is
+	// not indexed for the tenant carried by ctx's repository. It is
+	// deliberately returned for both an absent object and one that exists
+	// only under a different tenant.
+	ErrNativeObjectNotFound = errors.New("postgres: native pack object not found")
+	errNilContext           = errors.New("postgres: nil context")
 
 	uuidV4Pattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 )
@@ -128,6 +133,21 @@ type Store interface {
 	// written by the caller, creates the merge commit and its two parents,
 	// advances the target ref with a compare-and-swap, and consumes its lease.
 	ApplyMerge(ctx context.Context, request ApplyMergeRequest) error
+	// PutNativePack registers a verified native Spool pack (graphcontract's
+	// binary pack container format) and the location of every object it
+	// carries, scoped to the tenant carried by ctx. Re-registering the same
+	// packID is idempotent only for identical immutable metadata; entries
+	// sharing an already-indexed object ID are left pointing at their first
+	// recorded location, since an object ID is a content hash and any two
+	// verified entries sharing one must carry identical bytes.
+	PutNativePack(ctx context.Context, repoID, packID, casPackHash, commitID string, entries []graphcontract.PackIndexEntry) error
+	// GetNativeObjectLocation resolves a verified native pack object's
+	// storage location scoped to the tenant carried by ctx, returning
+	// ErrNativeObjectNotFound when the object is not indexed for this
+	// tenant's repository — including when it exists only for a different
+	// tenant, which RLS and the repo scope keep indistinguishable from an
+	// absent object.
+	GetNativeObjectLocation(ctx context.Context, repoID, objectID string) (NativeObjectLocation, error)
 }
 
 // PackRange identifies one immutable pack and the commit interval it contains.
@@ -190,6 +210,18 @@ type ApplyMergeRequest struct {
 	CommitFormat   uint32
 	PackFormat     uint32
 	CommitTime     time.Time
+}
+
+// NativeObjectLocation identifies where one verified native pack object's
+// compressed bytes live: inside the CAS pack named by CASPackHash, at
+// [Offset, Offset+CompressedSize).
+type NativeObjectLocation struct {
+	PackID           string
+	CASPackHash      string
+	Offset           uint64
+	CompressedSize   uint64
+	UncompressedSize uint64
+	CRC32            uint32
 }
 
 // PGStore is a PostgreSQL-backed implementation of Store.
@@ -1046,6 +1078,110 @@ func (s *PGStore) CompareAndSwapBranchRef(ctx context.Context, repoID, branch, e
 	}
 
 	return nil
+}
+
+// PutNativePack registers a verified native Spool pack and the location of
+// every object it carries, scoped to the tenant carried by ctx. Callers must
+// only pass entries that have already passed graphcontract's pack, header,
+// entry-bounds, and per-object integrity verification: this method trusts
+// its input and only enforces immutability and tenant isolation.
+func (s *PGStore) PutNativePack(ctx context.Context, repoID, packID, casPackHash, commitID string, entries []graphcontract.PackIndexEntry) error {
+	tenantID, err := requireTenantID(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres: put native pack for repo %s: %w", repoID, err)
+	}
+	if packID == "" || casPackHash == "" {
+		return fmt.Errorf("postgres: put native pack for repo %s: pack ID and CAS pack hash are required", repoID)
+	}
+
+	var commit any
+	if commitID != "" {
+		commit = commitID
+	}
+
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		result, err := tx.Exec(ctx, `
+			INSERT INTO native_packs (tenant_id, repo_id, pack_id, cas_pack_hash, commit_id, object_count)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (tenant_id, repo_id, pack_id) DO NOTHING
+		`, tenantID, repoID, packID, casPackHash, commit, len(entries))
+		if err != nil {
+			return fmt.Errorf("postgres: put native pack for repo %s: insert native pack: %w", repoID, err)
+		}
+		if result.RowsAffected() == 0 {
+			var existing struct {
+				casPackHash string
+				commitID    *string
+				objectCount int
+			}
+			if err := tx.QueryRow(ctx, `
+				SELECT cas_pack_hash, commit_id, object_count
+				FROM native_packs
+				WHERE tenant_id = $1 AND repo_id = $2 AND pack_id = $3
+				FOR KEY SHARE
+			`, tenantID, repoID, packID).Scan(&existing.casPackHash, &existing.commitID, &existing.objectCount); err != nil {
+				return fmt.Errorf("postgres: put native pack for repo %s: read existing native pack: %w", repoID, err)
+			}
+			existingCommit := ""
+			if existing.commitID != nil {
+				existingCommit = *existing.commitID
+			}
+			if existing.casPackHash != casPackHash || existingCommit != commitID || existing.objectCount != len(entries) {
+				return ErrImmutableMetadataMismatch
+			}
+		}
+
+		for _, entry := range entries {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO native_pack_objects (tenant_id, repo_id, pack_id, object_id, pack_offset, compressed_size, uncompressed_size, crc32)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+				ON CONFLICT (tenant_id, repo_id, object_id) DO NOTHING
+			`, tenantID, repoID, packID, string(entry.Object), int64(entry.Offset), int64(entry.CompressedSize), int64(entry.UncompressedSize), int64(entry.CRC32)); err != nil {
+				return fmt.Errorf("postgres: put native pack for repo %s: insert native pack object %s: %w", repoID, entry.Object, err)
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+// GetNativeObjectLocation resolves a verified native pack object's storage
+// location scoped to the tenant carried by ctx and repoID. It returns
+// ErrNativeObjectNotFound when no row is visible — which RLS and the repo
+// scope make indistinguishable between an absent object and one that exists
+// only for a different tenant or repository.
+func (s *PGStore) GetNativeObjectLocation(ctx context.Context, repoID, objectID string) (NativeObjectLocation, error) {
+	if _, err := requireTenantID(ctx); err != nil {
+		return NativeObjectLocation{}, fmt.Errorf("postgres: get native object location: %w", err)
+	}
+
+	var loc NativeObjectLocation
+	var offset, compressedSize, uncompressedSize, crc32Value int64
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		err := tx.QueryRow(ctx, `
+			SELECT o.pack_id, p.cas_pack_hash, o.pack_offset, o.compressed_size, o.uncompressed_size, o.crc32
+			FROM native_pack_objects o
+			JOIN native_packs p
+				ON p.tenant_id = o.tenant_id AND p.repo_id = o.repo_id AND p.pack_id = o.pack_id
+			WHERE o.repo_id = $1 AND o.object_id = $2
+		`, repoID, objectID).Scan(&loc.PackID, &loc.CASPackHash, &offset, &compressedSize, &uncompressedSize, &crc32Value)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrNativeObjectNotFound
+			}
+			return fmt.Errorf("postgres: get native object location: query object %s: %w", objectID, err)
+		}
+		return nil
+	}); err != nil {
+		return NativeObjectLocation{}, err
+	}
+	loc.Offset = uint64(offset)
+	loc.CompressedSize = uint64(compressedSize)
+	loc.UncompressedSize = uint64(uncompressedSize)
+	loc.CRC32 = uint32(crc32Value)
+	return loc, nil
 }
 
 func (s *PGStore) withTenantTx(ctx context.Context, fn func(ctx context.Context, tx pgx.Tx) error) error {

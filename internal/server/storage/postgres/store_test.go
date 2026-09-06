@@ -709,6 +709,147 @@ func TestGetPackRanges(t *testing.T) {
 	}
 }
 
+func testNativeEntries(t *testing.T, count int) []graphcontract.PackIndexEntry {
+	t.Helper()
+
+	entries := make([]graphcontract.PackIndexEntry, count)
+	offset := uint64(12)
+	for i := range entries {
+		objectID := testCommitID(t.Name(), fmt.Sprintf("object-%d", i))
+		entries[i] = graphcontract.PackIndexEntry{
+			Object:           graphcontract.ObjectID(objectID),
+			Offset:           offset,
+			CompressedSize:   uint64(16 + i),
+			UncompressedSize: uint64(32 + i),
+			CRC32:            uint32(1000 + i),
+		}
+		offset += entries[i].CompressedSize
+	}
+	return entries
+}
+
+func TestPutNativePack_IndexesObjectsAndResolvesLocation(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-native-pack")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoID := mustCreateRepository(t, store, tenantCtx, "repo-native-pack")
+
+	entries := testNativeEntries(t, 3)
+	packID := "abcd1234abcd1234abcd1234abcd1234"
+	casPackHash := testCommitID(t.Name(), "cas-pack-hash")
+
+	if err := store.PutNativePack(tenantCtx, repoID, packID, casPackHash, "", entries); err != nil {
+		t.Fatalf("PutNativePack: %v", err)
+	}
+
+	for _, entry := range entries {
+		loc, err := store.GetNativeObjectLocation(tenantCtx, repoID, string(entry.Object))
+		if err != nil {
+			t.Fatalf("GetNativeObjectLocation(%s): %v", entry.Object, err)
+		}
+		if loc.PackID != packID || loc.CASPackHash != casPackHash ||
+			loc.Offset != entry.Offset || loc.CompressedSize != entry.CompressedSize ||
+			loc.UncompressedSize != entry.UncompressedSize || loc.CRC32 != entry.CRC32 {
+			t.Fatalf("GetNativeObjectLocation(%s) = %+v, want location matching entry %+v", entry.Object, loc, entry)
+		}
+	}
+}
+
+func TestPutNativePack_Idempotent(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-native-pack-idempotent")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoID := mustCreateRepository(t, store, tenantCtx, "repo-native-pack-idempotent")
+
+	entries := testNativeEntries(t, 2)
+	packID := "1111222233334444555566667777888"
+	casPackHash := testCommitID(t.Name(), "cas-pack-hash")
+
+	if err := store.PutNativePack(tenantCtx, repoID, packID, casPackHash, "", entries); err != nil {
+		t.Fatalf("PutNativePack first call: %v", err)
+	}
+	if err := store.PutNativePack(tenantCtx, repoID, packID, casPackHash, "", entries); err != nil {
+		t.Fatalf("PutNativePack second call (idempotent replay): %v", err)
+	}
+}
+
+func TestPutNativePack_ImmutableMetadataMismatch(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-native-pack-mismatch")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoID := mustCreateRepository(t, store, tenantCtx, "repo-native-pack-mismatch")
+
+	entries := testNativeEntries(t, 1)
+	packID := "aaaa1111aaaa1111aaaa1111aaaa1111"
+	casPackHash := testCommitID(t.Name(), "cas-pack-hash")
+
+	if err := store.PutNativePack(tenantCtx, repoID, packID, casPackHash, "", entries); err != nil {
+		t.Fatalf("PutNativePack first call: %v", err)
+	}
+
+	otherHash := testCommitID(t.Name(), "different-cas-pack-hash")
+	if err := store.PutNativePack(tenantCtx, repoID, packID, otherHash, "", entries); !errors.Is(err, ErrImmutableMetadataMismatch) {
+		t.Fatalf("PutNativePack with conflicting CAS hash: expected ErrImmutableMetadataMismatch, got %v", err)
+	}
+}
+
+func TestGetNativeObjectLocation_NotFound(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantID := mustCreateTenant(t, store, ctx, "tenant-native-object-missing")
+	tenantCtx := mustTenantContext(t, store, ctx, tenantID)
+	repoID := mustCreateRepository(t, store, tenantCtx, "repo-native-object-missing")
+
+	_, err := store.GetNativeObjectLocation(tenantCtx, repoID, testCommitID(t.Name(), "absent-object"))
+	if !errors.Is(err, ErrNativeObjectNotFound) {
+		t.Fatalf("GetNativeObjectLocation(absent): expected ErrNativeObjectNotFound, got %v", err)
+	}
+}
+
+func TestGetNativeObjectLocation_RequiresTenantContext(t *testing.T) {
+	store, _ := newTestStore(t)
+
+	_, err := store.GetNativeObjectLocation(context.Background(), "some-repo", "some-object")
+	if !errors.Is(err, ErrMissingTenantContext) {
+		t.Fatalf("GetNativeObjectLocation without tenant context: expected ErrMissingTenantContext, got %v", err)
+	}
+}
+
+func TestGetNativeObjectLocation_CrossTenantIsolation(t *testing.T) {
+	store, ctx := newTestStore(t)
+
+	tenantAID := mustCreateTenant(t, store, ctx, "tenant-native-cross-a")
+	tenantBID := mustCreateTenant(t, store, ctx, "tenant-native-cross-b")
+	tenantACtx := mustTenantContext(t, store, ctx, tenantAID)
+	tenantBCtx := mustTenantContext(t, store, ctx, tenantBID)
+
+	repoAID := mustCreateRepository(t, store, tenantACtx, "repo-native-cross-a")
+
+	entries := testNativeEntries(t, 1)
+	packID := "cccc9999cccc9999cccc9999cccc9999"
+	casPackHash := testCommitID(t.Name(), "cas-pack-hash")
+	if err := store.PutNativePack(tenantACtx, repoAID, packID, casPackHash, "", entries); err != nil {
+		t.Fatalf("PutNativePack(tenant A): %v", err)
+	}
+
+	objectID := string(entries[0].Object)
+
+	// Tenant B querying tenant A's repository ID must see the object as
+	// absent, not merely denied — cross-tenant and absent lookups are
+	// indistinguishable.
+	if _, err := store.GetNativeObjectLocation(tenantBCtx, repoAID, objectID); !errors.Is(err, ErrNativeObjectNotFound) {
+		t.Fatalf("GetNativeObjectLocation(foreign tenant, same repo ID): expected ErrNativeObjectNotFound, got %v", err)
+	}
+
+	// Sanity check: tenant A can still resolve its own object.
+	if _, err := store.GetNativeObjectLocation(tenantACtx, repoAID, objectID); err != nil {
+		t.Fatalf("GetNativeObjectLocation(owning tenant): %v", err)
+	}
+}
+
 func TestCommitIdentityIsRepositoryScopedAndImmutable(t *testing.T) {
 	store, ctx := newTestStore(t)
 
