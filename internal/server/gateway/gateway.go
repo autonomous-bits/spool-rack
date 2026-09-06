@@ -10,6 +10,7 @@ import (
 
 	"github.com/autonomous-bits/spool/graphcontract"
 
+	"github.com/autonomous-bits/spool-rack/internal/server/audit"
 	"github.com/autonomous-bits/spool-rack/internal/server/auth"
 	"github.com/autonomous-bits/spool-rack/internal/server/review"
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/cas"
@@ -27,6 +28,7 @@ type Gateway struct {
 	pullEngine    *serversync.PullEngine
 	previewEngine review.Engine
 	mergeEngine   review.Finalizer
+	auditLogger   *audit.Logger
 	mux           *http.ServeMux
 }
 
@@ -64,6 +66,12 @@ func WithMergeEngine(engine review.Finalizer) Option {
 	return func(g *Gateway) { g.mergeEngine = engine }
 }
 
+// WithAuditLogger overrides the Gateway's audit event logger (defaults to a
+// non-blocking in-memory logger when not provided; see comp-audit-event-logger).
+func WithAuditLogger(logger *audit.Logger) Option {
+	return func(g *Gateway) { g.auditLogger = logger }
+}
+
 // New constructs an initialized API Gateway. When no verifier is provided,
 // it defaults to auth.PermissiveVerifier{} for zero-config local development
 // and MVP wiring; this MUST be overridden with WithVerifier before any
@@ -77,6 +85,9 @@ func New(opts ...Option) *Gateway {
 	}
 	if g.verifier == nil {
 		g.verifier = auth.PermissiveVerifier{}
+	}
+	if g.auditLogger == nil {
+		g.auditLogger = audit.NewLogger(audit.NewInMemorySink(), g.logger)
 	}
 	if g.casDriver != nil && g.branchStore != nil {
 		g.pushEngine = serversync.NewPushEngine(g.casDriver, g.branchStore, func(data []byte) error {
@@ -99,9 +110,11 @@ func New(opts ...Option) *Gateway {
 	return g
 }
 
-// Routes returns the configured http.Handler.
+// Routes returns the configured http.Handler, wrapped with correlation ID
+// extraction/generation (see CorrelationID) so every route — including
+// unauthenticated ones — echoes or assigns X-Correlation-Id.
 func (g *Gateway) Routes() http.Handler {
-	return g.mux
+	return CorrelationID()(g.mux)
 }
 
 func (g *Gateway) registerRoutes() {
@@ -226,9 +239,18 @@ func (g *Gateway) handleMergeApply(w http.ResponseWriter, r *http.Request) {
 		LeaseToken: request.LeaseToken, Resolutions: request.Resolutions, Author: *request.Author, Message: *request.Message,
 	})
 	if err != nil {
+		event := g.newAuditEvent(r, tenantID, scope.RepoID(), *request.TargetBranch, "merge.apply", "rejected")
+		event.Detail = "merge apply rejected"
+		g.auditLogger.Emit(event)
+
 		g.writeMergeError(w, r, err)
 		return
 	}
+
+	successEvent := g.newAuditEvent(r, tenantID, scope.RepoID(), *request.TargetBranch, "merge.apply", "success")
+	successEvent.NewRef = result.HeadCommit
+	g.auditLogger.Emit(successEvent)
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(result)
@@ -272,14 +294,42 @@ func decodeSingleJSON(w http.ResponseWriter, r *http.Request, logger *slog.Logge
 	return true
 }
 
+// newAuditEvent constructs an audit.Event pre-populated with the
+// request-scoped identity, scope, and correlation metadata shared by every
+// audit emission site: the authenticated actor, tenant, repository, branch,
+// current graphcontract pack format version, and correlation ID. Callers
+// should set PreviousRef/NewRef/Detail/ContractVersion (when a more
+// specific version applies) before emitting.
+func (g *Gateway) newAuditEvent(r *http.Request, tenantID, repoID, branch, action, outcome string) audit.Event {
+	var actor string
+	if claims, ok := ClaimsFromContext(r.Context()); ok && claims != nil {
+		actor = claims.Subject
+	}
+	correlationID, _ := CorrelationIDFromContext(r.Context())
+
+	return audit.Event{
+		CorrelationID:   correlationID,
+		Actor:           actor,
+		TenantID:        tenantID,
+		RepoID:          repoID,
+		Branch:          branch,
+		Action:          action,
+		Outcome:         outcome,
+		ContractVersion: graphcontract.PackFormatVersion,
+	}
+}
+
 func (g *Gateway) writeMergeError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, postgres.ErrBranchNotFound):
 		writeJSONError(w, r, g.logger, http.StatusNotFound, ErrorCodeNotFound, "branch not found")
 	case errors.Is(err, postgres.ErrMergeLeaseHeld), errors.Is(err, postgres.ErrNonFastForward), errors.Is(err, postgres.ErrMergeLeaseMismatch):
 		writeJSONError(w, r, g.logger, http.StatusConflict, ErrorCodeConflict, "merge branch state changed or is currently leased")
-	case errors.Is(err, postgres.ErrMergeLeaseNotFound), errors.Is(err, postgres.ErrMergeLeaseOwnership), errors.Is(err, postgres.ErrMergeLeaseExpired), errors.Is(err, review.ErrInvalidMergeRequest):
-		writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, err.Error())
+	case errors.Is(err, postgres.ErrMergeLeaseNotFound), errors.Is(err, postgres.ErrMergeLeaseOwnership), errors.Is(err, postgres.ErrMergeLeaseExpired):
+		writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "merge lease is invalid, expired, or not held by this caller")
+	case errors.Is(err, review.ErrInvalidMergeRequest):
+		logRejection(g.logger, r, "rejected invalid merge request", err)
+		writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "invalid merge request")
 	default:
 		writeJSONError(w, r, g.logger, http.StatusInternalServerError, ErrorCodeInternal, "failed to finalize merge")
 	}
@@ -316,7 +366,8 @@ func (g *Gateway) handleMergePreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if errors.Is(err, review.ErrInvalidPreviewRequest) {
-		writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, err.Error())
+		logRejection(g.logger, r, "rejected invalid merge preview request", err)
+		writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "invalid merge preview request")
 		return
 	}
 	if err != nil {
@@ -353,6 +404,11 @@ func (g *Gateway) handlePull(w http.ResponseWriter, r *http.Request) {
 
 	plan, err := g.pullEngine.PreparePull(r.Context(), req)
 	if errors.Is(err, serversync.ErrUpToDate) {
+		event := g.newAuditEvent(r, tenantID, scope.RepoID(), branch, "pull", "up_to_date")
+		event.PreviousRef = knownCommit
+		event.NewRef = plan.Head
+		g.auditLogger.Emit(event)
+
 		w.Header().Set("X-Spool-Head-Commit", plan.Head)
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -361,6 +417,12 @@ func (g *Gateway) handlePull(w http.ResponseWriter, r *http.Request) {
 		w.Header().Del("Content-Encoding")
 		var divergence *serversync.PullDivergedError
 		if errors.As(err, &divergence) {
+			event := g.newAuditEvent(r, tenantID, scope.RepoID(), branch, "pull", "rejected")
+			event.PreviousRef = knownCommit
+			event.NewRef = divergence.CurrentHead
+			event.Detail = "known commit is not an ancestor of the remote branch head"
+			g.auditLogger.Emit(event)
+
 			writeJSONErrorEnvelope(w, r, g.logger, http.StatusConflict, errorEnvelope{
 				Error:       ErrorCodeConflict,
 				Message:     "known commit is not an ancestor of the remote branch head",
@@ -370,15 +432,31 @@ func (g *Gateway) handlePull(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if errors.Is(err, postgres.ErrBranchNotFound) {
+		event := g.newAuditEvent(r, tenantID, scope.RepoID(), branch, "pull", "rejected")
+		event.PreviousRef = knownCommit
+		event.Detail = "branch not found"
+		g.auditLogger.Emit(event)
+
 		writeJSONError(w, r, g.logger, http.StatusNotFound, ErrorCodeNotFound, "branch not found")
 		return
 	}
 	if err != nil {
+		logRejection(g.logger, r, "pull preparation failed", err)
+		event := g.newAuditEvent(r, tenantID, scope.RepoID(), branch, "pull", "error")
+		event.PreviousRef = knownCommit
+		g.auditLogger.Emit(event)
+
 		writeJSONError(w, r, g.logger, http.StatusInternalServerError, ErrorCodeInternal, "failed to prepare pull")
 		return
 	}
 	manifest, err := g.pullEngine.BuildPullManifest(r.Context(), plan)
 	if err != nil {
+		logRejection(g.logger, r, "pull manifest build failed", err)
+		event := g.newAuditEvent(r, tenantID, scope.RepoID(), branch, "pull", "error")
+		event.PreviousRef = knownCommit
+		event.NewRef = plan.Head
+		g.auditLogger.Emit(event)
+
 		writeJSONError(w, r, g.logger, http.StatusInternalServerError, ErrorCodeInternal, "failed to open pull pack")
 		return
 	}
@@ -387,6 +465,12 @@ func (g *Gateway) handlePull(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Encoding", "zstd")
 	w.Header().Set("X-Spool-Pull-Format", "2")
 	w.Header().Set("X-Spool-Head-Commit", plan.Head)
+
+	successEvent := g.newAuditEvent(r, tenantID, scope.RepoID(), branch, "pull", "success")
+	successEvent.PreviousRef = knownCommit
+	successEvent.NewRef = plan.Head
+	g.auditLogger.Emit(successEvent)
+
 	if err := g.pullEngine.StreamPullWithManifest(r.Context(), plan, manifest, w); err != nil {
 		logger := g.logger
 		if logger == nil {
@@ -535,6 +619,13 @@ func (g *Gateway) handlePush(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				var nffErr *serversync.NonFastForwardError
 				if errors.As(err, &nffErr) {
+					event := g.newAuditEvent(r, tenantID, scope.RepoID(), meta.Branch, "push", "rejected")
+					event.PreviousRef = meta.BaseCommit
+					event.NewRef = nffErr.ActualHead
+					event.ContractVersion = meta.PackFormat
+					event.Detail = "non-fast-forward push"
+					g.auditLogger.Emit(event)
+
 					writeJSONErrorEnvelope(w, r, g.logger, http.StatusConflict, errorEnvelope{
 						Error:       ErrorCodeConflict,
 						Message:     nffErr.Guidance,
@@ -543,9 +634,27 @@ func (g *Gateway) handlePush(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 
-				writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, err.Error())
+				logRejection(g.logger, r, "rejected invalid push", err)
+				event := g.newAuditEvent(r, tenantID, scope.RepoID(), meta.Branch, "push", "rejected")
+				event.PreviousRef = meta.BaseCommit
+				event.NewRef = meta.TargetCommit
+				event.ContractVersion = meta.PackFormat
+				event.Detail = "invalid push pack or metadata"
+				g.auditLogger.Emit(event)
+
+				if errors.Is(err, serversync.ErrInvalidFrame) || errors.Is(err, serversync.ErrInvalidCanonicalFrame) {
+					writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "invalid or malformed push pack")
+					return
+				}
+				writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "push request could not be processed")
 				return
 			}
+
+			verifiedEvent := g.newAuditEvent(r, tenantID, scope.RepoID(), meta.Branch, "push", "verified")
+			verifiedEvent.PreviousRef = meta.BaseCommit
+			verifiedEvent.NewRef = meta.TargetCommit
+			verifiedEvent.ContractVersion = meta.PackFormat
+			g.auditLogger.Emit(verifiedEvent)
 
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
