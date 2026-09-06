@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS commits (
 	tenant_id uuid NOT NULL REFERENCES tenants(id),
 	repo_id uuid NOT NULL REFERENCES repositories(id),
 	snapshot_root text NOT NULL,
-	object_format smallint NOT NULL DEFAULT 1 CHECK (object_format IN (1, 2)),
+	object_format smallint NOT NULL DEFAULT 1 CHECK (object_format IN (1, 2, 3)),
 	author text NOT NULL,
 	message text NOT NULL,
 	commit_time timestamptz NOT NULL,
@@ -85,6 +85,13 @@ CREATE TABLE IF NOT EXISTS commits (
 		FOREIGN KEY (tenant_id, repo_id)
 		REFERENCES repositories(tenant_id, id)
 );
+
+-- object_format 3 identifies a commit registered from a verified native
+-- Spool pack (internal/server/nativepush), distinct from the legacy opaque
+-- format (1) and Rack's own v2 CBOR pack framing (2). Widen the constraint on
+-- databases created before native pushes were supported.
+ALTER TABLE commits DROP CONSTRAINT IF EXISTS commits_object_format_check;
+ALTER TABLE commits ADD CONSTRAINT commits_object_format_check CHECK (object_format IN (1, 2, 3));
 
 CREATE INDEX IF NOT EXISTS commits_repo_id_idx ON commits (repo_id);
 

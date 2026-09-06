@@ -1190,7 +1190,7 @@ func (s *PGStore) withTenantTx(ctx context.Context, fn func(ctx context.Context,
 }
 
 func validObjectFormat(format uint32) bool {
-	return format == 0 || format == 1 || format == 2
+	return format == 0 || format == 1 || format == 2 || format == 3
 }
 
 func normalizeObjectFormat(format uint32) uint32 {
