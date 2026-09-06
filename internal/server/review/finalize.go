@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"time"
 
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/cas"
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/postgres"
 	serversync "github.com/autonomous-bits/spool-rack/internal/server/sync"
+	"github.com/autonomous-bits/spool/graphcontract"
 )
 
 const defaultMergeLeaseDuration = 5 * time.Minute
@@ -365,7 +367,7 @@ func conflictByToken(preview *MergePreview, token string) ConflictToken {
 
 func applyResolution(merged *Snapshot, source, target Snapshot, conflict ConflictToken, resolution Resolution) error {
 	if conflict.Type == ConflictSchema {
-		var value Schema
+		var value graphcontract.SchemaSnapshot
 		switch resolution.Choice {
 		case "source":
 			value = source.Schema
@@ -402,14 +404,11 @@ func applyResolution(merged *Snapshot, source, target Snapshot, conflict Conflic
 	return nil
 }
 
-func resolutionProperty(source, target Snapshot, conflict ConflictToken, resolution Resolution) (Property, bool, error) {
+func resolutionProperty(source, target Snapshot, conflict ConflictToken, resolution Resolution) (graphcontract.PropertyValue, bool, error) {
 	if resolution.Choice == "manual" {
-		var value Property
+		var value graphcontract.PropertyValue
 		if err := decodeManual(resolution.Value, &value); err != nil {
-			return Property{}, false, err
-		}
-		if value.Name != conflict.Property {
-			return Property{}, false, fmt.Errorf("%w: manual property name does not match conflict", ErrInvalidMergeRequest)
+			return graphcontract.PropertyValue{}, false, err
 		}
 		return value, true, nil
 	}
@@ -419,9 +418,9 @@ func resolutionProperty(source, target Snapshot, conflict ConflictToken, resolut
 	}
 	properties, ok := propertiesFor(snapshot, conflict.Element, conflict.ElementID)
 	if !ok {
-		return Property{}, false, nil
+		return graphcontract.PropertyValue{}, false, nil
 	}
-	value, ok := propertiesByName(properties)[conflict.Property]
+	value, ok := properties[conflict.Property]
 	return value, ok, nil
 }
 
@@ -443,12 +442,8 @@ func resolutionNode(source, target Snapshot, id string, resolution Resolution) (
 	if resolution.Choice == "target" {
 		snapshot = target
 	}
-	for _, node := range snapshot.Nodes {
-		if node.ID == id {
-			return node, true, nil
-		}
-	}
-	return Node{}, false, nil
+	value, exists := snapshot.Nodes[id]
+	return value, exists, nil
 }
 
 func resolutionEdge(source, target Snapshot, id string, resolution Resolution) (Edge, bool, error) {
@@ -469,12 +464,8 @@ func resolutionEdge(source, target Snapshot, id string, resolution Resolution) (
 	if resolution.Choice == "target" {
 		snapshot = target
 	}
-	for _, edge := range snapshot.Edges {
-		if edge.ID == id {
-			return edge, true, nil
-		}
-	}
-	return Edge{}, false, nil
+	value, exists := snapshot.Edges[id]
+	return value, exists, nil
 }
 
 func decodeManual(data json.RawMessage, destination any) error {
@@ -483,115 +474,80 @@ func decodeManual(data json.RawMessage, destination any) error {
 	if err := decoder.Decode(destination); err != nil {
 		return fmt.Errorf("%w: invalid manual value: %v", ErrInvalidMergeRequest, err)
 	}
-	if err := ensureEOF(decoder); err != nil {
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return fmt.Errorf("%w: invalid manual value: multiple JSON values are not allowed", ErrInvalidMergeRequest)
+		}
 		return fmt.Errorf("%w: invalid manual value: %v", ErrInvalidMergeRequest, err)
 	}
 	return nil
 }
 
-func propertiesFor(snapshot Snapshot, kind ElementKind, id string) ([]Property, bool) {
+func propertiesFor(snapshot Snapshot, kind ElementKind, id string) (map[string]graphcontract.PropertyValue, bool) {
 	if kind == ElementNode {
-		for _, node := range snapshot.Nodes {
-			if node.ID == id {
-				return node.Properties, true
-			}
-		}
-		return nil, false
+		node, exists := snapshot.Nodes[id]
+		return node.Properties, exists
 	}
-	for _, edge := range snapshot.Edges {
-		if edge.ID == id {
-			return edge.Properties, true
-		}
-	}
-	return nil, false
+	edge, exists := snapshot.Edges[id]
+	return edge.Properties, exists
 }
 
-func setProperty(snapshot *Snapshot, kind ElementKind, id, name string, value Property, exists bool) error {
+func setProperty(snapshot *Snapshot, kind ElementKind, id, name string, value graphcontract.PropertyValue, exists bool) error {
 	if kind == ElementNode {
-		for i := range snapshot.Nodes {
-			if snapshot.Nodes[i].ID == id {
-				snapshot.Nodes[i].Properties = replaceProperty(snapshot.Nodes[i].Properties, name, value, exists)
-				return nil
-			}
+		node, found := snapshot.Nodes[id]
+		if found {
+			node.Properties = replaceProperty(node.Properties, name, value, exists)
+			snapshot.Nodes[id] = node
+			return nil
 		}
 	} else {
-		for i := range snapshot.Edges {
-			if snapshot.Edges[i].ID == id {
-				snapshot.Edges[i].Properties = replaceProperty(snapshot.Edges[i].Properties, name, value, exists)
-				return nil
-			}
+		edge, found := snapshot.Edges[id]
+		if found {
+			edge.Properties = replaceProperty(edge.Properties, name, value, exists)
+			snapshot.Edges[id] = edge
+			return nil
 		}
 	}
 	return fmt.Errorf("%w: conflicted element %q no longer exists", ErrInvalidMergeRequest, id)
 }
 
-func replaceProperty(properties []Property, name string, value Property, exists bool) []Property {
-	result := make([]Property, 0, len(properties)+1)
-	replaced := false
-	for _, property := range properties {
-		if property.Name != name {
-			result = append(result, property)
-			continue
-		}
-		replaced = true
-		if exists {
-			result = append(result, value)
-		}
+func replaceProperty(properties map[string]graphcontract.PropertyValue, name string, value graphcontract.PropertyValue, exists bool) map[string]graphcontract.PropertyValue {
+	result := make(map[string]graphcontract.PropertyValue, len(properties)+1)
+	for key, property := range properties {
+		result[key] = property
 	}
-	if exists && !replaced {
-		result = append(result, value)
+	if exists {
+		result[name] = value
+	} else {
+		delete(result, name)
 	}
-	sortProperties(result)
 	return result
 }
 
-func setNode(nodes []Node, id string, value Node, exists bool) []Node {
-	result := make([]Node, 0, len(nodes)+1)
-	replaced := false
-	for _, node := range nodes {
-		if node.ID != id {
-			result = append(result, node)
-			continue
-		}
-		replaced = true
-		if exists {
-			result = append(result, value)
-		}
+func setNode(nodes map[string]Node, id string, value Node, exists bool) map[string]Node {
+	result := make(map[string]Node, len(nodes)+1)
+	for key, node := range nodes {
+		result[key] = node
 	}
-	if exists && !replaced {
-		result = append(result, value)
+	if exists {
+		result[id] = value
+	} else if !exists {
+		delete(result, id)
 	}
-	sortNodes(result)
 	return result
 }
 
-func setEdge(edges []Edge, id string, value Edge, exists bool) []Edge {
-	result := make([]Edge, 0, len(edges)+1)
-	replaced := false
-	for _, edge := range edges {
-		if edge.ID == id {
-			replaced = true
-			if exists {
-				result = append(result, value)
-			}
-			continue
-		}
-		result = append(result, edge)
+func setEdge(edges map[string]Edge, id string, value Edge, exists bool) map[string]Edge {
+	result := make(map[string]Edge, len(edges)+1)
+	for key, edge := range edges {
+		result[key] = edge
 	}
-	if exists && !replaced {
-		result = append(result, value)
+	if exists {
+		result[id] = value
+	} else {
+		delete(result, id)
 	}
-	sortEdges(result)
 	return result
-}
-
-func sortProperties(values []Property) {
-	sort.Slice(values, func(i, j int) bool { return values[i].Name < values[j].Name })
-}
-func sortNodes(values []Node) {
-	sort.Slice(values, func(i, j int) bool { return values[i].ID < values[j].ID })
-}
-func sortEdges(values []Edge) {
-	sort.Slice(values, func(i, j int) bool { return values[i].ID < values[j].ID })
 }
 func hashBytes(data []byte) string { return serversync.ContentID(data) }
