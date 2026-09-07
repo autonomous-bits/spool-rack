@@ -35,6 +35,12 @@ const (
 	// the target branch is the repository's default branch, per
 	// req-remote-branch-lifecycle-and-safe-deletion.
 	ErrorCodeBranchProtected = "branch_protected"
+	// ErrorCodeUnsupportedContractVersion identifies a request rejected
+	// because the client declared a graphcontract wire-format version
+	// outside the range this server currently accepts (see
+	// spec-cli-rack-contract-and-metadata-migrations); GET /healthz
+	// advertises the accepted range.
+	ErrorCodeUnsupportedContractVersion = "unsupported_contract_version"
 )
 
 type errorEnvelope struct {

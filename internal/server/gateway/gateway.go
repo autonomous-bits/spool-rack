@@ -3,10 +3,12 @@ package gateway
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"regexp"
+	"strconv"
 
 	"github.com/autonomous-bits/spool/graphcontract"
 
@@ -32,6 +34,10 @@ type Gateway struct {
 	mux           *http.ServeMux
 
 	branchLifecycleStore BranchLifecycleStore
+
+	packFormatWindow         VersionWindow
+	packIndexFormatWindow    VersionWindow
+	packManifestFormatWindow VersionWindow
 }
 
 // Option configures a Gateway during construction.
@@ -101,11 +107,21 @@ func New(opts ...Option) *Gateway {
 	if g.auditLogger == nil {
 		g.auditLogger = audit.NewLogger(audit.NewInMemorySink(), g.logger)
 	}
+	if g.packFormatWindow == (VersionWindow{}) {
+		g.packFormatWindow = defaultPackFormatWindow()
+	}
+	if g.packIndexFormatWindow == (VersionWindow{}) {
+		g.packIndexFormatWindow = defaultPackIndexFormatWindow()
+	}
+	if g.packManifestFormatWindow == (VersionWindow{}) {
+		g.packManifestFormatWindow = defaultPackManifestFormatWindow()
+	}
 	if g.casDriver != nil && g.branchStore != nil {
 		g.pushEngine = serversync.NewPushEngine(g.casDriver, g.branchStore, func(data []byte) error {
 			_, err := review.DecodeSnapshotCBOR(data)
 			return err
 		})
+		g.pushEngine.SetMinPackFormatVersion(g.packFormatWindow.Min)
 		g.pullEngine = serversync.NewPullEngine(g.casDriver, g.branchStore)
 		if g.previewEngine == nil {
 			if metadataStore, ok := g.branchStore.(review.MetadataStore); ok {
@@ -438,6 +454,19 @@ func (g *Gateway) handlePull(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// packFormat is optional: an omitted value preserves today's behavior for
+	// clients that predate version negotiation. When present, it must be
+	// within the accepted pack format window advertised by GET /healthz (see
+	// spec-cli-rack-contract-and-metadata-migrations).
+	if rawPackFormat := r.URL.Query().Get("packFormat"); rawPackFormat != "" {
+		packFormat, err := strconv.ParseUint(rawPackFormat, 10, 32)
+		if err != nil || !g.packFormatWindow.Accepts(uint32(packFormat)) {
+			writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeUnsupportedContractVersion,
+				fmt.Sprintf("pack format %q is outside the versions this server currently accepts [%d,%d]", rawPackFormat, g.packFormatWindow.Min, g.packFormatWindow.Max))
+			return
+		}
+	}
+
 	tenantID, _ := TenantIDFromContext(r.Context())
 	scope, _ := ScopeFromContext(r.Context())
 	req := serversync.PullRequest{
@@ -527,11 +556,21 @@ func (g *Gateway) handlePull(w http.ResponseWriter, r *http.Request) {
 
 // healthzGraphContract reports the graphcontract pack format versions this
 // server understands, so clients (e.g. the Spool CLI) can negotiate
-// compatibility before push/pull.
+// compatibility before push/pull. The Min/Max fields advertise the accepted
+// version range for a rolling deploy (see
+// spec-cli-rack-contract-and-metadata-migrations); the plain *Version fields
+// are kept for existing clients that only compare against the current
+// version.
 type healthzGraphContract struct {
-	PackFormatVersion         uint32 `json:"packFormatVersion"`
-	PackIndexFormatVersion    uint32 `json:"packIndexFormatVersion"`
-	PackManifestFormatVersion uint32 `json:"packManifestFormatVersion"`
+	PackFormatVersion            uint32 `json:"packFormatVersion"`
+	PackFormatMinVersion         uint32 `json:"packFormatMinVersion"`
+	PackFormatMaxVersion         uint32 `json:"packFormatMaxVersion"`
+	PackIndexFormatVersion       uint32 `json:"packIndexFormatVersion"`
+	PackIndexFormatMinVersion    uint32 `json:"packIndexFormatMinVersion"`
+	PackIndexFormatMaxVersion    uint32 `json:"packIndexFormatMaxVersion"`
+	PackManifestFormatVersion    uint32 `json:"packManifestFormatVersion"`
+	PackManifestFormatMinVersion uint32 `json:"packManifestFormatMinVersion"`
+	PackManifestFormatMaxVersion uint32 `json:"packManifestFormatMaxVersion"`
 }
 
 type healthzResponse struct {
@@ -545,9 +584,15 @@ func (g *Gateway) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(healthzResponse{
 		Status: "healthy",
 		GraphContract: healthzGraphContract{
-			PackFormatVersion:         graphcontract.PackFormatVersion,
-			PackIndexFormatVersion:    graphcontract.PackIndexFormatVersion,
-			PackManifestFormatVersion: graphcontract.PackManifestFormatVersion,
+			PackFormatVersion:            graphcontract.PackFormatVersion,
+			PackFormatMinVersion:         g.packFormatWindow.Min,
+			PackFormatMaxVersion:         g.packFormatWindow.Max,
+			PackIndexFormatVersion:       graphcontract.PackIndexFormatVersion,
+			PackIndexFormatMinVersion:    g.packIndexFormatWindow.Min,
+			PackIndexFormatMaxVersion:    g.packIndexFormatWindow.Max,
+			PackManifestFormatVersion:    graphcontract.PackManifestFormatVersion,
+			PackManifestFormatMinVersion: g.packManifestFormatWindow.Min,
+			PackManifestFormatMaxVersion: g.packManifestFormatWindow.Max,
 		},
 	})
 }
@@ -680,13 +725,21 @@ func (g *Gateway) handlePush(w http.ResponseWriter, r *http.Request) {
 				}
 
 				logRejection(g.logger, r, "rejected invalid push", err)
+				detail := "invalid push pack or metadata"
+				if errors.Is(err, serversync.ErrUnsupportedContractVersion) {
+					detail = "unsupported contract version"
+				}
 				event := g.newAuditEvent(r, tenantID, scope.RepoID(), meta.Branch, "push", "rejected")
 				event.PreviousRef = meta.BaseCommit
 				event.NewRef = meta.TargetCommit
 				event.ContractVersion = meta.PackFormat
-				event.Detail = "invalid push pack or metadata"
+				event.Detail = detail
 				g.auditLogger.Emit(event)
 
+				if errors.Is(err, serversync.ErrUnsupportedContractVersion) {
+					writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeUnsupportedContractVersion, err.Error())
+					return
+				}
 				if errors.Is(err, serversync.ErrInvalidFrame) || errors.Is(err, serversync.ErrInvalidCanonicalFrame) {
 					writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "invalid or malformed push pack")
 					return

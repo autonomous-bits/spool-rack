@@ -29,8 +29,8 @@ func TestPushEngineHandlePushRejectsLegacyPack(t *testing.T) {
 		BaseCommit: baseCommit, TargetCommit: targetCommit, PackHash: hashString("legacy pack"),
 		PackFormat: 1, PackStream: bytes.NewReader([]byte("legacy pack")),
 	})
-	if !errors.Is(err, ErrInvalidFrame) {
-		t.Fatalf("HandlePush(legacy) error = %v, want v2 requirement", err)
+	if !errors.Is(err, ErrUnsupportedContractVersion) {
+		t.Fatalf("HandlePush(legacy) error = %v, want unsupported contract version", err)
 	}
 	if len(store.putCommitCalls) != 0 || store.getBranchRefCalls != 0 || store.compareAndSwapCalls != 0 {
 		t.Fatalf("legacy push mutated metadata: commits=%d reads=%d updates=%d", len(store.putCommitCalls), store.getBranchRefCalls, store.compareAndSwapCalls)

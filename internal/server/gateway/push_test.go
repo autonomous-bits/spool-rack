@@ -61,7 +61,7 @@ func TestPushRejectsLegacyPack(t *testing.T) {
 	gw.Routes().ServeHTTP(rec, req)
 
 	assertStatus(t, rec, http.StatusBadRequest)
-	assertErrorCode(t, rec, ErrorCodeBadRequest)
+	assertErrorCode(t, rec, ErrorCodeUnsupportedContractVersion)
 	if len(store.putCommitCalls) != 0 || store.compareAndSwapCalls != 0 {
 		t.Fatalf("legacy push mutated metadata: commits=%d updates=%d", len(store.putCommitCalls), store.compareAndSwapCalls)
 	}
