@@ -202,6 +202,25 @@ Example response:
 
 ---
 
+## Cloning a Workspace (`spl clone`)
+
+To clone an existing workspace hosted on Spool Rack to a new local directory:
+
+```bash
+# Clone by URL
+spl clone http://127.0.0.1:8080/api/v1/workspaces/00000000-0000-4000-8000-000000000002
+
+# Or clone by parameters
+spl clone \
+  --endpoint http://127.0.0.1:8080 \
+  --tenant-id 00000000-0000-4000-8000-000000000001 \
+  --workspace-id 00000000-0000-4000-8000-000000000002
+```
+
+This initializes the local repository, configures the remote, downloads the complete graph history for the default branch, and switches to it so you can immediately begin creating, pulling, and pushing ideas.
+
+---
+
 ## Working with Remote Branches
 
 ### List Remote Branches
