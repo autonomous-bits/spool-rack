@@ -216,6 +216,13 @@ func (g *Gateway) registerRoutes() {
 			),
 		),
 	)
+	g.mux.Handle("GET /api/v1/repos/{repo}/clone",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleViewer)(http.HandlerFunc(g.handleClone)),
+			),
+		),
+	)
 	g.mux.Handle("POST /api/v1/repos/{repo}/merge/preview",
 		Authenticate(g.logger, g.verifier)(
 			RequireRepoScope(g.logger)(
@@ -286,6 +293,13 @@ func (g *Gateway) registerRoutes() {
 		Authenticate(g.logger, g.verifier)(
 			RequireRepoScope(g.logger)(
 				RequireRole(g.logger, auth.RoleViewer)(http.HandlerFunc(g.handlePull)),
+			),
+		),
+	)
+	g.mux.Handle("GET /api/v1/workspaces/{workspace}/clone",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleViewer)(http.HandlerFunc(g.handleClone)),
 			),
 		),
 	)
@@ -672,6 +686,117 @@ func (g *Gateway) handlePull(w http.ResponseWriter, r *http.Request) {
 			logger = defaultLogger
 		}
 		logger.Error("pull stream failed", "path", r.URL.Path, "error", err)
+	}
+}
+
+func (g *Gateway) handleClone(w http.ResponseWriter, r *http.Request) {
+	if g.pullEngine == nil {
+		writeJSONError(w, r, g.logger, http.StatusNotImplemented, ErrorCodeNotImplemented, "clone is not configured on this server")
+		return
+	}
+
+	// packFormat is optional: an omitted value preserves today's behavior for
+	// clients that predate version negotiation. When present, it must be
+	// within the accepted pack format window advertised by GET /healthz.
+	if rawPackFormat := r.URL.Query().Get("packFormat"); rawPackFormat != "" {
+		packFormat, err := strconv.ParseUint(rawPackFormat, 10, 32)
+		if err != nil || !g.packFormatWindow.Accepts(uint32(packFormat)) {
+			writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeUnsupportedContractVersion,
+				fmt.Sprintf("pack format %q is outside the versions this server currently accepts [%d,%d]", rawPackFormat, g.packFormatWindow.Min, g.packFormatWindow.Max))
+			return
+		}
+	}
+
+	tenantID, _ := TenantIDFromContext(r.Context())
+	scope, _ := ScopeFromContext(r.Context())
+
+	branch := r.URL.Query().Get("branch")
+	defaultBranchName := ""
+
+	if g.branchLifecycleStore != nil {
+		ctx, err := g.branchLifecycleStore.SetTenantContext(r.Context(), tenantID)
+		if err == nil {
+			defaultRef, defErr := g.branchLifecycleStore.GetDefaultBranch(ctx, scope.RepoID())
+			if defErr == nil {
+				defaultBranchName = defaultRef.Name
+			} else if errors.Is(defErr, postgres.ErrDefaultBranchNotSet) && branch == "" {
+				// Empty workspace with no branches yet
+				event := g.newAuditEvent(r, tenantID, scope.RepoID(), "main", "clone", "empty")
+				g.auditLogger.Emit(event)
+
+				w.Header().Set("X-Spool-Empty", "true")
+				w.Header().Set("X-Spool-Default-Branch", "main")
+				w.Header().Set("X-Spool-Branch", "main")
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+		}
+	}
+
+	if branch == "" {
+		if defaultBranchName != "" {
+			branch = defaultBranchName
+		} else {
+			branch = "main"
+		}
+	}
+	if defaultBranchName == "" {
+		defaultBranchName = branch
+	}
+
+	req := serversync.PullRequest{
+		TenantID:    tenantID,
+		RepoID:      scope.RepoID(),
+		Branch:      branch,
+		KnownCommit: "", // clone always fetches complete history from root
+	}
+
+	plan, err := g.pullEngine.PreparePull(r.Context(), req)
+	if errors.Is(err, postgres.ErrBranchNotFound) {
+		event := g.newAuditEvent(r, tenantID, scope.RepoID(), branch, "clone", "rejected")
+		event.Detail = "branch not found"
+		g.auditLogger.Emit(event)
+
+		writeJSONError(w, r, g.logger, http.StatusNotFound, ErrorCodeNotFound, "branch not found")
+		return
+	}
+	if err != nil {
+		logRejection(g.logger, r, "clone preparation failed", err)
+		event := g.newAuditEvent(r, tenantID, scope.RepoID(), branch, "clone", "error")
+		g.auditLogger.Emit(event)
+
+		writeJSONError(w, r, g.logger, http.StatusInternalServerError, ErrorCodeInternal, "failed to prepare clone")
+		return
+	}
+
+	manifest, err := g.pullEngine.BuildPullManifest(r.Context(), plan)
+	if err != nil {
+		logRejection(g.logger, r, "clone manifest build failed", err)
+		event := g.newAuditEvent(r, tenantID, scope.RepoID(), branch, "clone", "error")
+		event.NewRef = plan.Head
+		g.auditLogger.Emit(event)
+
+		writeJSONError(w, r, g.logger, http.StatusInternalServerError, ErrorCodeInternal, "failed to open clone pack")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/vnd.spool-rack.pull-envelope")
+	w.Header().Set("Content-Encoding", "zstd")
+	w.Header().Set("X-Spool-Pull-Format", "2")
+	w.Header().Set("X-Spool-Head-Commit", plan.Head)
+	w.Header().Set("X-Spool-Branch", branch)
+	w.Header().Set("X-Spool-Default-Branch", defaultBranchName)
+
+	successEvent := g.newAuditEvent(r, tenantID, scope.RepoID(), branch, "clone", "success")
+	successEvent.NewRef = plan.Head
+	g.auditLogger.Emit(successEvent)
+
+	if err := g.pullEngine.StreamPullWithManifest(r.Context(), plan, manifest, w); err != nil {
+		logger := g.logger
+		if logger == nil {
+			logger = defaultLogger
+		}
+		logger.Error("clone stream failed", "path", r.URL.Path, "error", err)
 	}
 }
 
