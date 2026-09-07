@@ -1,0 +1,12 @@
+.git
+.github
+.spl
+bin
+dist
+coverage.out
+*.test
+tmp
+scratch
+.env
+.env.local
+.DS_Store

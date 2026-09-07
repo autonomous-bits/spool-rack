@@ -1,0 +1,5 @@
+Spool Rack is available inside the cluster at:
+  http://{{ include "spool-rack.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+
+To enable Postgres-backed push and pull operations, configure postgres.dsnSecret.name
+with a Secret containing the configured POSTGRES_DSN key.
