@@ -46,6 +46,10 @@ type formattedPackStore interface {
 	PutPackRangeWithFormat(context.Context, string, string, string, string, uint32) error
 }
 
+type branchCreator interface {
+	CreateBranch(context.Context, string, string, string) error
+}
+
 // NonFastForwardError carries branch-head context and caller guidance for
 // rejected non-fast-forward pushes.
 type NonFastForwardError struct {
@@ -124,7 +128,7 @@ func (e *PushEngine) HandlePush(ctx context.Context, req PushRequest) error {
 	if err != nil {
 		return fmt.Errorf("sync: push: write pack: %w", err)
 	}
-	if frame != nil {
+	if frame != nil && req.BaseCommit != "" {
 		if err := e.validateV2BaseFormat(ctx, req.RepoID, *frame); err != nil {
 			return err
 		}
@@ -154,14 +158,36 @@ func (e *PushEngine) HandlePush(ctx context.Context, req PushRequest) error {
 
 	actualHead, err := e.store.GetBranchRef(ctx, req.RepoID, req.Branch)
 	if err != nil {
+		if errors.Is(err, postgres.ErrBranchNotFound) && req.BaseCommit == "" {
+			if creator, ok := e.store.(branchCreator); ok {
+				if err := creator.CreateBranch(ctx, req.RepoID, req.Branch, req.TargetCommit); err != nil {
+					return fmt.Errorf("sync: push: create branch: %w", err)
+				}
+				return nil
+			}
+			return fmt.Errorf("sync: push: branch creation not supported by store")
+		}
 		return fmt.Errorf("sync: push: get branch ref: %w", err)
 	}
 
+	expectedCommit := req.BaseCommit
 	if actualHead != req.BaseCommit {
-		return e.diagnoseNonFastForward(ctx, req, actualHead)
+		if req.BaseCommit == "" {
+			if actualHead == req.TargetCommit {
+				return nil
+			}
+			isAncestor, err := e.store.IsAncestor(ctx, req.RepoID, actualHead, req.TargetCommit)
+			if err == nil && isAncestor {
+				expectedCommit = actualHead
+			} else {
+				return e.diagnoseNonFastForward(ctx, req, actualHead)
+			}
+		} else {
+			return e.diagnoseNonFastForward(ctx, req, actualHead)
+		}
 	}
 
-	if err := e.store.CompareAndSwapBranchRef(ctx, req.RepoID, req.Branch, req.BaseCommit, req.TargetCommit); err != nil {
+	if err := e.store.CompareAndSwapBranchRef(ctx, req.RepoID, req.Branch, expectedCommit, req.TargetCommit); err != nil {
 		if errors.Is(err, postgres.ErrNonFastForward) {
 			return &NonFastForwardError{
 				ActualHead: actualHead,
@@ -181,8 +207,6 @@ func validatePushRequest(req PushRequest, minPackFormatVersion uint32) error {
 		return fmt.Errorf("sync: push: branch is required")
 	case req.TargetCommit == "":
 		return fmt.Errorf("sync: push: target commit is required")
-	case req.BaseCommit == "":
-		return fmt.Errorf("sync: push: base commit is required")
 	case req.PackHash == "":
 		return fmt.Errorf("sync: push: pack hash is required")
 	case packFormat < minPackFormatVersion || packFormat > PackFormatV2:

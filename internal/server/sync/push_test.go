@@ -61,6 +61,70 @@ func TestPushEngineDefaultsOmittedFormatToCanonicalV2(t *testing.T) {
 	}
 }
 
+func TestPushEngineEmptyBaseCommitFastForwardsIfActualHeadIsAncestor(t *testing.T) {
+	t.Parallel()
+
+	driver, err := cas.NewLocalDriver(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootObject := []byte("root snapshot object")
+	rootCommit := CommitFrameV2{
+		Version:      CommitFormatV2,
+		Parents:      nil,
+		SnapshotRoot: ContentID(rootObject),
+		Author:       "Ada",
+		Message:      "root commit",
+	}
+	rootIdentity, err := rootCommit.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	childObject := []byte("child snapshot object")
+	childCommit := CommitFrameV2{
+		Version:      CommitFormatV2,
+		Parents:      []CommitIdentity{rootIdentity},
+		SnapshotRoot: ContentID(childObject),
+		Author:       "Ada",
+		Message:      "child commit",
+	}
+	target, err := childCommit.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	packData, err := MarshalPackFrameV2(PackFrameV2{
+		Version: PackFormatV2,
+		Base:    CommitIdentity{},
+		Target:  target,
+		Commits: []CommitFrameV2{rootCommit, childCommit},
+		Objects: []PackObjectV2{
+			{ID: ContentID(rootObject), Data: rootObject},
+			{ID: ContentID(childObject), Data: childObject},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeBranchStore{
+		branchHeads: map[string]string{"main": rootIdentity.ID},
+		parentOf:    map[string]string{target.ID: rootIdentity.ID},
+	}
+	req := PushRequest{
+		TenantID: "tenant-123", RepoID: "repo-456", Branch: "main",
+		BaseCommit: "", TargetCommit: target.ID,
+		Commits:  []CommitRecord{mustCommitRecord(t, rootCommit), mustCommitRecord(t, childCommit)},
+		PackHash: ContentID(packData), PackFormat: PackFormatV2, PackStream: bytes.NewReader(packData),
+	}
+	if err := NewPushEngine(driver, store, func([]byte) error { return nil }).HandlePush(context.Background(), req); err != nil {
+		t.Fatalf("HandlePush() error = %v", err)
+	}
+	if store.branchHeads["main"] != target.ID {
+		t.Fatalf("branch head = %q, want %q", store.branchHeads["main"], target.ID)
+	}
+}
+
 func TestPushEngineHandlePushAcceptsOnlyCanonicalV2PackFrames(t *testing.T) {
 	t.Parallel()
 
