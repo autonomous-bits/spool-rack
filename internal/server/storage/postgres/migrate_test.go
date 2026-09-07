@@ -137,6 +137,24 @@ func TestLoadMigrations_DestructiveStatementRequiresDirective(t *testing.T) {
 	}
 }
 
+// TestLoadMigrations_RejectsVersionPrefixOverflowingInt64 guards against
+// CodeQL's "incorrect conversion between integer types" finding: schema_
+// migrations.version is a Postgres bigint (signed 64-bit) and applyMigration
+// stores a migration's parsed version via int64(m.Version), so a filename
+// version prefix that fits in uint64 but overflows int64 must be rejected up
+// front instead of silently wrapping into a negative value on insert.
+func TestLoadMigrations_RejectsVersionPrefixOverflowingInt64(t *testing.T) {
+	fsys := fstest.MapFS{
+		"migrations/18446744073709551615_overflow.sql": &fstest.MapFile{Data: []byte(
+			`CREATE TABLE IF NOT EXISTS migrate_test_overflow (id bigserial PRIMARY KEY);`,
+		)},
+	}
+	_, err := loadMigrationsFromFS(fsys, "migrations")
+	if err == nil {
+		t.Fatal("loadMigrationsFromFS: expected an error for a version prefix exceeding math.MaxInt64, got nil")
+	}
+}
+
 func TestMigrate_DestructiveMigrationBlockedUntilRetirementConfirmed(t *testing.T) {
 	dsn := newMigrateTestDSN(t)
 	dropMigrationTestArtifacts(t, dsn, "migrate_test_legacy")

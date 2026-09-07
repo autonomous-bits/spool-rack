@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"regexp"
 	"sort"
 	"strconv"
@@ -98,6 +99,13 @@ func loadMigrationsFromFS(fsys fs.FS, dir string) ([]migration, error) {
 		version, err := strconv.ParseUint(match[1], 10, 64)
 		if err != nil {
 			return nil, fmt.Errorf("postgres: migration file %q has an invalid version prefix: %w", entry.Name(), err)
+		}
+		// schema_migrations.version is a Postgres bigint (signed 64-bit), and
+		// applyMigration stores it via int64(m.Version); reject a version
+		// prefix that would overflow int64 rather than silently truncating
+		// or wrapping it into a negative value.
+		if version > math.MaxInt64 {
+			return nil, fmt.Errorf("postgres: migration file %q has a version prefix %d that exceeds the maximum supported value %d", entry.Name(), version, uint64(math.MaxInt64))
 		}
 		if existing, ok := seen[version]; ok {
 			return nil, fmt.Errorf("postgres: migration version %d used by both %q and %q", version, existing, entry.Name())
