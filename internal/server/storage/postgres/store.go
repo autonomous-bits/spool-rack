@@ -21,6 +21,10 @@ var (
 	ErrTenantNotFound = errors.New("tenant not found")
 	// ErrRepositoryNotFound indicates the target repository was not found.
 	ErrRepositoryNotFound = errors.New("repository not found")
+	// ErrWorkspaceNotFound indicates the target workspace was not found.
+	ErrWorkspaceNotFound = errors.New("workspace not found")
+	// ErrWorkspaceNameConflict indicates the workspace name already exists in this tenant.
+	ErrWorkspaceNameConflict = errors.New("postgres: workspace name already exists")
 	// ErrBranchNotFound indicates the requested branch ref was not found.
 	ErrBranchNotFound = errors.New("branch not found")
 	// ErrBranchAlreadyExists indicates a branch create request reused a name
@@ -104,6 +108,21 @@ const maxMergeAncestryCommits = 100
 // still guarding against unbounded traversal work.
 const maxRetentionAncestryCommits = 200000
 
+// TenantSummary represents tenant metadata.
+type TenantSummary struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// WorkspaceSummary represents workspace metadata within a tenant.
+type WorkspaceSummary struct {
+	ID        string    `json:"id"`
+	TenantID  string    `json:"tenantId"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
 // Store defines the metadata store operations for multi-tenant repositories.
 type Store interface {
 	// SetTenantContext returns a child context carrying the validated tenant ID
@@ -112,9 +131,20 @@ type Store interface {
 	SetTenantContext(ctx context.Context, tenantID string) (context.Context, error)
 	// CreateTenant creates a new tenant row and returns its generated UUID.
 	CreateTenant(ctx context.Context, name string) (string, error)
+	// ListTenants returns a summary of all registered tenants.
+	ListTenants(ctx context.Context) ([]TenantSummary, error)
+	// GetTenant retrieves tenant metadata by UUID or name.
+	GetTenant(ctx context.Context, idOrName string) (TenantSummary, error)
 	// CreateRepository creates a repository within the tenant carried by ctx and
 	// returns its generated UUID.
 	CreateRepository(ctx context.Context, name string) (string, error)
+	// CreateWorkspace creates a workspace within the tenant carried by ctx and
+	// returns its generated UUID.
+	CreateWorkspace(ctx context.Context, name string) (string, error)
+	// ListWorkspaces lists all workspaces scoped to the tenant carried by ctx.
+	ListWorkspaces(ctx context.Context) ([]WorkspaceSummary, error)
+	// GetWorkspace retrieves a workspace by UUID or name scoped to the tenant carried by ctx.
+	GetWorkspace(ctx context.Context, idOrName string) (WorkspaceSummary, error)
 	// CreateBranch creates a branch ref within the tenant carried by ctx pointing
 	// at the supplied head commit. If repoID has no branches yet, the newly
 	// created branch is atomically recorded as the repository's default
@@ -497,6 +527,9 @@ func (s *PGStore) CreateRepository(ctx context.Context, name string) (string, er
 
 	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `INSERT INTO repositories (id, tenant_id, name) VALUES ($1, $2, $3)`, repoID, tenantID, name); err != nil {
+			if isUniqueViolation(err) {
+				return fmt.Errorf("postgres: create repository %q: %w", name, ErrWorkspaceNameConflict)
+			}
 			return fmt.Errorf("postgres: create repository %q: insert repository: %w", name, err)
 		}
 		return nil
@@ -505,6 +538,109 @@ func (s *PGStore) CreateRepository(ctx context.Context, name string) (string, er
 	}
 
 	return repoID, nil
+}
+
+// ListTenants returns a summary of all registered tenants.
+func (s *PGStore) ListTenants(ctx context.Context) ([]TenantSummary, error) {
+	rows, err := s.pool.Query(ctx, `SELECT id, name, created_at FROM tenants ORDER BY created_at ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list tenants: %w", err)
+	}
+	defer rows.Close()
+
+	var tenants []TenantSummary
+	for rows.Next() {
+		var t TenantSummary
+		if err := rows.Scan(&t.ID, &t.Name, &t.CreatedAt); err != nil {
+			return nil, fmt.Errorf("postgres: list tenants: scan: %w", err)
+		}
+		tenants = append(tenants, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: list tenants: %w", err)
+	}
+	if tenants == nil {
+		tenants = []TenantSummary{}
+	}
+	return tenants, nil
+}
+
+// GetTenant retrieves tenant metadata by UUID or name.
+func (s *PGStore) GetTenant(ctx context.Context, idOrName string) (TenantSummary, error) {
+	var t TenantSummary
+	query := `SELECT id, name, created_at FROM tenants WHERE id::text = $1 OR name = $1 LIMIT 1`
+	err := s.pool.QueryRow(ctx, query, idOrName).Scan(&t.ID, &t.Name, &t.CreatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return TenantSummary{}, ErrTenantNotFound
+		}
+		return TenantSummary{}, fmt.Errorf("postgres: get tenant %q: %w", idOrName, err)
+	}
+	return t, nil
+}
+
+// CreateWorkspace inserts a workspace row scoped to the tenant carried by ctx.
+func (s *PGStore) CreateWorkspace(ctx context.Context, name string) (string, error) {
+	return s.CreateRepository(ctx, name)
+}
+
+// ListWorkspaces lists all workspaces scoped to the tenant carried by ctx.
+func (s *PGStore) ListWorkspaces(ctx context.Context) ([]WorkspaceSummary, error) {
+	tenantID, err := requireTenantID(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list workspaces: %w", err)
+	}
+
+	var workspaces []WorkspaceSummary
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT id, tenant_id, name, created_at FROM repositories WHERE tenant_id = $1 ORDER BY created_at ASC`, tenantID)
+		if err != nil {
+			return fmt.Errorf("query workspaces: %w", err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var w WorkspaceSummary
+			if err := rows.Scan(&w.ID, &w.TenantID, &w.Name, &w.CreatedAt); err != nil {
+				return fmt.Errorf("scan workspace: %w", err)
+			}
+			workspaces = append(workspaces, w)
+		}
+		return rows.Err()
+	}); err != nil {
+		return nil, fmt.Errorf("postgres: list workspaces: %w", err)
+	}
+	if workspaces == nil {
+		workspaces = []WorkspaceSummary{}
+	}
+	return workspaces, nil
+}
+
+// GetWorkspace retrieves a workspace by UUID or name scoped to the tenant carried by ctx.
+func (s *PGStore) GetWorkspace(ctx context.Context, idOrName string) (WorkspaceSummary, error) {
+	tenantID, err := requireTenantID(ctx)
+	if err != nil {
+		return WorkspaceSummary{}, fmt.Errorf("postgres: get workspace %q: %w", idOrName, err)
+	}
+
+	var w WorkspaceSummary
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		query := `SELECT id, tenant_id, name, created_at FROM repositories WHERE tenant_id = $1 AND (id::text = $2 OR name = $2) LIMIT 1`
+		err := tx.QueryRow(ctx, query, tenantID, idOrName).Scan(&w.ID, &w.TenantID, &w.Name, &w.CreatedAt)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrWorkspaceNotFound
+			}
+			return fmt.Errorf("query workspace: %w", err)
+		}
+		return nil
+	}); err != nil {
+		if errors.Is(err, ErrWorkspaceNotFound) {
+			return WorkspaceSummary{}, ErrWorkspaceNotFound
+		}
+		return WorkspaceSummary{}, fmt.Errorf("postgres: get workspace %q: %w", idOrName, err)
+	}
+	return w, nil
 }
 
 // CreateBranch inserts a branch ref scoped to the tenant carried by ctx. When
