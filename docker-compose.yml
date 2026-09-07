@@ -9,6 +9,8 @@ services:
       CAS_ROOT: /var/lib/spool-rack
       POSTGRES_DSN: postgres://spool_app:spool_app_dev_password@postgres:5432/spool_rack?sslmode=disable
       POSTGRES_MIGRATIONS_DSN: postgres://spool:spoolpassword@postgres:5432/spool_rack?sslmode=disable
+      DEV_TENANT_ID: "00000000-0000-4000-8000-000000000001"
+      DEV_REPO_ID: "00000000-0000-4000-8000-000000000002"
     ports:
       - "${SPOOL_RACK_PORT:-8080}:8080"
     volumes:
