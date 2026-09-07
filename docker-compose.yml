@@ -1,14 +1,37 @@
 services:
+  spool-rack:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      PORT: "8080"
+      CAS_ROOT: /var/lib/spool-rack
+      POSTGRES_DSN: postgres://spool_app:spool_app_dev_password@postgres:5432/spool_rack?sslmode=disable
+      POSTGRES_MIGRATIONS_DSN: postgres://spool:spoolpassword@postgres:5432/spool_rack?sslmode=disable
+    ports:
+      - "${SPOOL_RACK_PORT:-8080}:8080"
+    volumes:
+      - spool_rack_data:/var/lib/spool-rack
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
   postgres:
     image: postgres:16-alpine
-    container_name: spool-rack-postgres
     restart: unless-stopped
     environment:
       POSTGRES_DB: spool_rack
       POSTGRES_USER: spool
       POSTGRES_PASSWORD: spoolpassword
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5433}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -19,3 +42,4 @@ services:
 
 volumes:
   postgres_data:
+  spool_rack_data:
