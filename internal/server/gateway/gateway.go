@@ -34,6 +34,7 @@ type Gateway struct {
 	mux           *http.ServeMux
 
 	branchLifecycleStore BranchLifecycleStore
+	tenantWorkspaceStore TenantWorkspaceStore
 
 	packFormatWindow         VersionWindow
 	packIndexFormatWindow    VersionWindow
@@ -90,6 +91,13 @@ func WithBranchLifecycleStore(store BranchLifecycleStore) Option {
 	return func(g *Gateway) { g.branchLifecycleStore = store }
 }
 
+// WithTenantWorkspaceStore overrides the Gateway's tenant and workspace store
+// directly. It is normally inferred automatically from WithBranchStore (when
+// that store also implements TenantWorkspaceStore, as postgres.Store does).
+func WithTenantWorkspaceStore(store TenantWorkspaceStore) Option {
+	return func(g *Gateway) { g.tenantWorkspaceStore = store }
+}
+
 // New constructs an initialized API Gateway. When no verifier is provided,
 // it defaults to auth.PermissiveVerifier{} for zero-config local development
 // and MVP wiring; this MUST be overridden with WithVerifier before any
@@ -139,6 +147,11 @@ func New(opts ...Option) *Gateway {
 			g.branchLifecycleStore = lifecycleStore
 		}
 	}
+	if g.tenantWorkspaceStore == nil && g.branchStore != nil {
+		if wsStore, ok := g.branchStore.(TenantWorkspaceStore); ok {
+			g.tenantWorkspaceStore = wsStore
+		}
+	}
 	g.registerRoutes()
 	return g
 }
@@ -153,6 +166,41 @@ func (g *Gateway) Routes() http.Handler {
 func (g *Gateway) registerRoutes() {
 	g.mux.HandleFunc("GET /healthz", g.handleHealthz)
 	g.mux.Handle("GET /v1/whoami", Authenticate(g.logger, g.verifier)(http.HandlerFunc(g.handleWhoami)))
+	// Tenant administration routes
+	g.mux.Handle("POST /api/v1/tenants",
+		Authenticate(g.logger, g.verifier)(
+			RequireRole(g.logger, auth.RoleAdmin)(http.HandlerFunc(g.handleCreateTenant)),
+		),
+	)
+	g.mux.Handle("GET /api/v1/tenants",
+		Authenticate(g.logger, g.verifier)(
+			RequireRole(g.logger, auth.RoleViewer)(http.HandlerFunc(g.handleListTenants)),
+		),
+	)
+	g.mux.Handle("GET /api/v1/tenants/{tenant}",
+		Authenticate(g.logger, g.verifier)(
+			RequireRole(g.logger, auth.RoleViewer)(http.HandlerFunc(g.handleGetTenant)),
+		),
+	)
+
+	// Workspace management routes (scoped to authenticated caller's tenant)
+	g.mux.Handle("POST /api/v1/workspaces",
+		Authenticate(g.logger, g.verifier)(
+			RequireRole(g.logger, auth.RoleContributor)(http.HandlerFunc(g.handleCreateWorkspace)),
+		),
+	)
+	g.mux.Handle("GET /api/v1/workspaces",
+		Authenticate(g.logger, g.verifier)(
+			RequireRole(g.logger, auth.RoleViewer)(http.HandlerFunc(g.handleListWorkspaces)),
+		),
+	)
+	g.mux.Handle("GET /api/v1/workspaces/{workspace}",
+		Authenticate(g.logger, g.verifier)(
+			RequireRole(g.logger, auth.RoleViewer)(http.HandlerFunc(g.handleGetWorkspace)),
+		),
+	)
+
+	// Repository routes (preserved for backwards compatibility)
 	g.mux.Handle("GET /api/v1/repos/{repo}/whoami", Authenticate(g.logger, g.verifier)(RequireRepoScope(g.logger)(http.HandlerFunc(g.handleRepoWhoami))))
 	g.mux.Handle("POST /api/v1/repos/{repo}/push",
 		Authenticate(g.logger, g.verifier)(
@@ -218,6 +266,79 @@ func (g *Gateway) registerRoutes() {
 		),
 	)
 	g.mux.Handle("DELETE /api/v1/repos/{repo}/branches/{name}",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleContributor)(http.HandlerFunc(g.handleDeleteBranch)),
+			),
+		),
+	)
+
+	// Mirrored first-class workspace routes
+	g.mux.Handle("GET /api/v1/workspaces/{workspace}/whoami", Authenticate(g.logger, g.verifier)(RequireRepoScope(g.logger)(http.HandlerFunc(g.handleRepoWhoami))))
+	g.mux.Handle("POST /api/v1/workspaces/{workspace}/push",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleContributor)(http.HandlerFunc(g.handlePush)),
+			),
+		),
+	)
+	g.mux.Handle("GET /api/v1/workspaces/{workspace}/pull",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleViewer)(http.HandlerFunc(g.handlePull)),
+			),
+		),
+	)
+	g.mux.Handle("POST /api/v1/workspaces/{workspace}/merge/preview",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleViewer)(http.HandlerFunc(g.handleMergePreview)),
+			),
+		),
+	)
+	g.mux.Handle("POST /api/v1/workspaces/{workspace}/merge/lease",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleContributor)(http.HandlerFunc(g.handleMergeLease)),
+			),
+		),
+	)
+	g.mux.Handle("DELETE /api/v1/workspaces/{workspace}/merge/lease",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleContributor)(http.HandlerFunc(g.handleMergeLeaseRelease)),
+			),
+		),
+	)
+	g.mux.Handle("POST /api/v1/workspaces/{workspace}/merge/apply",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleContributor)(http.HandlerFunc(g.handleMergeApply)),
+			),
+		),
+	)
+	g.mux.Handle("POST /api/v1/workspaces/{workspace}/branches",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleContributor)(http.HandlerFunc(g.handleCreateBranch)),
+			),
+		),
+	)
+	g.mux.Handle("GET /api/v1/workspaces/{workspace}/branches",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleViewer)(http.HandlerFunc(g.handleListBranches)),
+			),
+		),
+	)
+	g.mux.Handle("GET /api/v1/workspaces/{workspace}/branches/default",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleViewer)(http.HandlerFunc(g.handleDefaultBranch)),
+			),
+		),
+	)
+	g.mux.Handle("DELETE /api/v1/workspaces/{workspace}/branches/{name}",
 		Authenticate(g.logger, g.verifier)(
 			RequireRepoScope(g.logger)(
 				RequireRole(g.logger, auth.RoleContributor)(http.HandlerFunc(g.handleDeleteBranch)),

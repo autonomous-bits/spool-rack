@@ -69,7 +69,7 @@ func main() {
 		// This simple main still uses blocking ListenAndServe without graceful
 		// shutdown; defer is sufficient for fatal/panic exit paths.
 		defer store.Close()
-		opts = append(opts, gateway.WithBranchStore(store))
+		opts = append(opts, gateway.WithBranchStore(store), gateway.WithTenantWorkspaceStore(store))
 	}
 
 	devTenantID := os.Getenv("DEV_TENANT_ID")

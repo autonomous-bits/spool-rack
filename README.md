@@ -73,24 +73,97 @@ The following variables configure the server (defined in `docker-compose.yml`):
 
 ---
 
+---
+
+## Tenant & Workspace Management
+
+Spool Rack supports multi-tenant organization with isolated workspaces per tenant. You can create and manage tenants and workspaces via the REST API before connecting local Spool workspaces:
+
+### 1. Create a Tenant
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/api/v1/tenants \
+  -H "Authorization: Bearer $SPOOL_RACK_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "slug": "acme-corp",
+    "name": "Acme Corporation"
+  }'
+```
+
+Response:
+```json
+{
+  "tenantId": "00000000-0000-4000-8000-000000000001",
+  "slug": "acme-corp",
+  "name": "Acme Corporation",
+  "createdAt": "2026-09-07T15:00:00Z"
+}
+```
+
+### 2. Create a Workspace within a Tenant
+
+Workspaces belong to a tenant and serve as the remote graph repository:
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/api/v1/workspaces \
+  -H "Authorization: Bearer $SPOOL_RACK_TOKEN" \
+  -H "X-Tenant-ID: 00000000-0000-4000-8000-000000000001" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "backend-core",
+    "defaultBranch": "main"
+  }'
+```
+
+Response:
+```json
+{
+  "workspaceId": "00000000-0000-4000-8000-000000000002",
+  "tenantId": "00000000-0000-4000-8000-000000000001",
+  "name": "backend-core",
+  "defaultBranch": "main",
+  "createdAt": "2026-09-07T15:00:00Z"
+}
+```
+
+You can also list and inspect existing workspaces:
+```bash
+# List all workspaces in a tenant
+curl -s http://127.0.0.1:8080/api/v1/workspaces \
+  -H "Authorization: Bearer $SPOOL_RACK_TOKEN" \
+  -H "X-Tenant-ID: 00000000-0000-4000-8000-000000000001"
+
+# Get workspace details by workspace UUID
+curl -s http://127.0.0.1:8080/api/v1/workspaces/00000000-0000-4000-8000-000000000002 \
+  -H "Authorization: Bearer $SPOOL_RACK_TOKEN" \
+  -H "X-Tenant-ID: 00000000-0000-4000-8000-000000000001"
+```
+
+---
+
 ## Connecting a Spool Workspace (`spl`)
 
 Follow these steps to connect a local Spool workspace to Spool Rack.
 
 ### 1. Add / Configure the Remote
 
-Run `spl remote set` inside your Spool workspace:
+Run `spl remote set` inside your Spool workspace, specifying both `--tenant-id` and `--workspace-id`:
 
 ```bash
 spl remote set \
   --endpoint http://127.0.0.1:8080 \
-  --repo-id 00000000-0000-4000-8000-000000000002 \
+  --tenant-id 00000000-0000-4000-8000-000000000001 \
+  --workspace-id 00000000-0000-4000-8000-000000000002 \
   --auth-mode bearer
 ```
 
 - `--endpoint`: Base URL of the Spool Rack instance.
-- `--repo-id`: UUID of the repository in Spool Rack.
+- `--tenant-id` (or `--tenant`): Tenant identifier submitted with each request via the `X-Tenant-ID` header.
+- `--workspace-id` (or `--workspace`): Workspace UUID in Spool Rack.
 - `--auth-mode`: `bearer` or `api_key`.
+
+*(Note: `--repo-id` remains supported as a legacy alias for `--workspace-id` for backwards compatibility).*
 
 ### 2. Set Authentication Token
 
@@ -114,6 +187,8 @@ Example response:
 ```json
 {
   "endpoint": "http://127.0.0.1:8080",
+  "tenantId": "00000000-0000-4000-8000-000000000001",
+  "workspaceId": "00000000-0000-4000-8000-000000000002",
   "repoId": "00000000-0000-4000-8000-000000000002",
   "authMode": "bearer",
   "versionStatus": "negotiated",

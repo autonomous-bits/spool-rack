@@ -93,15 +93,12 @@ func Authenticate(logger *slog.Logger, verifier auth.Verifier) func(http.Handler
 	}
 }
 
-// RequireRepoScope returns middleware that resolves the repository segment
-// of the URL path (registered as a "{repo}" wildcard, e.g.
-// "/api/v1/repos/{repo}/...") together with the tenant ID already injected
-// by Authenticate, constructing a validated cas.Scope. It must be mounted
-// on routes registered with a "{repo}" path parameter, downstream of
-// Authenticate. It responds 400 Bad Request when the tenant ID is missing
-// from context (Authenticate wasn't applied) or when cas.NewScope rejects
-// the tenant/repo identifiers (empty, or containing path-traversal-unsafe
-// characters).
+// RequireRepoScope returns middleware that resolves the workspace or repository
+// segment of the URL path (registered as a "{workspace}" or "{repo}" wildcard,
+// e.g. "/api/v1/workspaces/{workspace}/..." or "/api/v1/repos/{repo}/...")
+// together with the tenant ID already injected by Authenticate, constructing a
+// validated cas.Scope. It must be mounted on routes registered with a
+// "{workspace}" or "{repo}" path parameter, downstream of Authenticate.
 func RequireRepoScope(logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -111,10 +108,13 @@ func RequireRepoScope(logger *slog.Logger) func(http.Handler) http.Handler {
 				return
 			}
 
-			repoID := r.PathValue("repo")
+			repoID := r.PathValue("workspace")
+			if repoID == "" {
+				repoID = r.PathValue("repo")
+			}
 			scope, err := cas.NewScope(tenantID, repoID)
 			if err != nil {
-				logRejection(logger, r, "rejected invalid repo scope", err)
+				logRejection(logger, r, "rejected invalid workspace or repo scope", err)
 				writeJSONError(w, r, logger, http.StatusBadRequest, ErrorCodeBadRequest, "invalid tenant or repository identifier")
 				return
 			}
