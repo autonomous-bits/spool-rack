@@ -16,6 +16,12 @@ import (
 // branch would not be a fast-forward update.
 var ErrNonFastForward = errors.New("sync: non-fast-forward push rejected")
 
+// ErrUnsupportedContractVersion indicates a client declared a graphcontract
+// pack format version outside the range this server currently accepts. It is
+// distinct from ErrInvalidFrame (malformed pack bytes) so callers can return
+// a specific, actionable error instead of a generic bad-request.
+var ErrUnsupportedContractVersion = errors.New("sync: unsupported contract version")
+
 // BranchStore is the narrow slice of postgres.Store that HandlePush depends on,
 // kept separate so unit tests can supply a lightweight fake instead of a real
 // PostgreSQL-backed Store.
@@ -67,6 +73,13 @@ type PushEngine struct {
 	driver            cas.Driver
 	store             BranchStore
 	snapshotValidator SnapshotValidator
+	// minPackFormatVersion is the lowest client-declared PackFormat this
+	// engine accepts. It defaults to PackFormatV2 (today's only implemented
+	// wire format), preserving existing strict behavior unless a caller
+	// explicitly widens it via SetMinPackFormatVersion for a rolling deploy
+	// that must keep serving the immediately-prior compatible client version
+	// (see spec-cli-rack-contract-and-metadata-migrations).
+	minPackFormatVersion uint32
 }
 
 // NewPushEngine constructs a PushEngine backed by CAS and branch metadata
@@ -76,7 +89,17 @@ func NewPushEngine(driver cas.Driver, store BranchStore, validators ...SnapshotV
 	if len(validators) != 0 {
 		snapshotValidator = validators[0]
 	}
-	return &PushEngine{driver: driver, store: store, snapshotValidator: snapshotValidator}
+	return &PushEngine{driver: driver, store: store, snapshotValidator: snapshotValidator, minPackFormatVersion: PackFormatV2}
+}
+
+// SetMinPackFormatVersion widens (or restores) the lowest client-declared
+// PackFormat this engine accepts. Passing 0 or a value above PackFormatV2 is
+// ignored, keeping the current setting.
+func (e *PushEngine) SetMinPackFormatVersion(min uint32) {
+	if min == 0 || min > PackFormatV2 {
+		return
+	}
+	e.minPackFormatVersion = min
 }
 
 // HandlePush persists the immutable pack payload before reading or mutating any
@@ -84,7 +107,7 @@ func NewPushEngine(driver cas.Driver, store BranchStore, validators ...SnapshotV
 // and advances the branch ref. This ordering makes it structurally impossible
 // for a failed CAS write to be followed by any branch-ref update path.
 func (e *PushEngine) HandlePush(ctx context.Context, req PushRequest) error {
-	if err := validatePushRequest(req); err != nil {
+	if err := validatePushRequest(req, e.minPackFormatVersion); err != nil {
 		return err
 	}
 	ctx, err := e.store.SetTenantContext(ctx, req.TenantID)
@@ -151,7 +174,7 @@ func (e *PushEngine) HandlePush(ctx context.Context, req PushRequest) error {
 	return nil
 }
 
-func validatePushRequest(req PushRequest) error {
+func validatePushRequest(req PushRequest, minPackFormatVersion uint32) error {
 	packFormat := normalizePackFormat(req.PackFormat)
 	switch {
 	case req.Branch == "":
@@ -162,8 +185,8 @@ func validatePushRequest(req PushRequest) error {
 		return fmt.Errorf("sync: push: base commit is required")
 	case req.PackHash == "":
 		return fmt.Errorf("sync: push: pack hash is required")
-	case packFormat != PackFormatV2:
-		return fmt.Errorf("%w: native pushes require a v2 pack frame", ErrInvalidFrame)
+	case packFormat < minPackFormatVersion || packFormat > PackFormatV2:
+		return fmt.Errorf("%w: pack format %d is outside the versions this server currently accepts [%d,%d]", ErrUnsupportedContractVersion, packFormat, minPackFormatVersion, PackFormatV2)
 	}
 	for _, commit := range req.Commits {
 		if err := validateCommitRecord(commit); err != nil {

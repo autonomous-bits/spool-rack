@@ -2,7 +2,6 @@ package postgres
 
 import (
 	"context"
-	_ "embed"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -21,9 +20,6 @@ const (
 	defaultTestPostgresAdminDSN = "postgres://spool:spoolpassword@localhost:5432/spool_rack?sslmode=disable"
 	defaultTestPostgresAppDSN   = "postgres://spool_app:spool_app_dev_password@localhost:5432/spool_rack?sslmode=disable"
 )
-
-//go:embed schema.sql
-var schemaSQL string
 
 var putCommitCounter uint64
 var postgresTestDatabaseMu sync.Mutex
@@ -51,7 +47,7 @@ func newTestStore(t *testing.T) (*PGStore, context.Context) {
 		_ = adminConn.Close(context.Background())
 	})
 
-	if err := applySchema(t, adminConn); err != nil {
+	if err := applySchema(t, adminDSN); err != nil {
 		t.Fatalf("apply schema: %v", err)
 	}
 
@@ -72,13 +68,17 @@ func newTestStore(t *testing.T) (*PGStore, context.Context) {
 	return store, context.Background()
 }
 
-func applySchema(t *testing.T, conn *pgx.Conn) error {
+// applySchema converges adminDSN's database to the latest schema by running
+// the same versioned migration runner (Migrate) production deployments use,
+// so the integration suite exercises the real forward-migration path instead
+// of a separate ad hoc bootstrap.
+func applySchema(t *testing.T, adminDSN string) error {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	_, err := conn.Exec(ctx, schemaSQL)
+	_, err := Migrate(ctx, adminDSN)
 	return err
 }
 

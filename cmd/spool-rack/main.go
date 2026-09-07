@@ -39,6 +39,25 @@ func main() {
 
 	postgresDSN := os.Getenv("POSTGRES_DSN")
 	if postgresDSN != "" {
+		// POSTGRES_MIGRATIONS_DSN lets operators point schema migrations at a
+		// privileged role while POSTGRES_DSN keeps the server itself on the
+		// restricted "spool_app" role (see migrations/0001_baseline.sql).
+		// Falling back to POSTGRES_DSN keeps single-DSN local/dev setups
+		// working unchanged.
+		migrationsDSN := os.Getenv("POSTGRES_MIGRATIONS_DSN")
+		if migrationsDSN == "" {
+			migrationsDSN = postgresDSN
+		}
+		migrateCtx, migrateCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		result, err := postgres.Migrate(migrateCtx, migrationsDSN)
+		migrateCancel()
+		if err != nil {
+			log.Fatalf("Failed to apply Postgres migrations: %v", err)
+		}
+		if len(result.Applied) > 0 {
+			log.Printf("Applied %d Postgres migration(s): %v", len(result.Applied), result.Applied)
+		}
+
 		openCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		store, err := postgres.Open(openCtx, postgresDSN)
 		cancel()
