@@ -830,7 +830,7 @@ func (g *Gateway) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(healthzResponse{
 		Status: "healthy",
 		GraphContract: healthzGraphContract{
-			PackFormatVersion:            graphcontract.PackFormatVersion,
+			PackFormatVersion:            serversync.PackFormatV3,
 			PackFormatMinVersion:         g.packFormatWindow.Min,
 			PackFormatMaxVersion:         g.packFormatWindow.Max,
 			PackIndexFormatVersion:       graphcontract.PackIndexFormatVersion,

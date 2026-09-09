@@ -752,3 +752,157 @@ func mustCommitRecord(t *testing.T, frame CommitFrameV2) CommitRecord {
 func hashString(data string) string {
 	return hashBytes([]byte(data))
 }
+
+func TestPushEngineHandlePushAcceptsV3DAGPack(t *testing.T) {
+	t.Parallel()
+
+	driver, err := cas.NewLocalDriver(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	objRoot := []byte("root snapshot")
+	objA := []byte("branch A snapshot")
+	objB := []byte("branch B snapshot")
+	objMerge := []byte("merge snapshot")
+
+	rootCommit := CommitFrameV2{
+		Version:      CommitFormatV2,
+		Parents:      nil,
+		SnapshotRoot: ContentID(objRoot),
+		Author:       "Alice",
+		Message:      "root",
+	}
+	rootID, err := rootCommit.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	commitA := CommitFrameV2{
+		Version:      CommitFormatV2,
+		Parents:      []CommitIdentity{rootID},
+		SnapshotRoot: ContentID(objA),
+		Author:       "Alice",
+		Message:      "branch a",
+	}
+	idA, err := commitA.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	commitB := CommitFrameV2{
+		Version:      CommitFormatV2,
+		Parents:      []CommitIdentity{rootID},
+		SnapshotRoot: ContentID(objB),
+		Author:       "Bob",
+		Message:      "branch b",
+	}
+	idB, err := commitB.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mergeCommit := CommitFrameV2{
+		Version:      CommitFormatV2,
+		Parents:      []CommitIdentity{idA, idB},
+		SnapshotRoot: ContentID(objMerge),
+		Author:       "Alice",
+		Message:      "merge",
+	}
+	targetID, err := mergeCommit.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Root push with PackFormatV3: DAG contains root, a, b, merge
+	packData, err := MarshalPackFrameV3(PackFrameV3{
+		Version: PackFormatV3,
+		Base:    CommitIdentity{},
+		Target:  targetID,
+		Commits: []CommitFrameV2{rootCommit, commitA, commitB, mergeCommit},
+		Objects: []PackObjectV2{
+			{ID: ContentID(objRoot), Data: objRoot},
+			{ID: ContentID(objA), Data: objA},
+			{ID: ContentID(objB), Data: objB},
+			{ID: ContentID(objMerge), Data: objMerge},
+		},
+	})
+	if err != nil {
+		t.Fatalf("MarshalPackFrameV3: %v", err)
+	}
+
+	store := &fakeBranchStore{
+		branchHeads: map[string]string{"main": rootID.ID},
+		parentOf: map[string]string{
+			targetID.ID: idA.ID,
+			idA.ID:      rootID.ID,
+		},
+	}
+	engine := NewPushEngine(driver, store, func([]byte) error { return nil })
+
+	req := PushRequest{
+		TenantID: "tenant-123", RepoID: "repo-456", Branch: "main",
+		BaseCommit: "", TargetCommit: targetID.ID,
+		Commits: []CommitRecord{
+			mustCommitRecord(t, rootCommit),
+			mustCommitRecord(t, commitA),
+			mustCommitRecord(t, commitB),
+			mustCommitRecord(t, mergeCommit),
+		},
+		PackHash:   ContentID(packData),
+		PackFormat: PackFormatV3,
+		PackStream: bytes.NewReader(packData),
+	}
+	if err := engine.HandlePush(context.Background(), req); err != nil {
+		t.Fatalf("HandlePush(root V3 DAG) error = %v", err)
+	}
+	if store.branchHeads["main"] != targetID.ID {
+		t.Fatalf("branch head = %q, want %q", store.branchHeads["main"], targetID.ID)
+	}
+
+	// 2. Incremental push with PackFormatV3:
+	// Branch is at commit A (idA.ID).
+	// New DAG push has Base=idA, Target=targetID, Commits=[commitB, mergeCommit].
+	// commitB branches from rootID (which is already in the repository store).
+	store2 := &fakeBranchStore{
+		branchHeads: map[string]string{"main": idA.ID},
+		commitFormat: map[string]uint32{
+			rootID.ID: CommitFormatV2,
+			idA.ID:    CommitFormatV2,
+		},
+	}
+	engine2 := NewPushEngine(driver, store2, func([]byte) error { return nil })
+
+	incPackData, err := MarshalPackFrameV3(PackFrameV3{
+		Version: PackFormatV3,
+		Base:    idA,
+		Target:  targetID,
+		Commits: []CommitFrameV2{commitB, mergeCommit},
+		Objects: []PackObjectV2{
+			{ID: ContentID(objB), Data: objB},
+			{ID: ContentID(objMerge), Data: objMerge},
+		},
+	})
+	if err != nil {
+		t.Fatalf("MarshalPackFrameV3 (incremental): %v", err)
+	}
+
+	incReq := PushRequest{
+		TenantID: "tenant-123", RepoID: "repo-456", Branch: "main",
+		BaseCommit:   idA.ID,
+		TargetCommit: targetID.ID,
+		Commits: []CommitRecord{
+			mustCommitRecord(t, commitB),
+			mustCommitRecord(t, mergeCommit),
+		},
+		PackHash:   ContentID(incPackData),
+		PackFormat: PackFormatV3,
+		PackStream: bytes.NewReader(incPackData),
+	}
+	if err := engine2.HandlePush(context.Background(), incReq); err != nil {
+		t.Fatalf("HandlePush(incremental V3 DAG) error = %v", err)
+	}
+	if store2.branchHeads["main"] != targetID.ID {
+		t.Fatalf("branch head = %q, want %q", store2.branchHeads["main"], targetID.ID)
+	}
+}

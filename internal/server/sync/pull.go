@@ -154,9 +154,25 @@ func UnmarshalPullEnvelopeV2(data []byte) (PullManifestV2, [][]byte, error) {
 		if ContentID(packs[i]) != pack.Hash {
 			return PullManifestV2{}, nil, fmt.Errorf("%w: pack %d hash mismatch", ErrInvalidPullEnvelope, i)
 		}
-		frame, err := UnmarshalPackFrameV2(packs[i])
-		if err != nil {
-			return PullManifestV2{}, nil, fmt.Errorf("%w: pack %d is not a canonical v2 frame: %v", ErrInvalidPullEnvelope, i, err)
+		var frame PackFrameV2
+		if pack.Format == PackFormatV3 {
+			v3, err := UnmarshalPackFrameV3(packs[i])
+			if err != nil {
+				return PullManifestV2{}, nil, fmt.Errorf("%w: pack %d is not a canonical v3 frame: %v", ErrInvalidPullEnvelope, i, err)
+			}
+			frame = PackFrameV2{
+				Version: v3.Version,
+				Base:    v3.Base,
+				Target:  v3.Target,
+				Commits: v3.Commits,
+				Objects: v3.Objects,
+			}
+		} else {
+			var err error
+			frame, err = UnmarshalPackFrameV2(packs[i])
+			if err != nil {
+				return PullManifestV2{}, nil, fmt.Errorf("%w: pack %d is not a canonical v2 frame: %v", ErrInvalidPullEnvelope, i, err)
+			}
 		}
 		frames[i] = frame
 		if frame.Target.Format == CommitFormatV2 && frame.Target.ID == manifest.Head {
@@ -517,8 +533,8 @@ func (e *PullEngine) planPullDAG(ctx context.Context, scope cas.Scope, repoID, k
 }
 
 func (e *PullEngine) readV2PackFrame(ctx context.Context, scope cas.Scope, packRange postgres.PackRange) (PackFrameV2, error) {
-	if packRange.Format != PackFormatV2 {
-		return PackFrameV2{}, fmt.Errorf("%w: pack %s is not canonical v2", ErrInvalidPullEnvelope, packRange.PackHash)
+	if packRange.Format != PackFormatV2 && packRange.Format != PackFormatV3 {
+		return PackFrameV2{}, fmt.Errorf("%w: pack %s is not canonical v2 or v3", ErrInvalidPullEnvelope, packRange.PackHash)
 	}
 	pack, err := e.driver.OpenPack(ctx, scope, packRange.PackHash)
 	if err != nil {
@@ -535,10 +551,28 @@ func (e *PullEngine) readV2PackFrame(ctx context.Context, scope cas.Scope, packR
 	if int64(len(data)) > MaxV2PackBytes || ContentID(data) != packRange.PackHash {
 		return PackFrameV2{}, fmt.Errorf("%w: pack %s has invalid content", ErrInvalidPullEnvelope, packRange.PackHash)
 	}
-	frame, err := UnmarshalPackFrameV2(data)
-	if err != nil {
-		return PackFrameV2{}, err
+
+	var frame PackFrameV2
+	if packRange.Format == PackFormatV3 {
+		v3, err := UnmarshalPackFrameV3(data)
+		if err != nil {
+			return PackFrameV2{}, err
+		}
+		frame = PackFrameV2{
+			Version: v3.Version,
+			Base:    v3.Base,
+			Target:  v3.Target,
+			Commits: v3.Commits,
+			Objects: v3.Objects,
+		}
+	} else {
+		var err error
+		frame, err = UnmarshalPackFrameV2(data)
+		if err != nil {
+			return PackFrameV2{}, err
+		}
 	}
+
 	if frame.Base.ID != packRange.BaseCommitID || frame.Target.ID != packRange.TargetCommitID {
 		return PackFrameV2{}, fmt.Errorf("%w: pack %s does not match its metadata range", ErrInvalidPullEnvelope, packRange.PackHash)
 	}
