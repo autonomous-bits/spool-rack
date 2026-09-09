@@ -550,4 +550,3 @@ func setEdge(edges map[string]Edge, id string, value Edge, exists bool) map[stri
 	}
 	return result
 }
-func hashBytes(data []byte) string { return serversync.ContentID(data) }

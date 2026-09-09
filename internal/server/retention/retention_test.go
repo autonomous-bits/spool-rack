@@ -151,15 +151,6 @@ var (
 	_ PackDeleter = (*fakeDriver)(nil)
 )
 
-func mustScope(t *testing.T, tenantID, repoID string) cas.Scope {
-	t.Helper()
-	scope, err := cas.NewScope(tenantID, repoID)
-	if err != nil {
-		t.Fatalf("cas.NewScope(%q, %q): %v", tenantID, repoID, err)
-	}
-	return scope
-}
-
 func retainedPackIDs(report Report) []string {
 	ids := make([]string, len(report.Retained))
 	for i, r := range report.Retained {
