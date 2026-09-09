@@ -123,7 +123,7 @@ func seedDevTenant(ctx context.Context, dsn, tenantID, repoID string) error {
 	if err != nil {
 		return err
 	}
-	defer conn.Close(ctx)
+	defer func() { _ = conn.Close(ctx) }()
 
 	if _, err := conn.Exec(ctx, `INSERT INTO tenants (id, name) VALUES ($1, 'default') ON CONFLICT (id) DO NOTHING`, tenantID); err != nil {
 		return fmt.Errorf("seed tenant: %w", err)

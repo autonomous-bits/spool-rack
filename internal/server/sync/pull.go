@@ -111,8 +111,8 @@ func (m PullManifestV2) validate() error {
 		if !validContentID(pack.Hash) {
 			return fmt.Errorf("%w: pack %d has invalid hash", ErrInvalidPullEnvelope, i)
 		}
-		if pack.Format != PackFormatV2 {
-			return fmt.Errorf("%w: pack %d is not canonical v2", ErrInvalidPullEnvelope, i)
+		if pack.Format != PackFormatV2 && pack.Format != PackFormatV3 {
+			return fmt.Errorf("%w: pack %d is not canonical v2 or v3", ErrInvalidPullEnvelope, i)
 		}
 	}
 	return nil
@@ -160,13 +160,7 @@ func UnmarshalPullEnvelopeV2(data []byte) (PullManifestV2, [][]byte, error) {
 			if err != nil {
 				return PullManifestV2{}, nil, fmt.Errorf("%w: pack %d is not a canonical v3 frame: %v", ErrInvalidPullEnvelope, i, err)
 			}
-			frame = PackFrameV2{
-				Version: v3.Version,
-				Base:    v3.Base,
-				Target:  v3.Target,
-				Commits: v3.Commits,
-				Objects: v3.Objects,
-			}
+			frame = PackFrameV2(v3)
 		} else {
 			var err error
 			frame, err = UnmarshalPackFrameV2(packs[i])
@@ -313,8 +307,8 @@ func (e *PullEngine) BuildPullManifest(ctx context.Context, plan PullPlan) (Pull
 		Packs:   make([]PullPackManifestV2, 0, len(plan.Ranges)),
 	}
 	for _, packRange := range plan.Ranges {
-		if packRange.Format != PackFormatV2 {
-			return PullManifestV2{}, fmt.Errorf("%w: pack %s is not canonical v2", ErrInvalidPullEnvelope, packRange.PackHash)
+		if packRange.Format != PackFormatV2 && packRange.Format != PackFormatV3 {
+			return PullManifestV2{}, fmt.Errorf("%w: pack %s is not canonical v2 or v3", ErrInvalidPullEnvelope, packRange.PackHash)
 		}
 		if !validContentID(packRange.PackHash) {
 			return PullManifestV2{}, fmt.Errorf("%w: pack %s has invalid hash", ErrInvalidPullEnvelope, packRange.PackHash)
@@ -339,7 +333,7 @@ func (e *PullEngine) BuildPullManifest(ctx context.Context, plan PullPlan) (Pull
 			return PullManifestV2{}, fmt.Errorf("%w: pack %s exceeds %d byte limit", ErrInvalidPullEnvelope, packRange.PackHash, MaxV2PackBytes)
 		}
 		manifest.Packs = append(manifest.Packs, PullPackManifestV2{
-			Hash: packRange.PackHash, Format: PackFormatV2, Length: uint64(length),
+			Hash: packRange.PackHash, Format: packRange.Format, Length: uint64(length),
 		})
 	}
 	if _, err := MarshalPullManifestV2(manifest); err != nil {
@@ -432,7 +426,7 @@ func pullManifestMatchesPlan(manifest PullManifestV2, plan PullPlan) error {
 	}
 	for i, pack := range manifest.Packs {
 		packRange := plan.Ranges[i]
-		if pack.Hash != packRange.PackHash || pack.Format != PackFormatV2 || packRange.Format != PackFormatV2 {
+		if pack.Hash != packRange.PackHash || pack.Format != packRange.Format || (packRange.Format != PackFormatV2 && packRange.Format != PackFormatV3) {
 			return fmt.Errorf("%w: manifest pack %d does not match pull plan", ErrInvalidPullEnvelope, i)
 		}
 	}
@@ -558,13 +552,7 @@ func (e *PullEngine) readV2PackFrame(ctx context.Context, scope cas.Scope, packR
 		if err != nil {
 			return PackFrameV2{}, err
 		}
-		frame = PackFrameV2{
-			Version: v3.Version,
-			Base:    v3.Base,
-			Target:  v3.Target,
-			Commits: v3.Commits,
-			Objects: v3.Objects,
-		}
+		frame = PackFrameV2(v3)
 	} else {
 		var err error
 		frame, err = UnmarshalPackFrameV2(data)

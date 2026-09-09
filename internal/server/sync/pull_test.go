@@ -6,6 +6,8 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+
+	"github.com/autonomous-bits/spool-rack/internal/server/storage/postgres"
 )
 
 func TestPullEnvelopeV2SeparatesPacksAndRejectsTampering(t *testing.T) {
@@ -307,4 +309,67 @@ func marshalPullEnvelope(t *testing.T, manifest PullManifestV2, packs ...[]byte)
 		envelope = append(envelope, pack...)
 	}
 	return envelope
+}
+
+func TestPullEnvelopeV2AcceptsPackFormatV3(t *testing.T) {
+	t.Parallel()
+
+	snapshot := []byte("v3 snapshot")
+	commit := CommitFrameV2{
+		Version: CommitFormatV2, Parents: []CommitIdentity{},
+		SnapshotRoot: ContentID(snapshot), Author: "Ada", Message: "v3 commit",
+	}
+	target, err := commit.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pack, err := MarshalPackFrameV3(PackFrameV3{
+		Version: PackFormatV3, Target: target, Commits: []CommitFrameV2{commit},
+		Objects: []PackObjectV2{{ID: ContentID(snapshot), Data: snapshot}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	manifest := PullManifestV2{
+		Version: PullEnvelopeFormatV2,
+		Head:    target.ID,
+		Packs: []PullPackManifestV2{
+			{Hash: ContentID(pack), Format: PackFormatV3, Length: uint64(len(pack))},
+		},
+	}
+	envelope := marshalPullEnvelope(t, manifest, pack)
+	gotManifest, gotPacks, err := UnmarshalPullEnvelopeV2(envelope)
+	if err != nil {
+		t.Fatalf("UnmarshalPullEnvelopeV2() error = %v", err)
+	}
+	if !reflect.DeepEqual(gotManifest, manifest) {
+		t.Fatalf("got manifest %+v, want %+v", gotManifest, manifest)
+	}
+	if len(gotPacks) != 1 || !bytes.Equal(gotPacks[0], pack) {
+		t.Fatalf("unexpected extracted pack data")
+	}
+}
+
+func TestPullManifestMatchesPlanSupportsV3(t *testing.T) {
+	t.Parallel()
+
+	packHash := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	headID := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	plan := PullPlan{
+		Head: headID,
+		Ranges: []postgres.PackRange{
+			{PackHash: packHash, Format: PackFormatV3, TargetCommitID: headID},
+		},
+	}
+	manifest := PullManifestV2{
+		Version: PullEnvelopeFormatV2,
+		Head:    headID,
+		Packs: []PullPackManifestV2{
+			{Hash: packHash, Format: PackFormatV3, Length: 100},
+		},
+	}
+	if err := pullManifestMatchesPlan(manifest, plan); err != nil {
+		t.Fatalf("pullManifestMatchesPlan() error = %v", err)
+	}
 }
