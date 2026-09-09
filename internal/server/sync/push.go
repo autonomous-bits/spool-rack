@@ -124,13 +124,37 @@ func (e *PushEngine) HandlePush(ctx context.Context, req PushRequest) error {
 		return fmt.Errorf("sync: push: invalid CAS scope: %w", err)
 	}
 
-	frame, err := e.writePack(ctx, scope, req)
+	base, err := e.writePack(ctx, scope, req)
 	if err != nil {
 		return fmt.Errorf("sync: push: write pack: %w", err)
 	}
-	if frame != nil && req.BaseCommit != "" {
-		if err := e.validateV2BaseFormat(ctx, req.RepoID, *frame); err != nil {
+	if base != nil && req.BaseCommit != "" {
+		if err := e.validateV2BaseFormat(ctx, req.RepoID, *base); err != nil {
 			return err
+		}
+	}
+
+	packFormat := normalizePackFormat(req.PackFormat)
+	if packFormat == PackFormatV3 {
+		known := make(map[string]struct{}, len(req.Commits)+1)
+		if req.BaseCommit != "" {
+			known[req.BaseCommit] = struct{}{}
+		}
+		for _, c := range req.Commits {
+			for _, parent := range c.Commit.Parents {
+				parentID := string(parent)
+				if _, ok := known[parentID]; ok {
+					continue
+				}
+				if _, err := e.store.GetCommitMetadata(ctx, req.RepoID, parentID); err != nil {
+					if errors.Is(err, postgres.ErrCommitNotFound) {
+						return fmt.Errorf("%w: commit %s references unknown parent %s", ErrInvalidFrame, c.ID, parentID)
+					}
+					return fmt.Errorf("sync: push: resolve parent %s: %w", parentID, err)
+				}
+				known[parentID] = struct{}{}
+			}
+			known[string(c.ID)] = struct{}{}
 		}
 	}
 
@@ -149,7 +173,7 @@ func (e *PushEngine) HandlePush(ctx context.Context, req PushRequest) error {
 		}
 	}
 	if formatted, ok := e.store.(formattedPackStore); ok {
-		if err := formatted.PutPackRangeWithFormat(ctx, req.RepoID, req.PackHash, req.BaseCommit, req.TargetCommit, PackFormatV2); err != nil {
+		if err := formatted.PutPackRangeWithFormat(ctx, req.RepoID, req.PackHash, req.BaseCommit, req.TargetCommit, packFormat); err != nil {
 			return fmt.Errorf("sync: push: register pack range: %w", err)
 		}
 	} else if err := e.store.PutPackRange(ctx, req.RepoID, req.PackHash, req.BaseCommit, req.TargetCommit); err != nil {
@@ -209,8 +233,8 @@ func validatePushRequest(req PushRequest, minPackFormatVersion uint32) error {
 		return fmt.Errorf("sync: push: target commit is required")
 	case req.PackHash == "":
 		return fmt.Errorf("sync: push: pack hash is required")
-	case packFormat < minPackFormatVersion || packFormat > PackFormatV2:
-		return fmt.Errorf("%w: pack format %d is outside the versions this server currently accepts [%d,%d]", ErrUnsupportedContractVersion, packFormat, minPackFormatVersion, PackFormatV2)
+	case packFormat < minPackFormatVersion || packFormat > PackFormatV3:
+		return fmt.Errorf("%w: pack format %d is outside the versions this server currently accepts [%d,%d]", ErrUnsupportedContractVersion, packFormat, minPackFormatVersion, PackFormatV3)
 	}
 	for _, commit := range req.Commits {
 		if err := validateCommitRecord(commit); err != nil {
@@ -220,66 +244,91 @@ func validatePushRequest(req PushRequest, minPackFormatVersion uint32) error {
 	return nil
 }
 
-func (e *PushEngine) writePack(ctx context.Context, scope cas.Scope, req PushRequest) (*PackFrameV2, error) {
+func (e *PushEngine) writePack(ctx context.Context, scope cas.Scope, req PushRequest) (*CommitIdentity, error) {
 	if req.PackStream == nil {
-		return nil, fmt.Errorf("v2 pack stream is required")
+		return nil, fmt.Errorf("pack stream is required")
 	}
 	if e.snapshotValidator == nil {
-		return nil, fmt.Errorf("%w: v2 snapshot validator is required", ErrInvalidFrame)
+		return nil, fmt.Errorf("%w: snapshot validator is required", ErrInvalidFrame)
 	}
 	data, err := io.ReadAll(io.LimitReader(req.PackStream, MaxV2PackBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("read v2 pack: %w", err)
+		return nil, fmt.Errorf("read pack: %w", err)
 	}
 	if int64(len(data)) > MaxV2PackBytes {
-		return nil, fmt.Errorf("v2 pack exceeds %d byte limit", MaxV2PackBytes)
+		return nil, fmt.Errorf("pack exceeds %d byte limit", MaxV2PackBytes)
 	}
 	if ContentID(data) != req.PackHash {
-		return nil, fmt.Errorf("v2 pack content ID does not match pack hash")
+		return nil, fmt.Errorf("pack content ID does not match pack hash")
 	}
-	frame, err := UnmarshalPackFrameV2(data)
-	if err != nil {
-		return nil, err
+
+	var (
+		base    CommitIdentity
+		target  CommitIdentity
+		commits []CommitFrameV2
+		objects []PackObjectV2
+	)
+
+	packFormat := normalizePackFormat(req.PackFormat)
+	if packFormat == PackFormatV3 {
+		frame, err := UnmarshalPackFrameV3(data)
+		if err != nil {
+			return nil, err
+		}
+		base = frame.Base
+		target = frame.Target
+		commits = frame.Commits
+		objects = frame.Objects
+	} else {
+		frame, err := UnmarshalPackFrameV2(data)
+		if err != nil {
+			return nil, err
+		}
+		base = frame.Base
+		target = frame.Target
+		commits = frame.Commits
+		objects = frame.Objects
 	}
-	if frame.Base.ID != req.BaseCommit || frame.Target.ID != req.TargetCommit {
+
+	if base.ID != req.BaseCommit || target.ID != req.TargetCommit {
 		return nil, fmt.Errorf("%w: pack frame base/target does not match push metadata", ErrInvalidFrame)
 	}
-	if err := validateV2CommitMetadata(req.Commits, frame.Commits); err != nil {
+	if err := validateV2CommitMetadata(req.Commits, commits); err != nil {
 		return nil, err
 	}
-	for _, object := range frame.Objects {
+	for _, object := range objects {
 		if err := e.driver.Put(ctx, scope, object.ID, object.Data); err != nil {
-			return nil, fmt.Errorf("write v2 object %s: %w", object.ID, err)
+			return nil, fmt.Errorf("write object %s: %w", object.ID, err)
 		}
 	}
-	for _, commit := range frame.Commits {
+	for _, commit := range commits {
 		snapshot, err := e.driver.Get(ctx, scope, commit.SnapshotRoot)
 		if err != nil {
-			return nil, fmt.Errorf("read v2 snapshot %s: %w", commit.SnapshotRoot, err)
+			return nil, fmt.Errorf("read snapshot %s: %w", commit.SnapshotRoot, err)
 		}
 		if ContentID(snapshot) != commit.SnapshotRoot {
-			return nil, fmt.Errorf("%w: v2 snapshot %s has an invalid content ID", ErrInvalidFrame, commit.SnapshotRoot)
+			return nil, fmt.Errorf("%w: snapshot %s has an invalid content ID", ErrInvalidFrame, commit.SnapshotRoot)
 		}
 		if err := e.snapshotValidator(snapshot); err != nil {
-			return nil, fmt.Errorf("%w: v2 snapshot %s: %v", ErrInvalidFrame, commit.SnapshotRoot, err)
+			return nil, fmt.Errorf("%w: snapshot %s: %v", ErrInvalidFrame, commit.SnapshotRoot, err)
 		}
 	}
 	if err := e.driver.WritePack(ctx, scope, req.PackHash, bytes.NewReader(data)); err != nil {
 		return nil, err
 	}
-	return &frame, nil
+	return &base, nil
 }
 
-func (e *PushEngine) validateV2BaseFormat(ctx context.Context, repoID string, frame PackFrameV2) error {
-	if frame.Base.Format != CommitFormatV2 {
-		return fmt.Errorf("%w: native v2 pack base must use v2 framing", ErrInvalidFrame)
+func (e *PushEngine) validateV2BaseFormat(ctx context.Context, repoID string, base CommitIdentity) error {
+	if base.Format != CommitFormatV2 {
+		return fmt.Errorf("%w: native pack base must use v2 framing", ErrInvalidFrame)
 	}
-	metadata, err := e.store.GetCommitMetadata(ctx, repoID, frame.Base.ID)
+	metadata, err := e.store.GetCommitMetadata(ctx, repoID, base.ID)
 	if err != nil {
-		return fmt.Errorf("sync: push: resolve v2 pack base %s: %w", frame.Base.ID, err)
+		return fmt.Errorf("sync: push: resolve pack base %s: %w", base.ID, err)
 	}
 	if metadata.Format != CommitFormatV2 {
-		return fmt.Errorf("%w: v2 pack base %s has format %d", ErrInvalidFrame, frame.Base.ID, metadata.Format)
+		return fmt.Errorf("%w: pack base %s has format %d", ErrInvalidFrame, base.ID, metadata.Format)
 	}
 	return nil
 }

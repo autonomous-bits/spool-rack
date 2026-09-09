@@ -5,6 +5,8 @@ import (
 	"strconv"
 
 	"github.com/autonomous-bits/spool/graphcontract"
+
+	serversync "github.com/autonomous-bits/spool-rack/internal/server/sync"
 )
 
 // VersionWindow describes the inclusive range of a graphcontract wire-format
@@ -69,7 +71,11 @@ func WithPackManifestFormatWindow(window VersionWindow) Option {
 }
 
 func defaultPackFormatWindow() VersionWindow {
-	return envVersionWindow("RACK_MIN_PACK_FORMAT_VERSION", graphcontract.PackFormatVersion)
+	window := envVersionWindow("RACK_MIN_PACK_FORMAT_VERSION", serversync.PackFormatV3)
+	if os.Getenv("RACK_MIN_PACK_FORMAT_VERSION") == "" {
+		window.Min = serversync.PackFormatV2
+	}
+	return window
 }
 
 func defaultPackIndexFormatWindow() VersionWindow {

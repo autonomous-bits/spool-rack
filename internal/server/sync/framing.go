@@ -24,6 +24,8 @@ const (
 	CommitFormatV2 uint32 = 2
 	// PackFormatV2 identifies a canonical Rack pack frame.
 	PackFormatV2 uint32 = 2
+	// PackFormatV3 identifies a canonical Rack pack frame supporting DAG commit histories.
+	PackFormatV3 uint32 = 3
 )
 
 var (
@@ -217,6 +219,125 @@ func (f PackFrameV2) validate() error {
 		previous = identity
 	}
 	if previous != f.Target {
+		return fmt.Errorf("%w: target does not name the final commit frame", ErrInvalidFrame)
+	}
+	seen := make(map[string]struct{}, len(f.Objects))
+	for i, object := range f.Objects {
+		if !validContentID(object.ID) {
+			return fmt.Errorf("%w: object %d has invalid content ID", ErrInvalidFrame, i)
+		}
+		if ContentID(object.Data) != object.ID {
+			return fmt.Errorf("%w: object %d content ID mismatch", ErrInvalidFrame, i)
+		}
+		if _, ok := seen[object.ID]; ok {
+			return fmt.Errorf("%w: duplicate object %q", ErrInvalidFrame, object.ID)
+		}
+		seen[object.ID] = struct{}{}
+	}
+	for _, commit := range f.Commits {
+		if _, found := seen[commit.SnapshotRoot]; !found {
+			identity, err := commit.Identity()
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("%w: commit %s snapshot %s is not available in the pack", ErrInvalidFrame, identity.ID, commit.SnapshotRoot)
+		}
+	}
+	return nil
+}
+
+// PackFrameV3 is one bounded, canonical v3 slice of a commit DAG. Its
+// commits form a topologically sorted DAG (ancestors before descendants),
+// supporting multi-parent merge commits and branching histories within a
+// single pack frame.
+type PackFrameV3 struct {
+	Version uint32          `cbor:"1,keyasint"`
+	Base    CommitIdentity  `cbor:"2,keyasint"`
+	Target  CommitIdentity  `cbor:"3,keyasint"`
+	Commits []CommitFrameV2 `cbor:"4,keyasint"`
+	Objects []PackObjectV2  `cbor:"5,keyasint"`
+}
+
+// MarshalPackFrameV3 validates and returns the canonical encoding of frame.
+func MarshalPackFrameV3(frame PackFrameV3) ([]byte, error) {
+	if err := frame.validate(); err != nil {
+		return nil, err
+	}
+	data, err := frameCanonicalCBOR.Marshal(frame)
+	if err != nil {
+		return nil, fmt.Errorf("%w: encode pack: %v", ErrInvalidFrame, err)
+	}
+	if int64(len(data)) > MaxV2PackBytes {
+		return nil, fmt.Errorf("%w: pack exceeds %d byte limit", ErrInvalidFrame, MaxV2PackBytes)
+	}
+	return data, nil
+}
+
+// UnmarshalPackFrameV3 verifies that data is a canonical, self-consistent v3
+// pack frame before allowing a caller to register its metadata.
+func UnmarshalPackFrameV3(data []byte) (PackFrameV3, error) {
+	if int64(len(data)) > MaxV2PackBytes {
+		return PackFrameV3{}, fmt.Errorf("%w: pack exceeds %d byte limit", ErrInvalidCanonicalFrame, MaxV2PackBytes)
+	}
+	var frame PackFrameV3
+	if err := frameCBORDecoder.Unmarshal(data, &frame); err != nil {
+		return PackFrameV3{}, fmt.Errorf("%w: decode pack: %v", ErrInvalidCanonicalFrame, err)
+	}
+	canonical, err := MarshalPackFrameV3(frame)
+	if err != nil {
+		return PackFrameV3{}, err
+	}
+	if !bytes.Equal(data, canonical) {
+		return PackFrameV3{}, fmt.Errorf("%w: object is not canonically encoded", ErrInvalidCanonicalFrame)
+	}
+	return frame, nil
+}
+
+func (f PackFrameV3) validate() error {
+	if f.Version != PackFormatV3 {
+		return fmt.Errorf("%w: unsupported pack frame version %d", ErrInvalidFrame, f.Version)
+	}
+	if f.Base.ID != "" || f.Base.Format != 0 {
+		if err := f.Base.Validate(); err != nil {
+			return fmt.Errorf("%w: base commit: %v", ErrInvalidFrame, err)
+		}
+	}
+	if err := f.Target.Validate(); err != nil {
+		return fmt.Errorf("%w: target commit: %v", ErrInvalidFrame, err)
+	}
+	if len(f.Commits) == 0 {
+		return fmt.Errorf("%w: advancing pack must contain a commit frame", ErrInvalidFrame)
+	}
+	seenCommits := make(map[string]struct{}, len(f.Commits)+1)
+	if f.Base.ID != "" {
+		seenCommits[f.Base.ID] = struct{}{}
+	}
+	for i, commit := range f.Commits {
+		if _, err := commit.Commit(); err != nil {
+			return fmt.Errorf("%w: commit %d: %v", ErrInvalidFrame, i, err)
+		}
+		identity, err := commit.Identity()
+		if err != nil {
+			return err
+		}
+		if _, exists := seenCommits[identity.ID]; exists {
+			return fmt.Errorf("%w: commit %d: duplicate commit %s", ErrInvalidFrame, i, identity.ID)
+		}
+		if len(commit.Parents) == 0 && f.Base.ID != "" {
+			return fmt.Errorf("%w: commit %d has no parents in an advancing pack", ErrInvalidFrame, i)
+		}
+		for j, parent := range commit.Parents {
+			if err := parent.Validate(); err != nil {
+				return fmt.Errorf("%w: commit %d parent %d: %v", ErrInvalidFrame, i, j, err)
+			}
+		}
+		seenCommits[identity.ID] = struct{}{}
+	}
+	lastIdentity, err := f.Commits[len(f.Commits)-1].Identity()
+	if err != nil {
+		return err
+	}
+	if lastIdentity != f.Target {
 		return fmt.Errorf("%w: target does not name the final commit frame", ErrInvalidFrame)
 	}
 	seen := make(map[string]struct{}, len(f.Objects))

@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/autonomous-bits/spool/graphcontract"
+
+	serversync "github.com/autonomous-bits/spool-rack/internal/server/sync"
 )
 
 func TestHealthz(t *testing.T) {
@@ -29,8 +31,8 @@ func TestHealthz(t *testing.T) {
 		t.Errorf("expected status 'healthy', got '%s'", resp.Status)
 	}
 
-	if resp.GraphContract.PackFormatVersion != graphcontract.PackFormatVersion {
-		t.Errorf("expected packFormatVersion %d, got %d", graphcontract.PackFormatVersion, resp.GraphContract.PackFormatVersion)
+	if resp.GraphContract.PackFormatVersion != serversync.PackFormatV3 {
+		t.Errorf("expected packFormatVersion %d, got %d", serversync.PackFormatV3, resp.GraphContract.PackFormatVersion)
 	}
 	if resp.GraphContract.PackIndexFormatVersion != graphcontract.PackIndexFormatVersion {
 		t.Errorf("expected packIndexFormatVersion %d, got %d", graphcontract.PackIndexFormatVersion, resp.GraphContract.PackIndexFormatVersion)
@@ -40,9 +42,9 @@ func TestHealthz(t *testing.T) {
 	}
 
 	// By default (no rollout window configured), the accepted min/max range
-	// collapses to the current version on each axis.
-	if resp.GraphContract.PackFormatMinVersion != graphcontract.PackFormatVersion || resp.GraphContract.PackFormatMaxVersion != graphcontract.PackFormatVersion {
-		t.Errorf("expected packFormat min/max to both be %d, got min=%d max=%d", graphcontract.PackFormatVersion, resp.GraphContract.PackFormatMinVersion, resp.GraphContract.PackFormatMaxVersion)
+	// accepts PackFormatV2 through PackFormatV3.
+	if resp.GraphContract.PackFormatMinVersion != serversync.PackFormatV2 || resp.GraphContract.PackFormatMaxVersion != serversync.PackFormatV3 {
+		t.Errorf("expected packFormat min=%d max=%d, got min=%d max=%d", serversync.PackFormatV2, serversync.PackFormatV3, resp.GraphContract.PackFormatMinVersion, resp.GraphContract.PackFormatMaxVersion)
 	}
 	if resp.GraphContract.PackIndexFormatMinVersion != graphcontract.PackIndexFormatVersion || resp.GraphContract.PackIndexFormatMaxVersion != graphcontract.PackIndexFormatVersion {
 		t.Errorf("expected packIndexFormat min/max to both be %d, got min=%d max=%d", graphcontract.PackIndexFormatVersion, resp.GraphContract.PackIndexFormatMinVersion, resp.GraphContract.PackIndexFormatMaxVersion)
