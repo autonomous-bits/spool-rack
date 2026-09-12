@@ -9,10 +9,12 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/cas"
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/postgres"
 	"github.com/autonomous-bits/spool/graphcontract"
+	"github.com/fxamacker/cbor/v2"
 	"lukechampine.com/blake3"
 )
 
@@ -687,6 +689,34 @@ func (f *fakeCASDriver) WritePack(_ context.Context, _ cas.Scope, _ string, _ io
 	return f.writePackErr
 }
 
+func (f *fakeCASDriver) WriteAsset(_ context.Context, _ cas.Scope, hash string, r io.Reader) (int64, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return 0, err
+	}
+	if f.objects == nil {
+		f.objects = make(map[string][]byte)
+	}
+	f.objects[hash] = data
+	return int64(len(data)), nil
+}
+
+func (f *fakeCASDriver) OpenAsset(_ context.Context, _ cas.Scope, hash string) (io.ReadCloser, int64, error) {
+	data, ok := f.objects[hash]
+	if !ok {
+		return nil, 0, cas.ErrNotFound
+	}
+	return io.NopCloser(bytes.NewReader(data)), int64(len(data)), nil
+}
+
+func (f *fakeCASDriver) AssetExists(_ context.Context, _ cas.Scope, hash string) (bool, error) {
+	if f.objects == nil {
+		return false, nil
+	}
+	_, ok := f.objects[hash]
+	return ok, nil
+}
+
 func testWorkspaceDir(t *testing.T) string {
 	t.Helper()
 
@@ -904,5 +934,112 @@ func TestPushEngineHandlePushAcceptsV3DAGPack(t *testing.T) {
 	}
 	if store2.branchHeads["main"] != targetID.ID {
 		t.Fatalf("branch head = %q, want %q", store2.branchHeads["main"], targetID.ID)
+	}
+}
+
+func TestPushEngineHandlePush_AssetVerificationGate(t *testing.T) {
+	t.Parallel()
+
+	assetHash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	nodeID := "asset-node-1"
+
+	// Construct snapshot CBOR with node containing assetUri
+	envelope := struct {
+		Version uint32                        `cbor:"1,keyasint"`
+		Nodes   map[string]graphcontract.Node `cbor:"3,keyasint"`
+		Edges   map[string]graphcontract.Edge `cbor:"4,keyasint"`
+	}{
+		Version: 3,
+		Nodes: map[string]graphcontract.Node{
+			nodeID: {
+				ID:    nodeID,
+				Title: "Referenced Asset Spec",
+				Properties: map[string]graphcontract.PropertyValue{
+					"assetUri": {
+						Kind:   graphcontract.PropertyString,
+						String: "spool://assets/" + assetHash,
+					},
+				},
+			},
+		},
+		Edges: map[string]graphcontract.Edge{},
+	}
+
+	snapData, err := cbor.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("cbor.Marshal envelope: %v", err)
+	}
+	snapRoot := ContentID(snapData)
+
+	baseID := V2CommitIdentity(hashString("commit-base-0"))
+
+	commitA := CommitFrameV2{
+		Version:      CommitFormatV2,
+		SnapshotRoot: snapRoot,
+		Parents:      []CommitIdentity{baseID},
+		Author:       "Engineer <eng@spool.dev>",
+		Message:      "commit with asset reference",
+		Time:         time.Unix(1000, 0),
+	}
+	targetID, err := commitA.Identity()
+	if err != nil {
+		t.Fatalf("commitA.Identity: %v", err)
+	}
+
+	packData, err := MarshalPackFrameV2(PackFrameV2{
+		Version: PackFormatV2,
+		Base:    baseID,
+		Target:  targetID,
+		Commits: []CommitFrameV2{commitA},
+		Objects: []PackObjectV2{{ID: snapRoot, Data: snapData}},
+	})
+	if err != nil {
+		t.Fatalf("MarshalPackFrameV2: %v", err)
+	}
+
+	driver := &fakeCASDriver{}
+	store := &fakeBranchStore{
+		branchHeads: map[string]string{"main": baseID.ID},
+		commitFormat: map[string]uint32{baseID.ID: CommitFormatV2},
+	}
+	engine := NewPushEngine(driver, store, func([]byte) error { return nil })
+
+	req := PushRequest{
+		TenantID:     "tenant-asset",
+		RepoID:       "repo-asset",
+		Branch:       "main",
+		BaseCommit:   baseID.ID,
+		TargetCommit: targetID.ID,
+		Commits: []CommitRecord{
+			mustCommitRecord(t, commitA),
+		},
+		PackHash:   ContentID(packData),
+		PackFormat: PackFormatV2,
+		PackStream: bytes.NewReader(packData),
+	}
+
+	// 1. Without asset in CAS, push must be rejected by asset gate (fail-closed)
+	err = engine.HandlePush(context.Background(), req)
+	if !errors.Is(err, ErrMissingAsset) {
+		t.Fatalf("expected ErrMissingAsset, got: %v", err)
+	}
+	if store.branchHeads["main"] != baseID.ID {
+		t.Fatalf("branch ref must remain baseID on asset rejection, got %q", store.branchHeads["main"])
+	}
+
+	// 2. Write asset into CAS
+	scope, _ := cas.NewScope("tenant-asset", "repo-asset")
+	_, err = driver.WriteAsset(context.Background(), scope, assetHash, bytes.NewReader([]byte("asset blob content")))
+	if err != nil {
+		t.Fatalf("WriteAsset: %v", err)
+	}
+
+	// 3. Retry push with reset pack stream: must succeed
+	req.PackStream = bytes.NewReader(packData)
+	if err := engine.HandlePush(context.Background(), req); err != nil {
+		t.Fatalf("HandlePush with asset in CAS failed: %v", err)
+	}
+	if store.branchHeads["main"] != targetID.ID {
+		t.Fatalf("expected branch head %q, got %q", targetID.ID, store.branchHeads["main"])
 	}
 }

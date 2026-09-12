@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"time"
 
 	"github.com/autonomous-bits/spool/graphcontract"
 
+	"github.com/autonomous-bits/spool-rack/internal/server/asset"
 	"github.com/autonomous-bits/spool-rack/internal/server/audit"
 	"github.com/autonomous-bits/spool-rack/internal/server/auth"
 	"github.com/autonomous-bits/spool-rack/internal/server/review"
@@ -31,6 +33,7 @@ type Gateway struct {
 	previewEngine review.Engine
 	mergeEngine   review.Finalizer
 	auditLogger   *audit.Logger
+	assetService  *asset.Service
 	mux           *http.ServeMux
 
 	branchLifecycleStore BranchLifecycleStore
@@ -58,6 +61,11 @@ func WithVerifier(verifier auth.Verifier) Option {
 // WithCASDriver configures the Gateway's CAS driver for push handling.
 func WithCASDriver(driver cas.Driver) Option {
 	return func(g *Gateway) { g.casDriver = driver }
+}
+
+// WithAssetService configures the Gateway's remote asset management service.
+func WithAssetService(service *asset.Service) Option {
+	return func(g *Gateway) { g.assetService = service }
 }
 
 // WithBranchStore configures the Gateway's branch store for push handling.
@@ -150,6 +158,11 @@ func New(opts ...Option) *Gateway {
 	if g.tenantWorkspaceStore == nil && g.branchStore != nil {
 		if wsStore, ok := g.branchStore.(TenantWorkspaceStore); ok {
 			g.tenantWorkspaceStore = wsStore
+		}
+	}
+	if g.assetService == nil && g.casDriver != nil && g.branchStore != nil {
+		if assetStore, ok := g.branchStore.(asset.Store); ok {
+			g.assetService = asset.NewService(g.casDriver, assetStore)
 		}
 	}
 	g.registerRoutes()
@@ -356,6 +369,52 @@ func (g *Gateway) registerRoutes() {
 		Authenticate(g.logger, g.verifier)(
 			RequireRepoScope(g.logger)(
 				RequireRole(g.logger, auth.RoleContributor)(http.HandlerFunc(g.handleDeleteBranch)),
+			),
+		),
+	)
+
+	// Contextual asset reference routes (repository endpoints)
+	g.mux.Handle("POST /api/v1/repos/{repo}/assets/negotiate",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleContributor)(http.HandlerFunc(g.handleAssetNegotiate)),
+			),
+		),
+	)
+	g.mux.Handle("PUT /api/v1/repos/{repo}/assets/blobs/{hash}",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleContributor)(http.HandlerFunc(g.handleAssetUpload)),
+			),
+		),
+	)
+	g.mux.Handle("GET /api/v1/repos/{repo}/assets/blobs/{hash}",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleViewer)(http.HandlerFunc(g.handleAssetStream)),
+			),
+		),
+	)
+
+	// Contextual asset reference routes (workspace endpoints)
+	g.mux.Handle("POST /api/v1/workspaces/{workspace}/assets/negotiate",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleContributor)(http.HandlerFunc(g.handleAssetNegotiate)),
+			),
+		),
+	)
+	g.mux.Handle("PUT /api/v1/workspaces/{workspace}/assets/blobs/{hash}",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleContributor)(http.HandlerFunc(g.handleAssetUpload)),
+			),
+		),
+	)
+	g.mux.Handle("GET /api/v1/workspaces/{workspace}/assets/blobs/{hash}",
+		Authenticate(g.logger, g.verifier)(
+			RequireRepoScope(g.logger)(
+				RequireRole(g.logger, auth.RoleViewer)(http.HandlerFunc(g.handleAssetStream)),
 			),
 		),
 	)
@@ -1011,4 +1070,122 @@ func (g *Gateway) handlePush(w http.ResponseWriter, r *http.Request) {
 			_ = part.Close()
 		}
 	}
+}
+
+func (g *Gateway) handleAssetNegotiate(w http.ResponseWriter, r *http.Request) {
+	if g.assetService == nil {
+		writeJSONError(w, r, g.logger, http.StatusNotImplemented, ErrorCodeNotImplemented, "asset service is not configured on this server")
+		return
+	}
+
+	var req asset.NegotiationRequest
+	if !decodeSingleJSON(w, r, g.logger, &req) {
+		return
+	}
+
+	scope, ok := ScopeFromContext(r.Context())
+	if !ok {
+		writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "missing repository scope")
+		return
+	}
+
+	result, err := g.assetService.Negotiate(r.Context(), scope, req)
+	if err != nil {
+		if errors.Is(err, asset.ErrQuotaExceeded) {
+			writeJSONError(w, r, g.logger, http.StatusForbidden, "QUOTA_EXCEEDED", err.Error())
+			return
+		}
+		writeJSONError(w, r, g.logger, http.StatusInternalServerError, ErrorCodeInternal, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+func (g *Gateway) handleAssetUpload(w http.ResponseWriter, r *http.Request) {
+	if g.assetService == nil {
+		writeJSONError(w, r, g.logger, http.StatusNotImplemented, ErrorCodeNotImplemented, "asset service is not configured on this server")
+		return
+	}
+
+	hash := r.PathValue("hash")
+	if hash == "" {
+		writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "asset hash is required")
+		return
+	}
+
+	scope, ok := ScopeFromContext(r.Context())
+	if !ok {
+		writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "missing repository scope")
+		return
+	}
+
+	var size int64 = r.ContentLength
+	contentType := r.Header.Get("Content-Type")
+
+	written, err := g.assetService.Upload(r.Context(), scope, hash, size, contentType, r.Body)
+	if err != nil {
+		if errors.Is(err, asset.ErrQuotaExceeded) {
+			writeJSONError(w, r, g.logger, http.StatusForbidden, "QUOTA_EXCEEDED", err.Error())
+			return
+		}
+		if errors.Is(err, cas.ErrHashMismatch) {
+			writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, err.Error())
+			return
+		}
+		writeJSONError(w, r, g.logger, http.StatusInternalServerError, ErrorCodeInternal, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"hash":   hash,
+		"size":   written,
+		"status": "stored",
+	})
+}
+
+func (g *Gateway) handleAssetStream(w http.ResponseWriter, r *http.Request) {
+	if g.assetService == nil {
+		writeJSONError(w, r, g.logger, http.StatusNotImplemented, ErrorCodeNotImplemented, "asset service is not configured on this server")
+		return
+	}
+
+	hash := r.PathValue("hash")
+	if hash == "" {
+		writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "asset hash is required")
+		return
+	}
+
+	scope, ok := ScopeFromContext(r.Context())
+	if !ok {
+		writeJSONError(w, r, g.logger, http.StatusBadRequest, ErrorCodeBadRequest, "missing repository scope")
+		return
+	}
+
+	rc, size, mimeType, err := g.assetService.Open(r.Context(), scope, hash)
+	if err != nil {
+		if errors.Is(err, asset.ErrNotFound) {
+			writeJSONError(w, r, g.logger, http.StatusNotFound, ErrorCodeNotFound, "asset blob not found")
+			return
+		}
+		writeJSONError(w, r, g.logger, http.StatusInternalServerError, ErrorCodeInternal, err.Error())
+		return
+	}
+	defer rc.Close()
+
+	w.Header().Set("Content-Type", mimeType)
+	w.Header().Set("Accept-Ranges", "bytes")
+
+	if seeker, ok := rc.(io.ReadSeeker); ok {
+		http.ServeContent(w, r, hash, time.Time{}, seeker)
+		return
+	}
+
+	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.Copy(w, rc)
 }
