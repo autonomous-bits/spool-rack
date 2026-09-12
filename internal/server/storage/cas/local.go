@@ -22,6 +22,7 @@ const (
 	reposDir   = "repos"
 	objectsDir = "objects"
 	packsDir   = "packs"
+	assetsDir  = "assets"
 	tmpDir     = "tmp"
 
 	dirPerm  = 0o755
@@ -258,6 +259,108 @@ func (d *LocalDriver) WritePack(ctx context.Context, scope Scope, packHash strin
 	return nil
 }
 
+// WriteAsset persists a validated asset blob stream, fenced to scope,
+// verifying its BLAKE3 hash before making it durable.
+func (d *LocalDriver) WriteAsset(ctx context.Context, scope Scope, hash string, r io.Reader) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if err := validateHash(hash); err != nil {
+		return 0, err
+	}
+	dest, err := d.assetPath(scope, hash)
+	if err != nil {
+		return 0, err
+	}
+	tmp, err := d.scopeTmpDir(scope)
+	if err != nil {
+		return 0, err
+	}
+
+	if info, err := os.Stat(dest); err == nil {
+		// Already durable under this hash; drain reader and return size
+		if _, err := io.Copy(io.Discard, r); err != nil {
+			return 0, fmt.Errorf("cas: drain existing asset %s: %w", hash, err)
+		}
+		return info.Size(), nil
+	} else if !os.IsNotExist(err) {
+		return 0, fmt.Errorf("cas: stat asset %s: %w", hash, err)
+	}
+
+	hasher := blake3.New(hashSize, nil)
+	tee := io.TeeReader(r, hasher)
+	var written int64
+
+	if err := writeFileAtomic(tmp, dest, func(w io.Writer) error {
+		n, err := io.Copy(w, tee)
+		written = n
+		return err
+	}); err != nil {
+		return 0, fmt.Errorf("cas: write asset %s: %w", hash, err)
+	}
+
+	sum := hex.EncodeToString(hasher.Sum(nil))
+	if sum != hash {
+		if rmErr := os.Remove(dest); rmErr != nil && !os.IsNotExist(rmErr) {
+			return 0, fmt.Errorf("%w: asset %s (also failed to remove invalid asset: %v)", ErrHashMismatch, hash, rmErr)
+		}
+		return 0, fmt.Errorf("%w: asset %s", ErrHashMismatch, hash)
+	}
+	return written, nil
+}
+
+// OpenAsset opens a content-addressed asset blob for streaming, fenced to scope.
+func (d *LocalDriver) OpenAsset(ctx context.Context, scope Scope, hash string) (io.ReadCloser, int64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	if err := validateHash(hash); err != nil {
+		return nil, 0, err
+	}
+	path, err := d.assetPath(scope, hash)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, 0, ErrNotFound
+		}
+		return nil, 0, fmt.Errorf("cas: open asset %s: %w", hash, err)
+	}
+
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, 0, fmt.Errorf("cas: stat asset %s: %w", hash, err)
+	}
+
+	return f, info.Size(), nil
+}
+
+// AssetExists reports whether an asset blob exists in storage, fenced to scope.
+func (d *LocalDriver) AssetExists(ctx context.Context, scope Scope, hash string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if err := validateHash(hash); err != nil {
+		return false, err
+	}
+	path, err := d.assetPath(scope, hash)
+	if err != nil {
+		return false, err
+	}
+
+	if _, err := os.Stat(path); err == nil {
+		return true, nil
+	} else if os.IsNotExist(err) {
+		return false, nil
+	} else {
+		return false, fmt.Errorf("cas: stat asset %s: %w", hash, err)
+	}
+}
+
 // DeletePack removes a packfile by packfile hash, fenced to scope. It is not
 // part of the Driver interface: retention/GC callers type-assert for it
 // (see retention.PackDeleter) so that a Driver implementation without
@@ -334,6 +437,18 @@ func (d *LocalDriver) packPath(scope Scope, packHash string) (string, error) {
 		return "", err
 	}
 	return safeJoin(root, packsDir, canonicalHash+".spack")
+}
+
+func (d *LocalDriver) assetPath(scope Scope, hash string) (string, error) {
+	root, err := d.scopeRoot(scope)
+	if err != nil {
+		return "", err
+	}
+	canonicalHash, err := canonicalHashString(hash)
+	if err != nil {
+		return "", err
+	}
+	return safeJoin(root, assetsDir, canonicalHash[:2], canonicalHash[2:])
 }
 
 // validateHash rejects any hash that is not a well-formed lowercase hex

@@ -6,15 +6,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/cas"
 	"github.com/autonomous-bits/spool-rack/internal/server/storage/postgres"
 	"github.com/autonomous-bits/spool/graphcontract"
+	"github.com/fxamacker/cbor/v2"
 )
 
 // ErrNonFastForward indicates a push was rejected because advancing the remote
 // branch would not be a fast-forward update.
 var ErrNonFastForward = errors.New("sync: non-fast-forward push rejected")
+
+// ErrMissingAsset indicates a commit snapshot references an asset blob not found in CAS.
+var ErrMissingAsset = errors.New("sync: push: referenced asset blob missing from storage")
 
 // ErrUnsupportedContractVersion indicates a client declared a graphcontract
 // pack format version outside the range this server currently accepts. It is
@@ -312,11 +317,51 @@ func (e *PushEngine) writePack(ctx context.Context, scope cas.Scope, req PushReq
 		if err := e.snapshotValidator(snapshot); err != nil {
 			return nil, fmt.Errorf("%w: snapshot %s: %v", ErrInvalidFrame, commit.SnapshotRoot, err)
 		}
+		if err := e.verifySnapshotAssets(ctx, scope, snapshot); err != nil {
+			return nil, err
+		}
 	}
 	if err := e.driver.WritePack(ctx, scope, req.PackHash, bytes.NewReader(data)); err != nil {
 		return nil, err
 	}
 	return &base, nil
+}
+
+type snapshotAssetScan struct {
+	Nodes map[string]graphcontract.Node `cbor:"3,keyasint"`
+}
+
+func (e *PushEngine) verifySnapshotAssets(ctx context.Context, scope cas.Scope, snapshotData []byte) error {
+	var scan snapshotAssetScan
+	if err := cbor.Unmarshal(snapshotData, &scan); err != nil {
+		// Non-CBOR or legacy/test data without valid node envelope
+		return nil
+	}
+	if len(scan.Nodes) == 0 {
+		return nil
+	}
+
+	for _, node := range scan.Nodes {
+		prop, ok := node.Properties["assetUri"]
+		if !ok || prop.Kind != graphcontract.PropertyString {
+			continue
+		}
+		uri := strings.TrimSpace(prop.String)
+		hash := strings.TrimPrefix(uri, "spool://assets/")
+		hash = strings.ToLower(strings.TrimSpace(hash))
+		if hash == "" {
+			continue
+		}
+
+		exists, err := e.driver.AssetExists(ctx, scope, hash)
+		if err != nil {
+			return fmt.Errorf("sync: push: check asset %s: %w", hash, err)
+		}
+		if !exists {
+			return fmt.Errorf("%w: node %s references missing asset blob %s", ErrMissingAsset, node.ID, hash)
+		}
+	}
+	return nil
 }
 
 func (e *PushEngine) validateV2BaseFormat(ctx context.Context, repoID string, base CommitIdentity) error {

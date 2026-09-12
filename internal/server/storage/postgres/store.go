@@ -91,6 +91,10 @@ var (
 	// push always supplies identical values, so this can only mean the
 	// idempotency key (the pack's PackID) was reused for an unrelated push.
 	ErrNativePushIdempotencyConflict = errors.New("postgres: native push idempotency key reused with different push parameters")
+	// ErrQuotaExceeded indicates the requested upload exceeds the tenant's allocated storage quota.
+	ErrQuotaExceeded = errors.New("postgres: tenant storage quota exceeded")
+	// ErrAssetNotFound indicates the requested asset metadata row was not found.
+	ErrAssetNotFound = errors.New("postgres: asset not found")
 	errNilContext                    = errors.New("postgres: nil context")
 
 	uuidV4Pattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
@@ -2245,3 +2249,222 @@ func isForeignKeyViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23503"
 }
+
+// AssetRecord represents an asset metadata row in PostgreSQL.
+type AssetRecord struct {
+	TenantID  string    `json:"tenantId"`
+	RepoID    string    `json:"repoId"`
+	Hash      string    `json:"hash"`
+	SizeBytes int64     `json:"sizeBytes"`
+	MIMEType  string    `json:"mimeType"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+func resolveRepoUUID(ctx context.Context, tx pgx.Tx, tenantID, repoIDOrName string) (string, error) {
+	if uuidV4Pattern.MatchString(repoIDOrName) {
+		return repoIDOrName, nil
+	}
+	var id string
+	err := tx.QueryRow(ctx, `SELECT id FROM repositories WHERE tenant_id = $1 AND name = $2 LIMIT 1`, tenantID, repoIDOrName).Scan(&id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrRepositoryNotFound
+		}
+		return "", err
+	}
+	return id, nil
+}
+
+// AdmitAssetUpload checks if an asset upload is permitted under the tenant's storage quota.
+// If the asset has already been registered for this repository, it is deduplicated and admitted immediately.
+// Otherwise, the tenant row is locked with SELECT ... FOR UPDATE to atomically verify
+// that storage_used_bytes + sizeBytes <= storage_quota_bytes.
+func (s *PGStore) AdmitAssetUpload(ctx context.Context, repoID, hash string, sizeBytes int64) error {
+	tenantID, err := requireTenantID(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres: admit asset upload: %w", err)
+	}
+
+	return s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		actualRepoID, err := resolveRepoUUID(ctx, tx, tenantID, repoID)
+		if err != nil {
+			return err
+		}
+
+		// Check if asset already exists
+		var exists bool
+		err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM assets WHERE tenant_id = $1 AND repo_id = $2 AND hash = $3)`, tenantID, actualRepoID, hash).Scan(&exists)
+		if err != nil {
+			return fmt.Errorf("check asset exists: %w", err)
+		}
+		if exists {
+			return nil
+		}
+
+		// Row-lock tenant to check quota
+		var quota, used int64
+		err = tx.QueryRow(ctx, `SELECT storage_quota_bytes, storage_used_bytes FROM tenants WHERE id = $1 FOR UPDATE`, tenantID).Scan(&quota, &used)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrTenantNotFound
+			}
+			return fmt.Errorf("lock tenant for quota check: %w", err)
+		}
+
+		if quota > 0 && (used+sizeBytes) > quota {
+			return ErrQuotaExceeded
+		}
+		return nil
+	})
+}
+
+// RegisterAsset records an asset in the repository's metadata registry and updates tenant usage under row lock.
+func (s *PGStore) RegisterAsset(ctx context.Context, repoID, hash string, sizeBytes int64, mimeType string) error {
+	tenantID, err := requireTenantID(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres: register asset: %w", err)
+	}
+
+	return s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		actualRepoID, err := resolveRepoUUID(ctx, tx, tenantID, repoID)
+		if err != nil {
+			return err
+		}
+
+		// Check if asset already exists
+		var exists bool
+		err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM assets WHERE tenant_id = $1 AND repo_id = $2 AND hash = $3)`, tenantID, actualRepoID, hash).Scan(&exists)
+		if err != nil {
+			return fmt.Errorf("check asset exists: %w", err)
+		}
+		if exists {
+			return nil
+		}
+
+		// Row-lock tenant to verify quota and update usage
+		var quota, used int64
+		err = tx.QueryRow(ctx, `SELECT storage_quota_bytes, storage_used_bytes FROM tenants WHERE id = $1 FOR UPDATE`, tenantID).Scan(&quota, &used)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrTenantNotFound
+			}
+			return fmt.Errorf("lock tenant for quota update: %w", err)
+		}
+
+		if quota > 0 && (used+sizeBytes) > quota {
+			return ErrQuotaExceeded
+		}
+
+		// Insert asset row
+		_, err = tx.Exec(ctx, `
+			INSERT INTO assets (tenant_id, repo_id, hash, size_bytes, mime_type, created_at)
+			VALUES ($1, $2, $3, $4, $5, now())
+			ON CONFLICT (tenant_id, repo_id, hash) DO NOTHING
+		`, tenantID, actualRepoID, hash, sizeBytes, mimeType)
+		if err != nil {
+			return fmt.Errorf("insert asset: %w", err)
+		}
+
+		// Increment storage_used_bytes
+		_, err = tx.Exec(ctx, `UPDATE tenants SET storage_used_bytes = storage_used_bytes + $1 WHERE id = $2`, sizeBytes, tenantID)
+		if err != nil {
+			return fmt.Errorf("update tenant used bytes: %w", err)
+		}
+
+		return nil
+	})
+}
+
+// GetAssetMetadata retrieves an asset metadata record by hash.
+func (s *PGStore) GetAssetMetadata(ctx context.Context, repoID, hash string) (AssetRecord, error) {
+	tenantID, err := requireTenantID(ctx)
+	if err != nil {
+		return AssetRecord{}, fmt.Errorf("postgres: get asset metadata: %w", err)
+	}
+
+	var rec AssetRecord
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		actualRepoID, err := resolveRepoUUID(ctx, tx, tenantID, repoID)
+		if err != nil {
+			return err
+		}
+
+		query := `SELECT tenant_id, repo_id, hash, size_bytes, mime_type, created_at FROM assets WHERE tenant_id = $1 AND repo_id = $2 AND hash = $3`
+		err = tx.QueryRow(ctx, query, tenantID, actualRepoID, hash).Scan(&rec.TenantID, &rec.RepoID, &rec.Hash, &rec.SizeBytes, &rec.MIMEType, &rec.CreatedAt)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrAssetNotFound
+			}
+			return fmt.Errorf("query asset: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return AssetRecord{}, err
+	}
+	return rec, nil
+}
+
+// ListMissingAssets returns the subset of candidateHashes that are not yet recorded in the assets registry.
+func (s *PGStore) ListMissingAssets(ctx context.Context, repoID string, candidateHashes []string) ([]string, error) {
+	tenantID, err := requireTenantID(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list missing assets: %w", err)
+	}
+	if len(candidateHashes) == 0 {
+		return nil, nil
+	}
+
+	var missing []string
+	if err := s.withTenantTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		actualRepoID, err := resolveRepoUUID(ctx, tx, tenantID, repoID)
+		if err != nil {
+			return err
+		}
+
+		rows, err := tx.Query(ctx, `SELECT hash FROM assets WHERE tenant_id = $1 AND repo_id = $2 AND hash = ANY($3)`, tenantID, actualRepoID, candidateHashes)
+		if err != nil {
+			return fmt.Errorf("query existing assets: %w", err)
+		}
+		defer rows.Close()
+
+		existing := make(map[string]struct{})
+		for rows.Next() {
+			var h string
+			if err := rows.Scan(&h); err != nil {
+				return fmt.Errorf("scan asset hash: %w", err)
+			}
+			existing[h] = struct{}{}
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		for _, h := range candidateHashes {
+			if _, ok := existing[h]; !ok {
+				missing = append(missing, h)
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return missing, nil
+}
+
+// SetTenantStorageQuota sets the maximum storage quota in bytes for a tenant (0 means unlimited).
+func (s *PGStore) SetTenantStorageQuota(ctx context.Context, tenantID string, quotaBytes int64) error {
+	if !uuidV4Pattern.MatchString(tenantID) {
+		return fmt.Errorf("postgres: set tenant storage quota: %w", ErrTenantNotFound)
+	}
+	return s.withConfiguredTenantTx(ctx, tenantID, func(ctx context.Context, tx pgx.Tx) error {
+		cmd, err := tx.Exec(ctx, `UPDATE tenants SET storage_quota_bytes = $1 WHERE id = $2`, quotaBytes, tenantID)
+		if err != nil {
+			return fmt.Errorf("update storage quota: %w", err)
+		}
+		if cmd.RowsAffected() == 0 {
+			return ErrTenantNotFound
+		}
+		return nil
+	})
+}
+

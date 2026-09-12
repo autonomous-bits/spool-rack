@@ -141,6 +141,13 @@ func (f *fakeDriver) OpenPack(context.Context, cas.Scope, string) (io.ReadCloser
 	return nil, errors.New("fakeDriver: OpenPack not supported")
 }
 func (f *fakeDriver) WritePack(context.Context, cas.Scope, string, io.Reader) error { return nil }
+func (f *fakeDriver) WriteAsset(context.Context, cas.Scope, string, io.Reader) (int64, error) {
+	return 0, nil
+}
+func (f *fakeDriver) OpenAsset(context.Context, cas.Scope, string) (io.ReadCloser, int64, error) {
+	return nil, 0, errors.New("fakeDriver: OpenAsset not supported")
+}
+func (f *fakeDriver) AssetExists(context.Context, cas.Scope, string) (bool, error) { return false, nil }
 func (f *fakeDriver) DeletePack(_ context.Context, scope cas.Scope, hash string) error {
 	f.deletes = append(f.deletes, deletedPackCall{tenantID: scope.TenantID(), repoID: scope.RepoID(), hash: hash})
 	return nil
@@ -486,5 +493,12 @@ func (noopDriver) OpenPack(context.Context, cas.Scope, string) (io.ReadCloser, e
 	return nil, errors.New("noopDriver: OpenPack not supported")
 }
 func (noopDriver) WritePack(context.Context, cas.Scope, string, io.Reader) error { return nil }
+func (noopDriver) WriteAsset(context.Context, cas.Scope, string, io.Reader) (int64, error) {
+	return 0, nil
+}
+func (noopDriver) OpenAsset(context.Context, cas.Scope, string) (io.ReadCloser, int64, error) {
+	return nil, 0, errors.New("noopDriver: OpenAsset not supported")
+}
+func (noopDriver) AssetExists(context.Context, cas.Scope, string) (bool, error) { return false, nil }
 
 var _ cas.Driver = noopDriver{}

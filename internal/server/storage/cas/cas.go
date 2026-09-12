@@ -77,4 +77,10 @@ type Driver interface {
 	OpenPack(ctx context.Context, scope Scope, packHash string) (io.ReadCloser, error)
 	// WritePack persists a validated packfile stream, scoped to a single tenant/repository.
 	WritePack(ctx context.Context, scope Scope, packHash string, r io.Reader) error
+	// WriteAsset streams a validated asset blob, scoped to a single tenant/repository.
+	WriteAsset(ctx context.Context, scope Scope, hash string, r io.Reader) (int64, error)
+	// OpenAsset opens a content-addressed asset blob for streaming, scoped to a single tenant/repository.
+	OpenAsset(ctx context.Context, scope Scope, hash string) (io.ReadCloser, int64, error)
+	// AssetExists reports whether an asset blob exists in storage, scoped to a single tenant/repository.
+	AssetExists(ctx context.Context, scope Scope, hash string) (bool, error)
 }
