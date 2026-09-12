@@ -999,7 +999,7 @@ func TestPushEngineHandlePush_AssetVerificationGate(t *testing.T) {
 
 	driver := &fakeCASDriver{}
 	store := &fakeBranchStore{
-		branchHeads: map[string]string{"main": baseID.ID},
+		branchHeads:  map[string]string{"main": baseID.ID},
 		commitFormat: map[string]uint32{baseID.ID: CommitFormatV2},
 	}
 	engine := NewPushEngine(driver, store, func([]byte) error { return nil })

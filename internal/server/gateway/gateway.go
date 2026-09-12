@@ -1122,7 +1122,7 @@ func (g *Gateway) handleAssetUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var size int64 = r.ContentLength
+	size := r.ContentLength
 	contentType := r.Header.Get("Content-Type")
 
 	written, err := g.assetService.Upload(r.Context(), scope, hash, size, contentType, r.Body)
@@ -1175,7 +1175,11 @@ func (g *Gateway) handleAssetStream(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, r, g.logger, http.StatusInternalServerError, ErrorCodeInternal, err.Error())
 		return
 	}
-	defer rc.Close()
+	defer func() {
+		if err := rc.Close(); err != nil {
+			g.logger.Error("close asset reader", "error", err)
+		}
+	}()
 
 	w.Header().Set("Content-Type", mimeType)
 	w.Header().Set("Accept-Ranges", "bytes")

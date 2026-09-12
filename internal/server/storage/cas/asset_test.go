@@ -68,7 +68,11 @@ func TestLocalDriver_AssetOperations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenAsset: %v", err)
 	}
-	defer rc.Close()
+	defer func() {
+		if err := rc.Close(); err != nil {
+			t.Errorf("close asset reader: %v", err)
+		}
+	}()
 	if size != int64(len(payload)) {
 		t.Fatalf("expected size %d, got %d", len(payload), size)
 	}

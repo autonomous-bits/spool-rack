@@ -5,7 +5,7 @@ development workflow and the checks required before opening a pull request.
 
 ## Prerequisites
 
-- Go 1.26 or later
+- Go 1.26.6 or later
 - Docker Engine with Docker Compose
 - PostgreSQL is provided by the Compose development stack
 

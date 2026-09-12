@@ -11,7 +11,7 @@ content-addressed storage and manages repository metadata in PostgreSQL.
 - [`spl` CLI](https://github.com/autonomous-bits/spool) v1.5.0 or later to
   create, clone, push, and pull Spool workspaces
 
-To build or run the server outside Docker, install Go 1.26 or later and
+To build or run the server outside Docker, install Go 1.26.6 or later and
 PostgreSQL 16.
 
 ## Install and start
