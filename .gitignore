@@ -19,3 +19,5 @@ coverage.out
 # Locks
 *.lock
 .spl/*.lock
+
+.mcp.json
