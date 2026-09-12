@@ -162,7 +162,7 @@ func (s *Service) Open(ctx context.Context, scope cas.Scope, hash string) (io.Re
 		return nil, 0, "", ErrMissingHash
 	}
 
-	var mimeType string = "application/octet-stream"
+	mimeType := "application/octet-stream"
 	if s.store != nil {
 		if rec, err := s.store.GetAssetMetadata(ctx, scope.RepoID(), cleanHash); err == nil {
 			if rec.MIMEType != "" {

@@ -1,460 +1,142 @@
 # Spool Rack
 
-Spool Rack is the central remote synchronization server and repository host for [Spool](https://github.com/autonomous-bits/spool) graph version-control repositories.
+Spool Rack is the remote synchronization server and repository host for
+[Spool](https://github.com/autonomous-bits/spool) graph version-control
+repositories. It stores immutable packs and snapshot objects in
+content-addressed storage and manages repository metadata in PostgreSQL.
 
-It provides:
-- **Content-Addressed Storage (CAS)** for immutable packs and snapshot object blobs.
-- **Commit DAG & Branch Governance** stored in PostgreSQL with strict tenant boundary isolation enforced via Row-Level Security (RLS).
-- **V2 Native Pack Exchange** supporting verified push transactions, thin packs, fast-forward branch advances, and conflict diagnosis.
-- **REST Sync API** compatible with the `spl remote`, `spl push`, and `spl pull` CLI commands.
+## Requirements
 
----
+- Docker Engine with Docker Compose
+- [`spl` CLI](https://github.com/autonomous-bits/spool) v1.5.0 or later to
+  create, clone, push, and pull Spool workspaces
 
-## Architecture & Storage
+To build or run the server outside Docker, install Go 1.26.6 or later and
+PostgreSQL 16.
 
-Spool Rack separates immutable payload blobs from relational DAG metadata:
+## Install and start
 
-```
-                  ┌───────────────────────┐
-                  │    Spool CLI (spl)    │
-                  └──────────┬────────────┘
-                             │ HTTP/JSON + V2 Pack Stream
-                             ▼
-                  ┌───────────────────────┐
-                  │      Spool Rack       │
-                  │   (Gateway & Sync)    │
-                  └──────┬─────────┬──────┘
-                         │         │
-       CAS Object Blobs  │         │  Commit DAG & Branches
-                         ▼         ▼
-             ┌──────────────┐   ┌─────────────────┐
-             │ File / S3    │   │   PostgreSQL    │
-             │ CAS Storage  │   │  (RLS Enabled)  │
-             └──────────────┘   └─────────────────┘
-```
-
-- **CAS Storage (`/var/lib/spool-rack`)**:
-  Stores pack files (`.spack`) and individual graph snapshot objects indexed by BLAKE3 hashes under tenant- and repository-scoped directories:
-  `/var/lib/spool-rack/tenants/<tenant_hash>/repos/<repo_hash>/[packs|objects]/`
-- **PostgreSQL**:
-  Stores tenants, repositories, branches, commit metadata, parent links, and pack ranges. Multi-tenancy is enforced on every query via `app.current_tenant_id`.
-
----
-
-## Quickstart (Docker Compose)
-
-### 1. Start Services
-
-To launch Spool Rack and its PostgreSQL dependency:
+Clone this repository and start Spool Rack with its PostgreSQL dependency:
 
 ```bash
+git clone https://github.com/autonomous-bits/spool-rack.git
+cd spool-rack
 docker compose up -d --build
 ```
 
-This starts:
-- **Spool Rack API**: listening on `http://127.0.0.1:8080` (health check at `http://127.0.0.1:8080/healthz`).
-- **PostgreSQL 16**: listening on host port `5433` (internal port `5432`).
+The Compose configuration:
 
-### 2. Environment Configuration
+- serves the API at `http://127.0.0.1:8080`;
+- publishes PostgreSQL at `127.0.0.1:5433`;
+- persists PostgreSQL and content-addressed data in Docker volumes; and
+- seeds a development tenant and workspace.
 
-The following variables configure the server (defined in `docker-compose.yml`):
-
-| Variable | Description | Default in Compose |
-|---|---|---|
-| `PORT` | HTTP server port | `8080` |
-| `CAS_ROOT` | Directory for content-addressed files | `/var/lib/spool-rack` |
-| `POSTGRES_DSN` | Application database connection string | `postgres://spool_app:...@postgres:5432/spool_rack` |
-| `POSTGRES_MIGRATIONS_DSN` | Privileged connection string for schema migrations | `postgres://spool:...@postgres:5432/spool_rack` |
-| `DEV_TENANT_ID` | Seeded tenant UUID for local development | `00000000-0000-4000-8000-000000000001` |
-| `DEV_REPO_ID` | Seeded repository UUID for local development | `00000000-0000-4000-8000-000000000002` |
-
-> [!NOTE]
-> In development mode (`DEV_TENANT_ID` set), Spool Rack uses a local token verifier that automatically attributes incoming requests to the development tenant, eliminating the need for an external identity provider.
-
----
-
----
-
-## Tenant & Workspace Management
-
-Spool Rack supports multi-tenant organization with isolated workspaces per tenant. You can create and manage tenants and workspaces via the REST API before connecting local Spool workspaces:
-
-### 1. Create a Tenant
+Wait for the service to become healthy:
 
 ```bash
-curl -s -X POST http://127.0.0.1:8080/api/v1/tenants \
-  -H "Authorization: Bearer $SPOOL_RACK_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "slug": "acme-corp",
-    "name": "Acme Corporation"
-  }'
+curl --fail http://127.0.0.1:8080/healthz
 ```
 
-Response:
-```json
-{
-  "tenantId": "00000000-0000-4000-8000-000000000001",
-  "slug": "acme-corp",
-  "name": "Acme Corporation",
-  "createdAt": "2026-09-07T15:00:00Z"
-}
-```
-
-### 2. Create a Workspace within a Tenant
-
-Workspaces belong to a tenant and serve as the remote graph repository:
+Set `SPOOL_RACK_PORT` or `POSTGRES_PORT` before starting Compose to override
+the default host ports:
 
 ```bash
-curl -s -X POST http://127.0.0.1:8080/api/v1/workspaces \
-  -H "Authorization: Bearer $SPOOL_RACK_TOKEN" \
-  -H "X-Tenant-ID: 00000000-0000-4000-8000-000000000001" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "backend-core",
-    "defaultBranch": "main"
-  }'
+SPOOL_RACK_PORT=8081 POSTGRES_PORT=5434 docker compose up -d --build
 ```
 
-Response:
-```json
-{
-  "workspaceId": "00000000-0000-4000-8000-000000000002",
-  "tenantId": "00000000-0000-4000-8000-000000000001",
-  "name": "backend-core",
-  "defaultBranch": "main",
-  "createdAt": "2026-09-07T15:00:00Z"
-}
-```
+## Use with Spool
 
-You can also list and inspect existing workspaces:
+The default local configuration accepts any non-empty bearer token and seeds
+these identifiers:
+
 ```bash
-# List all workspaces in a tenant
-curl -s http://127.0.0.1:8080/api/v1/workspaces \
-  -H "Authorization: Bearer $SPOOL_RACK_TOKEN" \
-  -H "X-Tenant-ID: 00000000-0000-4000-8000-000000000001"
-
-# Get workspace details by workspace UUID
-curl -s http://127.0.0.1:8080/api/v1/workspaces/00000000-0000-4000-8000-000000000002 \
-  -H "Authorization: Bearer $SPOOL_RACK_TOKEN" \
-  -H "X-Tenant-ID: 00000000-0000-4000-8000-000000000001"
+export SPOOL_RACK_TOKEN=dev-token
+export SPOOL_RACK_TENANT_ID=00000000-0000-4000-8000-000000000001
+export SPOOL_RACK_WORKSPACE_ID=00000000-0000-4000-8000-000000000002
 ```
 
----
-
-## Connecting a Spool Workspace (`spl`)
-
-Follow these steps to connect a local Spool workspace to Spool Rack.
-
-### 1. Add / Configure the Remote
-
-Run `spl remote set` inside your Spool workspace, specifying both `--tenant-id` and `--workspace-id`:
+Configure a local Spool workspace to use the server:
 
 ```bash
 spl remote set \
   --endpoint http://127.0.0.1:8080 \
-  --tenant-id 00000000-0000-4000-8000-000000000001 \
-  --workspace-id 00000000-0000-4000-8000-000000000002 \
+  --tenant-id "$SPOOL_RACK_TENANT_ID" \
+  --workspace-id "$SPOOL_RACK_WORKSPACE_ID" \
   --auth-mode bearer
-```
 
-- `--endpoint`: Base URL of the Spool Rack instance.
-- `--tenant-id` (or `--tenant`): Tenant identifier submitted with each request via the `X-Tenant-ID` header.
-- `--workspace-id` (or `--workspace`): Workspace UUID in Spool Rack.
-- `--auth-mode`: `bearer` or `api_key`.
-
-*(Note: `--repo-id` remains supported as a legacy alias for `--workspace-id` for backwards compatibility).*
-
-### 2. Set Authentication Token
-
-Spool does **not** persist secrets in repository configuration. Supply the token via an environment variable:
-
-```bash
-export SPOOL_RACK_TOKEN="dev-token"
-```
-
-*(If using `--auth-mode api_key`, set `export SPOOL_RACK_API_KEY="your-key"` instead).*
-
-### 3. Verify Remote Connection
-
-Check that the CLI can communicate with Rack and has negotiated the pack protocol version:
-
-```bash
 spl remote show
 ```
 
-Example response:
-```json
-{
-  "endpoint": "http://127.0.0.1:8080",
-  "tenantId": "00000000-0000-4000-8000-000000000001",
-  "workspaceId": "00000000-0000-4000-8000-000000000002",
-  "repoId": "00000000-0000-4000-8000-000000000002",
-  "authMode": "bearer",
-  "versionStatus": "negotiated",
-  "versions": {
-    "packFormatVersion": { "local": 2, "remote": 2, "status": "match" },
-    "packIndexFormatVersion": { "local": 1, "remote": 1, "status": "match" },
-    "packManifestFormatVersion": { "local": 1, "remote": 1, "status": "match" }
-  }
-}
-```
+Push a branch or retrieve a remote branch:
 
----
-
-## Cloning a Workspace (`spl clone`)
-
-To clone an existing workspace hosted on Spool Rack to a new local directory:
-
-```bash
-# Clone by URL
-spl clone http://127.0.0.1:8080/api/v1/workspaces/00000000-0000-4000-8000-000000000002
-
-# Or clone by parameters
-spl clone \
-  --endpoint http://127.0.0.1:8080 \
-  --tenant-id 00000000-0000-4000-8000-000000000001 \
-  --workspace-id 00000000-0000-4000-8000-000000000002
-```
-
-This initializes the local repository, configures the remote, downloads the complete graph history for the default branch, and switches to it so you can immediately begin creating, pulling, and pushing ideas.
-
----
-
-## Working with Remote Branches
-
-### List Remote Branches
-
-```bash
-spl remote branch list
-```
-
-### Discover the Default Branch
-
-```bash
-spl remote branch default
-```
-
-### Push a Branch
-
-Push local commits to Spool Rack:
-
-```bash
-spl push --branch <branch-name>
-```
-
-For linear branches, Spool builds a native pack and advances the remote branch.
-
-#### Handling Non-Fast-Forward / Diverged Branches
-
-If remote changes occurred concurrently, use `--reconcile`:
-
-```bash
-spl push --branch <branch-name> --reconcile
-```
-
-This fetches the remote history into a temporary local reconciliation branch, applies three-way semantic graph rebase using Spool's merge engine, and retries the push if no conflicts exist.
-
-### Pull a Branch
-
-Fast-forward your local branch with updates from Spool Rack:
-
-```bash
-spl pull --branch <branch-name>
-```
-
-### Create a Remote Branch
-
-Create a remote branch directly on Spool Rack from an existing remote branch or commit:
-
-```bash
-# Create from an existing remote branch
-spl remote branch create feature-auth --from-branch main
-
-# Or create from a specific commit ID
-spl remote branch create hotfix --from-commit <commit-id>
-```
-
-### Delete a Remote Branch
-
-Safely delete a branch on Spool Rack (retained commits and objects remain intact for audit/retention):
-
-```bash
-spl remote branch delete <branch-name>
-```
-
----
-
-## Merging with Remote Repositories
-
-Graph repositories support three-way semantic merges. Merges can be performed locally using the `spl merge` CLI or server-side via Spool Rack's REST API.
-
-### 1. Local Three-Way Merge Workflow (`spl merge`)
-
-Always compute a preview before applying a merge. A caller-owned transaction ID ensures idempotency and safe locking.
-
-#### Step A: Preview the Merge
-```bash
-spl merge preview --source feature-auth --target main
-```
-This returns a deterministic preview JSON with a `previewId`, snapshot changes, and any semantic conflicts.
-
-#### Step B: Apply a Clean Preview
-If the preview reported zero conflicts:
-```bash
-spl merge apply \
-  --source feature-auth \
-  --target main \
-  --transaction merge-101 \
-  --preview <preview-id> \
-  --author "Werner Swart" \
-  --message "Merge feature-auth into main"
-```
-
-#### Step C: Resolving Conflicted Merges
-If conflicts exist, the target branch is leased for your transaction:
-```bash
-# Inspect persisted conflict tokens
-spl merge conflicts --target main --transaction merge-101
-
-# Submit conflict selections (and optional property overrides)
-spl merge resolve \
-  --target main \
-  --transaction merge-101 \
-  --preview <preview-id> \
-  --selections selections.json
-
-# Finalize the merge after resolving all conflicts
-spl merge finalize --target main --transaction merge-101
-
-# (Or abort to release the lease without moving the target branch)
-spl merge abort --target main --transaction merge-101
-```
-
-*`selections.json` format:*
-```json
-[
-  { "conflictId": "conflict-token-1", "choice": "source" },
-  { "conflictId": "conflict-token-2", "choice": "target" }
-]
-```
-
-#### Step D: Push the Merged Target
-Once merged locally, push the updated target branch:
 ```bash
 spl push --branch main
+spl pull --branch main
 ```
 
----
-
-### 2. Push Reconciliation (`spl push --reconcile`)
-
-If you push to a remote branch that has advanced on Spool Rack since your base commit, standard push is rejected with a non-fast-forward error. Passing `--reconcile` automates the merge:
+To clone the seeded workspace into a new local directory:
 
 ```bash
-spl push --branch feature --reconcile
+spl clone \
+  --endpoint http://127.0.0.1:8080 \
+  --tenant-id "$SPOOL_RACK_TENANT_ID" \
+  --workspace-id "$SPOOL_RACK_WORKSPACE_ID"
 ```
 
-1. **Fetches** Spool Rack's current history into a local reconciliation branch.
-2. **Rebases** your branch's independent local changes onto the remote head using the graph merge engine.
-3. **Retries the push** automatically if the merge is clean.
-4. **Reports conflicts** if semantic collisions exist, preserving both branches so you can inspect with `spl merge conflicts` and resolve them.
+## Create tenants and workspaces
 
----
+The development token grants administrator access. Create a tenant:
 
-### 3. Server-Side Remote Merge API (Spool Rack)
-
-For CI/CD runners, automated agents, and pull-request review interfaces, Spool Rack provides server-side merge endpoints:
-
-#### Preview Merge
-Computes lowest common ancestor (LCA) and deterministic three-way diff:
 ```bash
-curl -s -X POST http://127.0.0.1:8080/api/v1/repos/00000000-0000-4000-8000-000000000002/merge/preview \
+curl --fail-with-body -X POST http://127.0.0.1:8080/api/v1/tenants \
   -H "Authorization: Bearer $SPOOL_RACK_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{
-    "sourceBranch": "feature-auth",
-    "targetBranch": "main"
-  }'
+  -d '{"name":"Acme Corporation"}'
 ```
 
-#### Acquire Target Branch Lease
-Locks the target branch exclusively to prevent concurrent pushes during review:
+Create a workspace in that tenant, using the tenant ID returned above:
+
 ```bash
-curl -s -X POST http://127.0.0.1:8080/api/v1/repos/00000000-0000-4000-8000-000000000002/merge/lease \
+curl --fail-with-body -X POST http://127.0.0.1:8080/api/v1/workspaces \
   -H "Authorization: Bearer $SPOOL_RACK_TOKEN" \
+  -H "X-Tenant-ID: <tenant-id>" \
   -H "Content-Type: application/json" \
-  -d '{
-    "sourceBranch": "feature-auth",
-    "targetBranch": "main"
-  }'
-```
-Returns a `leaseToken` and lease expiration timestamp.
-
-#### Apply Server-Side Merge
-Atomically applies the preview, updates the target branch head, and releases the lease:
-```bash
-curl -s -X POST http://127.0.0.1:8080/api/v1/repos/00000000-0000-4000-8000-000000000002/merge/apply \
-  -H "Authorization: Bearer $SPOOL_RACK_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "sourceBranch": "feature-auth",
-    "targetBranch": "main",
-    "leaseToken": "<lease-token>",
-    "author": "Werner Swart",
-    "message": "Merge feature-auth into main",
-    "resolutions": []
-  }'
+  -d '{"name":"backend-core"}'
 ```
 
-#### Release Lease (Abort / Cancel)
-If a merge is cancelled without applying:
-```bash
-curl -s -X DELETE http://127.0.0.1:8080/api/v1/repos/00000000-0000-4000-8000-000000000002/merge/lease \
-  -H "Authorization: Bearer $SPOOL_RACK_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "targetBranch": "main",
-    "leaseToken": "<lease-token>"
-  }'
-```
+Use the returned `workspaceId` with `spl remote set`.
 
----
+## Develop locally
 
-## Local Development & Testing
-
-### Prerequisites
-- Go 1.26+
-- Docker & Docker Compose
-- `spl` CLI v1.5.0+
-
-### Running Tests
+Run the test suite:
 
 ```bash
-# Run all unit and integration tests
-go test ./...
-
-# Run sync package tests
-go test ./internal/server/sync/...
+make test
 ```
 
-### Code Formatting & Module Hygiene
+Build the server binary:
 
 ```bash
-# Format code
-make fmt
-
-# Verify code formatting and tidy modules
-make fmt-check && make tidy-check
+make build
 ```
 
-### Stopping Services
+For direct execution, configure `CAS_ROOT`, `POSTGRES_DSN`, and
+`POSTGRES_MIGRATIONS_DSN`. Set `DEV_TENANT_ID` (and optionally
+`DEV_REPO_ID`) only for local development; it enables the permissive
+development token verifier and seeds the specified tenant and workspace.
+
+## Stop the stack
 
 ```bash
 docker compose down
 ```
 
-To clean up database and CAS volumes:
+To also remove the persisted Docker volumes:
+
 ```bash
 docker compose down -v
 ```
+
+## Licence
+
+This project is licensed under the [GNU Affero General Public License v3.0](LICENCE).

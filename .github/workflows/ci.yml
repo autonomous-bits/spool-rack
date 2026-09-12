@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - ".agents/**"
+      - ".vscode/**"
+      - ".gitattributes"
+      - ".gitignore"
+      - "LICENCE"
+      - "security.txt"
+      - ".github/CODEOWNERS"
+      - ".github/dependabot.yml"
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - ".agents/**"
+      - ".vscode/**"
+      - ".gitattributes"
+      - ".gitignore"
+      - "LICENCE"
+      - "security.txt"
+      - ".github/CODEOWNERS"
+      - ".github/dependabot.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.6"
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            cmd/spool-rack/go.sum
+      - name: Build and test root module
+        run: |
+          go build ./...
+          go test ./...
+      - name: Build and test server module
+        working-directory: cmd/spool-rack
+        run: |
+          go build ./...
+          go test ./...

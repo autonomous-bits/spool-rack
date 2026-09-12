@@ -2,6 +2,8 @@ module github.com/autonomous-bits/spool-rack
 
 go 1.26.1
 
+toolchain go1.26.6
+
 require (
 	github.com/autonomous-bits/spool v1.4.1-0.20260906100220-a50cb88c5ba9
 	github.com/fxamacker/cbor/v2 v2.9.3
@@ -20,5 +22,5 @@ require (
 	github.com/x448/float16 v0.8.4 // indirect
 	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.29.0 // indirect
+	golang.org/x/text v0.39.0 // indirect
 )

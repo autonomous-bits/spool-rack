@@ -95,7 +95,7 @@ var (
 	ErrQuotaExceeded = errors.New("postgres: tenant storage quota exceeded")
 	// ErrAssetNotFound indicates the requested asset metadata row was not found.
 	ErrAssetNotFound = errors.New("postgres: asset not found")
-	errNilContext                    = errors.New("postgres: nil context")
+	errNilContext    = errors.New("postgres: nil context")
 
 	uuidV4Pattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 )
@@ -2467,4 +2467,3 @@ func (s *PGStore) SetTenantStorageQuota(ctx context.Context, tenantID string, qu
 		return nil
 	})
 }
-

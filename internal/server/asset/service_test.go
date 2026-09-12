@@ -12,9 +12,9 @@ import (
 )
 
 type fakeStore struct {
-	assets  map[string]postgres.AssetRecord
-	quota   int64
-	used    int64
+	assets   map[string]postgres.AssetRecord
+	quota    int64
+	used     int64
 	admitErr error
 }
 
@@ -80,10 +80,12 @@ func newFakeCASDriver() *fakeCASDriver {
 	return &fakeCASDriver{blobs: make(map[string][]byte)}
 }
 
-func (f *fakeCASDriver) Put(context.Context, cas.Scope, string, []byte) error { return nil }
-func (f *fakeCASDriver) Get(context.Context, cas.Scope, string) ([]byte, error) { return nil, nil }
+func (f *fakeCASDriver) Put(context.Context, cas.Scope, string, []byte) error    { return nil }
+func (f *fakeCASDriver) Get(context.Context, cas.Scope, string) ([]byte, error)  { return nil, nil }
 func (f *fakeCASDriver) Exists(context.Context, cas.Scope, string) (bool, error) { return false, nil }
-func (f *fakeCASDriver) OpenPack(context.Context, cas.Scope, string) (io.ReadCloser, error) { return nil, nil }
+func (f *fakeCASDriver) OpenPack(context.Context, cas.Scope, string) (io.ReadCloser, error) {
+	return nil, nil
+}
 func (f *fakeCASDriver) WritePack(context.Context, cas.Scope, string, io.Reader) error { return nil }
 
 func (f *fakeCASDriver) WriteAsset(_ context.Context, _ cas.Scope, hash string, r io.Reader) (int64, error) {
@@ -164,7 +166,11 @@ func TestAssetService_NegotiateAndUpload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open hash1: %v", err)
 	}
-	defer rc.Close()
+	defer func() {
+		if err := rc.Close(); err != nil {
+			t.Errorf("close asset reader: %v", err)
+		}
+	}()
 	if size != int64(len(payload1)) || mimeType != "text/plain" {
 		t.Fatalf("unexpected open result: size=%d, mimeType=%s", size, mimeType)
 	}
