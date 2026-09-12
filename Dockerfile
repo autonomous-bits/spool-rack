@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1
 
-FROM golang:1.26.6-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.6-alpine AS builder
 
+ARG TARGETOS
+ARG TARGETARCH
 WORKDIR /src
 
 COPY go.mod go.sum go.work go.work.sum ./
@@ -9,11 +11,12 @@ COPY cmd/spool-rack/go.mod cmd/spool-rack/go.sum ./cmd/spool-rack/
 RUN go mod download && cd cmd/spool-rack && go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/spool-rack ./cmd/spool-rack
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/spool-rack ./cmd/spool-rack
 
 FROM alpine:3.22
 
-RUN apk add --no-cache ca-certificates \
+RUN apk upgrade --no-cache \
+    && apk add --no-cache ca-certificates \
     && addgroup -S -g 10001 spoolrack \
     && adduser -S -D -H -u 10001 -G spoolrack spoolrack \
     && mkdir -p /var/lib/spool-rack \
