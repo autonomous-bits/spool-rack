@@ -1,0 +1,16 @@
+# Example values for dynamic provisioning using a CSI StorageClass
+# (e.g. AWS EBS gp3, Azure Disk managed-csi, GKE pd-ssd)
+
+persistence:
+  enabled: true
+  # StorageClass backed by the cluster's CSI driver
+  storageClass: "gp3" # or "managed-csi", "standard-rwo", etc.
+  accessModes:
+    - ReadWriteOnce
+  size: 20Gi
+  mountPath: /var/lib/spool-rack
+
+postgres:
+  dsnSecret:
+    name: spool-rack-postgres
+    key: POSTGRES_DSN

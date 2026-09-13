@@ -1,0 +1,46 @@
+name: Publish Helm chart
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  publish-chart:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Log in to GitHub Container Registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Package and Push Helm Chart
+        env:
+          OWNER: ${{ github.repository_owner }}
+          TAG_NAME: ${{ github.event.release.tag_name || '0.2.0' }}
+        run: |
+          # GHCR requires lowercase namespace
+          OWNER_LOWER=$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')
+
+          # Strip leading 'v' if present (e.g. v0.2.0 -> 0.2.0)
+          CHART_VERSION=${TAG_NAME#v}
+
+          mkdir -p .cr-release-packages
+
+          # Package the chart with the release version
+          helm package ./infra/charts/spool-rack \
+            --version "$CHART_VERSION" \
+            --app-version "$CHART_VERSION" \
+            --destination .cr-release-packages
+
+          # Push to GHCR as an OCI artifact
+          helm push .cr-release-packages/spool-rack-"$CHART_VERSION".tgz "oci://ghcr.io/$OWNER_LOWER/charts"
