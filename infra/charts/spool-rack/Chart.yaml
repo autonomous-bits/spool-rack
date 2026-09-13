@@ -2,8 +2,8 @@ apiVersion: v2
 name: spool-rack
 description: A Helm chart for the Spool Rack server
 type: application
-version: 0.2.0
-appVersion: "0.1.0-mvp"
+version: 0.3.0
+appVersion: "0.3.0"
 annotations:
   org.opencontainers.image.source: https://github.com/autonomous-bits/spool-rack
   org.opencontainers.image.description: Helm chart for Spool Rack server
