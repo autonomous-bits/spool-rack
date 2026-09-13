@@ -106,6 +106,49 @@ curl --fail-with-body -X POST http://127.0.0.1:8080/api/v1/workspaces \
 
 Use the returned `workspaceId` with `spl remote set`.
 
+## Kubernetes deployment
+
+Spool Rack can be deployed to Kubernetes using Helm with full support for
+cloud-native storage via CSI (Container Storage Interface) drivers.
+
+### Quick start with Helm
+
+Deploy directly using the OCI chart published to GitHub Container Registry:
+
+```bash
+# 1. Create a namespace and provide PostgreSQL DSN
+kubectl create namespace spool-rack
+kubectl -n spool-rack create secret generic spool-rack-postgres \
+  --from-literal=POSTGRES_DSN='postgres://spool_app:password@postgres:5432/spool_rack?sslmode=require'
+
+# 2. Install the chart
+helm upgrade --install spool-rack oci://ghcr.io/autonomous-bits/charts/spool-rack \
+  --version 0.2.0 \
+  --namespace spool-rack \
+  --set postgres.dsnSecret.name=spool-rack-postgres
+```
+
+Or deploy from local repository sources:
+
+```bash
+helm upgrade --install spool-rack ./infra/charts/spool-rack \
+  --namespace spool-rack \
+  --set postgres.dsnSecret.name=spool-rack-postgres
+```
+
+### Storage and CSI drivers
+
+Spool Rack stores immutable content-addressed storage (CAS) files at
+`CAS_ROOT` (default `/var/lib/spool-rack`). The chart supports multiple storage
+patterns for Kubernetes CSI drivers:
+
+- **Dynamic CSI StorageClass**: Use standard dynamic provisioning (`persistence.storageClass`).
+- **Static CSI PersistentVolume**: Attach existing cloud storage volumes (such as AWS EFS, SMB shares, or Azure Files) via `persistence.csi.enabled: true`.
+- **Pod-Inline CSI Volume**: Mount CSI volumes directly in the pod spec (`persistence.csi.inline: true`).
+
+For detailed documentation, configuration options, and example values files, see
+the [Infrastructure and Helm documentation](infra/README.md).
+
 ## Develop locally
 
 Run the test suite:

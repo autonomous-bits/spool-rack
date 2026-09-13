@@ -1,0 +1,27 @@
+# Example values for static PersistentVolume provisioning with a CSI driver
+# Example: AWS EFS (efs.csi.aws.com) or SMB (smb.csi.k8s.io)
+
+persistence:
+  enabled: true
+  mountPath: /var/lib/spool-rack
+  subPath: "cas-data"
+  size: 50Gi
+  accessModes:
+    - ReadWriteMany
+  reclaimPolicy: Retain
+  csi:
+    enabled: true
+    driver: "efs.csi.aws.com"
+    volumeHandle: "fs-0123456789abcdef0"
+    volumeAttributes: {}
+    # For SMB / Azure with credentials:
+    # driver: "smb.csi.k8s.io"
+    # volumeHandle: "smb-server.local/share##"
+    # nodePublishSecretRef:
+    #   name: "smb-creds"
+    #   namespace: "spool-rack"
+
+postgres:
+  dsnSecret:
+    name: spool-rack-postgres
+    key: POSTGRES_DSN

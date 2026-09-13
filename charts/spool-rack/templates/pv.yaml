@@ -1,0 +1,51 @@
+{{- if and .Values.persistence.enabled (not .Values.persistence.existingClaim) .Values.persistence.csi.enabled (not .Values.persistence.csi.inline) }}
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: {{ include "spool-rack.fullname" . }}-pv
+  labels:
+    {{- include "spool-rack.labels" . | nindent 4 }}
+    {{- with .Values.persistence.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.persistence.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  capacity:
+    storage: {{ .Values.persistence.size }}
+  volumeMode: {{ .Values.persistence.volumeMode | default "Filesystem" }}
+  accessModes:
+    {{- toYaml .Values.persistence.accessModes | nindent 4 }}
+  persistentVolumeReclaimPolicy: {{ .Values.persistence.reclaimPolicy | default "Retain" }}
+  {{- with .Values.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  claimRef:
+    namespace: {{ .Release.Namespace }}
+    name: {{ include "spool-rack.fullname" . }}
+  csi:
+    driver: {{ required "A valid persistence.csi.driver is required when persistence.csi.enabled is true" .Values.persistence.csi.driver | quote }}
+    volumeHandle: {{ required "A valid persistence.csi.volumeHandle is required when persistence.csi.enabled is true" .Values.persistence.csi.volumeHandle | quote }}
+    readOnly: {{ .Values.persistence.csi.readOnly | default false }}
+    {{- with .Values.persistence.csi.fsType }}
+    fsType: {{ . | quote }}
+    {{- end }}
+    {{- with .Values.persistence.csi.volumeAttributes }}
+    volumeAttributes:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with .Values.persistence.csi.nodePublishSecretRef }}
+    nodePublishSecretRef:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with .Values.persistence.csi.nodeStageSecretRef }}
+    nodeStageSecretRef:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with .Values.persistence.csi.controllerExpandSecretRef }}
+    controllerExpandSecretRef:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+{{- end }}

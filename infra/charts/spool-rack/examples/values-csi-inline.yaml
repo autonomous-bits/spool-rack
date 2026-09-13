@@ -1,0 +1,16 @@
+# Example values for Pod-inline CSI volume mounting
+# (For CSI drivers that support ephemeral / inline volume mounting)
+
+persistence:
+  enabled: true
+  mountPath: /var/lib/spool-rack
+  csi:
+    inline: true
+    driver: "inline.storage.kubernetes.io"
+    volumeAttributes:
+      capacity: "10Gi"
+
+postgres:
+  dsnSecret:
+    name: spool-rack-postgres
+    key: POSTGRES_DSN

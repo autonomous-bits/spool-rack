@@ -1,0 +1,40 @@
+name: Publish Helm chart
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish-chart:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Log in to GitHub Container Registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Package and push Helm chart
+        env:
+          OWNER: ${{ github.repository_owner }}
+          TAG_REF: ${{ github.ref_name }}
+        run: |
+          OWNER_LOWER=$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')
+          VERSION=${TAG_REF#v}
+          if [ -z "$VERSION" ]; then
+            VERSION=$(helm show chart infra/charts/spool-rack | awk '/^version:/ {print $2}')
+          fi
+          mkdir -p .cr-release-packages
+          helm package infra/charts/spool-rack \
+            --version "$VERSION" \
+            --app-version "$VERSION" \
+            --destination .cr-release-packages
+          helm push .cr-release-packages/spool-rack-"$VERSION".tgz "oci://ghcr.io/$OWNER_LOWER/charts"
