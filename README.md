@@ -123,7 +123,7 @@ kubectl -n spool-rack create secret generic spool-rack-postgres \
 
 # 2. Install the chart
 helm upgrade --install spool-rack oci://ghcr.io/autonomous-bits/charts/spool-rack \
-  --version 0.2.0 \
+  --version 0.3.0 \
   --namespace spool-rack \
   --set postgres.dsnSecret.name=spool-rack-postgres
 ```
