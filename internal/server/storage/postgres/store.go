@@ -457,13 +457,9 @@ type PGStore struct {
 
 var _ Store = (*PGStore)(nil)
 
-// Open connects to PostgreSQL, verifies the connection is usable, and returns
-// a store backed by a pgx connection pool.
-func Open(ctx context.Context, dsn string, opts ...Option) (*PGStore, error) {
-	if ctx == nil {
-		return nil, errNilContext
-	}
-
+// newPoolConfig parses the DSN and applies configuration options including
+// dynamic TokenProvider, custom usernames, and connection lifetime limits.
+func newPoolConfig(ctx context.Context, dsn string, opts ...Option) (*pgxpool.Config, error) {
 	var options openOptions
 	for _, opt := range opts {
 		opt(&options)
@@ -504,6 +500,21 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*PGStore, error) {
 			cc.Password = t
 			return nil
 		}
+	}
+
+	return poolConfig, nil
+}
+
+// Open connects to PostgreSQL, verifies the connection is usable, and returns
+// a store backed by a pgx connection pool.
+func Open(ctx context.Context, dsn string, opts ...Option) (*PGStore, error) {
+	if ctx == nil {
+		return nil, errNilContext
+	}
+
+	poolConfig, err := newPoolConfig(ctx, dsn, opts...)
+	if err != nil {
+		return nil, err
 	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)

@@ -255,6 +255,19 @@ func Connect(ctx context.Context, dsn string, opts ...MigrateOption) (*pgx.Conn,
 	return conn, nil
 }
 
+type prefixedError struct {
+	prefix string
+	err    error
+}
+
+func (e *prefixedError) Error() string {
+	return e.prefix + strings.TrimPrefix(e.err.Error(), "postgres: ")
+}
+
+func (e *prefixedError) Unwrap() error {
+	return e.err
+}
+
 // migrateWithMigrations is the connection/apply core behind Migrate, split
 // out so tests can drive it with an in-memory migration set (built via
 // loadMigrationsFromFS against an fstest.MapFS) to exercise the destructive
@@ -263,7 +276,7 @@ func Connect(ctx context.Context, dsn string, opts ...MigrateOption) (*pgx.Conn,
 func migrateWithMigrations(ctx context.Context, dsn string, migrations []migration, opts ...MigrateOption) (*MigrationResult, error) {
 	conn, err := Connect(ctx, dsn, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("postgres: migrate: %w", err)
+		return nil, &prefixedError{prefix: "postgres: migrate: ", err: err}
 	}
 	defer func() { _ = conn.Close(ctx) }()
 
@@ -376,7 +389,7 @@ func ConfirmRetirement(ctx context.Context, dsn, name, note string, opts ...Migr
 
 	conn, err := Connect(ctx, dsn, opts...)
 	if err != nil {
-		return fmt.Errorf("postgres: confirm retirement: %w", err)
+		return &prefixedError{prefix: "postgres: confirm retirement: ", err: err}
 	}
 	defer func() { _ = conn.Close(ctx) }()
 

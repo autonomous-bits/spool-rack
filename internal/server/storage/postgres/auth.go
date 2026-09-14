@@ -3,7 +3,6 @@ package postgres
 import (
 	"context"
 	"fmt"
-	"os"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
@@ -61,18 +60,43 @@ func NewAzureTokenProvider(opts AzureTokenProviderOptions) (*AzureTokenProvider,
 
 	cred := opts.TokenCredential
 	if cred == nil {
-		if opts.ClientID != "" && os.Getenv("AZURE_CLIENT_ID") == "" {
-			_ = os.Setenv("AZURE_CLIENT_ID", opts.ClientID)
+		if opts.ClientID != "" {
+			var sources []azcore.TokenCredential
+			if wic, err := azidentity.NewWorkloadIdentityCredential(&azidentity.WorkloadIdentityCredentialOptions{
+				ClientID: opts.ClientID,
+				TenantID: opts.TenantID,
+			}); err == nil {
+				sources = append(sources, wic)
+			}
+			if mic, err := azidentity.NewManagedIdentityCredential(&azidentity.ManagedIdentityCredentialOptions{
+				ID: azidentity.ClientID(opts.ClientID),
+			}); err == nil {
+				sources = append(sources, mic)
+			}
+			if clicred, err := azidentity.NewAzureCLICredential(&azidentity.AzureCLICredentialOptions{
+				TenantID: opts.TenantID,
+			}); err == nil {
+				sources = append(sources, clicred)
+			}
+			if len(sources) == 0 {
+				return nil, fmt.Errorf("postgres: no azure credentials available for client id %q", opts.ClientID)
+			}
+			chainedCred, err := azidentity.NewChainedTokenCredential(sources, nil)
+			if err != nil {
+				return nil, fmt.Errorf("postgres: create chained azure credential: %w", err)
+			}
+			cred = chainedCred
+		} else {
+			var dacOpts azidentity.DefaultAzureCredentialOptions
+			if opts.TenantID != "" {
+				dacOpts.TenantID = opts.TenantID
+			}
+			defaultCred, err := azidentity.NewDefaultAzureCredential(&dacOpts)
+			if err != nil {
+				return nil, fmt.Errorf("postgres: create default azure credential: %w", err)
+			}
+			cred = defaultCred
 		}
-		var dacOpts azidentity.DefaultAzureCredentialOptions
-		if opts.TenantID != "" {
-			dacOpts.TenantID = opts.TenantID
-		}
-		defaultCred, err := azidentity.NewDefaultAzureCredential(&dacOpts)
-		if err != nil {
-			return nil, fmt.Errorf("postgres: create default azure credential: %w", err)
-		}
-		cred = defaultCred
 	}
 
 	return &AzureTokenProvider{

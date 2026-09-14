@@ -60,3 +60,29 @@ func TestHasPasswordInDSN(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveMigrationUser(t *testing.T) {
+	appDSN := "postgres://spool_app@localhost:5432/spool"
+	adminDSN := "postgres://admin:secret@localhost:5432/spool"
+
+	// 1. Explicit migrations user always takes precedence
+	if u := resolveMigrationUser("explicit_admin", "app_user", adminDSN, appDSN); u != "explicit_admin" {
+		t.Errorf("got %q, want explicit_admin", u)
+	}
+
+	// 2. Same DSN inherits appUser
+	if u := resolveMigrationUser("", "app_user", appDSN, appDSN); u != "app_user" {
+		t.Errorf("got %q, want app_user", u)
+	}
+
+	// 3. Different DSN does NOT inherit appUser (preserving embedded DSN user)
+	if u := resolveMigrationUser("", "app_user", adminDSN, appDSN); u != "" {
+		t.Errorf("got %q, want empty string", u)
+	}
+}
+
+func TestVersion(t *testing.T) {
+	if version != "0.3.0" {
+		t.Errorf("version = %q, want 0.3.0", version)
+	}
+}

@@ -9,8 +9,6 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type mockCredential struct {
@@ -124,7 +122,7 @@ func TestAzureTokenProvider_ErrorHandling(t *testing.T) {
 	}
 }
 
-func TestOpen_Options_TokenProviderConfig(t *testing.T) {
+func TestNewPoolConfig_OptionsAndTokenRefresh(t *testing.T) {
 	tokenCalls := 0
 	tokenVal := "initial-secret-token"
 	tp := TokenFunc(func(_ context.Context) (string, error) {
@@ -133,62 +131,60 @@ func TestOpen_Options_TokenProviderConfig(t *testing.T) {
 	})
 
 	dsn := "postgres://initialuser@localhost:5432/spool_rack?sslmode=disable"
-	cfg, err := pgxpool.ParseConfig(dsn)
-	if err != nil {
-		t.Fatalf("ParseConfig: %v", err)
-	}
-
 	opts := []Option{
 		WithTokenProvider(tp),
 		WithUser("managed-identity-user"),
 		WithMaxConnLifetime(20 * time.Minute),
 	}
 
-	var o openOptions
-	for _, opt := range opts {
-		opt(&o)
+	cfg, err := newPoolConfig(context.Background(), dsn, opts...)
+	if err != nil {
+		t.Fatalf("newPoolConfig: %v", err)
 	}
 
-	if o.user != "managed-identity-user" {
-		t.Fatalf("user option = %q, want %q", o.user, "managed-identity-user")
+	if cfg.ConnConfig.User != "managed-identity-user" {
+		t.Fatalf("user = %q, want %q", cfg.ConnConfig.User, "managed-identity-user")
 	}
-	if o.maxConnLifetime != 20*time.Minute {
-		t.Fatalf("lifetime option = %v, want 20m", o.maxConnLifetime)
+	if cfg.ConnConfig.Password != "initial-secret-token" {
+		t.Fatalf("initial password = %q, want %q", cfg.ConnConfig.Password, "initial-secret-token")
 	}
-
-	// Verify BeforeConnect behavior
-	cfg.ConnConfig.User = o.user
-	cfg.BeforeConnect = func(ctx context.Context, cc *pgx.ConnConfig) error {
-		if o.user != "" {
-			cc.User = o.user
-		}
-		tok, err := o.tokenProvider.GetToken(ctx)
-		if err != nil {
-			return err
-		}
-		cc.Password = tok
-		return nil
+	if cfg.MaxConnLifetime != 20*time.Minute {
+		t.Fatalf("lifetime = %v, want 20m", cfg.MaxConnLifetime)
+	}
+	if cfg.BeforeConnect == nil {
+		t.Fatal("expected BeforeConnect hook to be installed")
 	}
 
 	testConnConfig := cfg.ConnConfig.Copy()
+	testConnConfig.Password = ""
 	if err := cfg.BeforeConnect(context.Background(), testConnConfig); err != nil {
 		t.Fatalf("BeforeConnect failed: %v", err)
 	}
 	if testConnConfig.Password != "initial-secret-token" {
-		t.Fatalf("password = %q, want %q", testConnConfig.Password, "initial-secret-token")
+		t.Fatalf("password after BeforeConnect = %q, want %q", testConnConfig.Password, "initial-secret-token")
 	}
 	if testConnConfig.User != "managed-identity-user" {
-		t.Fatalf("user = %q, want %q", testConnConfig.User, "managed-identity-user")
+		t.Fatalf("user after BeforeConnect = %q, want %q", testConnConfig.User, "managed-identity-user")
 	}
 
 	// Dynamic token refresh: change token returned by provider
 	tokenVal = "refreshed-token-456"
 	testConnConfig2 := cfg.ConnConfig.Copy()
+	testConnConfig2.Password = ""
 	if err := cfg.BeforeConnect(context.Background(), testConnConfig2); err != nil {
 		t.Fatalf("BeforeConnect 2 failed: %v", err)
 	}
 	if testConnConfig2.Password != "refreshed-token-456" {
 		t.Fatalf("password = %q, want %q", testConnConfig2.Password, "refreshed-token-456")
+	}
+
+	// Verify default MaxConnLifetime is 45m when tokenProvider is set and no lifetime is given
+	cfgDefaultLifetime, err := newPoolConfig(context.Background(), dsn, WithTokenProvider(tp))
+	if err != nil {
+		t.Fatalf("newPoolConfig with default lifetime: %v", err)
+	}
+	if cfgDefaultLifetime.MaxConnLifetime != 45*time.Minute {
+		t.Fatalf("default lifetime = %v, want 45m", cfgDefaultLifetime.MaxConnLifetime)
 	}
 }
 
