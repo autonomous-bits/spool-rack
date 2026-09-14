@@ -20,7 +20,7 @@ Install directly from the published OCI registry:
 
 ```bash
 helm upgrade --install spool-rack oci://ghcr.io/autonomous-bits/charts/spool-rack \
-  --version 0.3.0 \
+  --version 0.4.0 \
   --namespace spool-rack \
   --set postgres.dsnSecret.name=spool-rack-postgres
 ```
