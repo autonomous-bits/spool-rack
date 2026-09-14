@@ -1,6 +1,6 @@
 services:
   spool-rack:
-    image: ${SPOOL_RACK_IMAGE:-ghcr.io/autonomous-bits/spool-rack:0.3.0}
+    image: ${SPOOL_RACK_IMAGE:-ghcr.io/autonomous-bits/spool-rack:0.4.0}
     build:
       context: .
       dockerfile: Dockerfile

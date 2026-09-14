@@ -82,7 +82,7 @@ func TestResolveMigrationUser(t *testing.T) {
 }
 
 func TestVersion(t *testing.T) {
-	if version != "0.3.0" {
-		t.Errorf("version = %q, want 0.3.0", version)
+	if version != "0.4.0" {
+		t.Errorf("version = %q, want 0.4.0", version)
 	}
 }

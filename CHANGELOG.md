@@ -7,12 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-14
+
 ### Added
 - **Azure Managed Identity Authentication**: Added support for Azure Database for PostgreSQL Flexible Server authentication using Microsoft Entra ID OAuth2 access tokens via Azure Workload Identity, VM-based Managed Identity, and Azure CLI.
 - **Dynamic Token Refresh**: Integrated with `pgxpool.Pool` via `BeforeConnect` to automatically acquire fresh tokens for scope `https://ossrdbms-aad.database.windows.net/.default` on every new connection, and periodically recycle pool connections with configurable `POSTGRES_MAX_CONN_LIFETIME`.
 - **Database User Mapping**: Supported setting the database user via `POSTGRES_USER` or directly in the DSN to map to the PostgreSQL Entra role (e.g. managed identity name).
 - **Decoupled Schema Migrations**: Supported running migrations via Azure Managed Identity, an independently authenticated password DSN (`POSTGRES_MIGRATIONS_DSN`), or skipping startup migrations (`POSTGRES_RUN_MIGRATIONS=false`) for external jobs/pipelines (`POSTGRES_MIGRATE_ONLY=true`).
 - **Helm Chart Azure Workload Identity Support**: Added Helm values and templates for Azure Workload Identity, direct DSNs without static password secrets, and added `values-azure-workload-identity.yaml` example.
+
+### Changed
+- Updated Helm chart version and appVersion to `0.4.0`.
+- Configured default container image in `docker-compose.yml` to `ghcr.io/autonomous-bits/spool-rack:0.4.0`.
+- Updated binary version to `0.4.0`.
 
 ## [0.3.0] - 2026-09-13
 
@@ -50,7 +57,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Seeded development environment with Docker Compose.
 - Health endpoint (`/healthz`) with contract and version diagnostics.
 
-[Unreleased]: https://github.com/autonomous-bits/spool-rack/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/autonomous-bits/spool-rack/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/autonomous-bits/spool-rack/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/autonomous-bits/spool-rack/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/autonomous-bits/spool-rack/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/autonomous-bits/spool-rack/releases/tag/v0.1.0
