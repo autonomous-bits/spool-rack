@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Azure Managed Identity Authentication**: Added support for Azure Database for PostgreSQL Flexible Server authentication using Microsoft Entra ID OAuth2 access tokens via Azure Workload Identity, VM-based Managed Identity, and Azure CLI.
+- **Dynamic Token Refresh**: Integrated with `pgxpool.Pool` via `BeforeConnect` to automatically acquire fresh tokens for scope `https://ossrdbms-aad.database.windows.net/.default` on every new connection, and periodically recycle pool connections with configurable `POSTGRES_MAX_CONN_LIFETIME`.
+- **Database User Mapping**: Supported setting the database user via `POSTGRES_USER` or directly in the DSN to map to the PostgreSQL Entra role (e.g. managed identity name).
+- **Decoupled Schema Migrations**: Supported running migrations via Azure Managed Identity, an independently authenticated password DSN (`POSTGRES_MIGRATIONS_DSN`), or skipping startup migrations (`POSTGRES_RUN_MIGRATIONS=false`) for external jobs/pipelines (`POSTGRES_MIGRATE_ONLY=true`).
+- **Helm Chart Azure Workload Identity Support**: Added Helm values and templates for Azure Workload Identity, direct DSNs without static password secrets, and added `values-azure-workload-identity.yaml` example.
+
 ## [0.3.0] - 2026-09-13
 
 ### Added

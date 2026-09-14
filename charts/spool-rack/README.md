@@ -127,6 +127,49 @@ persistence:
 | `persistence.csi.volumeHandle` | CSI volume handle / identifier | `""` |
 | `persistence.csi.volumeAttributes` | Driver-specific volume attributes map | `{}` |
 | `persistence.csi.nodePublishSecretRef` | Secret reference for node publish | `{}` |
+| `postgres.authType` | PostgreSQL authentication type (`password` or `azure`) | `password` |
+| `postgres.dsn` | Direct connection string / DSN (useful for passwordless Azure auth) | `""` |
 | `postgres.dsnSecret.name` | Secret name holding `POSTGRES_DSN` | `""` |
 | `postgres.dsnSecret.key` | Secret key holding `POSTGRES_DSN` | `POSTGRES_DSN` |
-| `postgres.migrationsDsnSecret.name` | Secret name holding `POSTGRES_MIGRATIONS_DSN` | `""` |
+| `postgres.user` | Database username (e.g. managed identity name) | `""` |
+| `postgres.userSecret.name` | Secret name holding `POSTGRES_USER` | `""` |
+| `postgres.azure.clientId` | Client ID of user-assigned managed identity | `""` |
+| `postgres.azure.scope` | OAuth2 scope (defaults to `https://ossrdbms-aad.database.windows.net/.default`) | `""` |
+| `postgres.maxConnLifetime` | Maximum pooled connection lifetime (defaults to `45m` with Azure auth) | `""` |
+| `postgres.migrations.enabled` | Whether to run migrations at startup | `true` |
+| `postgres.migrations.authType` | Authentication type for migrations (`password` or `azure`) | `""` |
+| `postgres.migrations.dsn` | Migration DSN (defaults to `postgres.dsn`) | `""` |
+| `postgres.migrations.dsnSecret.name` | Secret name holding `POSTGRES_MIGRATIONS_DSN` | `""` |
+| `postgres.migrations.user` | Migration database username | `""` |
+| `postgres.migrationsDsnSecret.name` | Backwards-compatibility secret name for migration DSN | `""` |
+| `extraEnv` | Additional environment variables list | `[]` |
+
+## Azure Managed Identity & Workload Identity
+
+To connect to Azure Database for PostgreSQL Flexible Server using Azure Managed Identity without static passwords:
+
+1. Enable Azure Workload Identity on your AKS cluster.
+2. Create an Entra principal in PostgreSQL matching the managed identity name:
+   ```sql
+   SELECT * FROM pgaadauth_create_principal('id-ixs-rng-dev-em20-spl-02', false, false);
+   GRANT CONNECT ON DATABASE spool_rack TO "id-ixs-rng-dev-em20-spl-02";
+   GRANT ALL ON SCHEMA public TO "id-ixs-rng-dev-em20-spl-02";
+   ```
+3. Deploy Spool Rack with Workload Identity annotations and `authType: "azure"`:
+   ```yaml
+   serviceAccount:
+     create: true
+     automount: true
+     annotations:
+       azure.workload.identity/client-id: "<MANAGED_IDENTITY_CLIENT_ID>"
+
+   podLabels:
+     azure.workload.identity/use: "true"
+
+   postgres:
+     authType: "azure"
+     dsn: "host=psql-spool-dev.postgres.database.azure.com port=5432 dbname=spool_rack sslmode=require"
+     user: "id-ixs-rng-dev-em20-spl-02"
+   ```
+
+See [examples/values-azure-workload-identity.yaml](./examples/values-azure-workload-identity.yaml) for a complete example.

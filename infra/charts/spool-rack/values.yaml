@@ -46,9 +46,55 @@ autoscaling:
   targetCPUUtilizationPercentage: 80
 
 postgres:
+  # Authentication method: "password" or "azure" (for Azure Managed Identity / Workload Identity)
+  authType: "password"
+
+  # PostgreSQL connection string / DSN (can be used directly when using Azure auth without passwords)
+  dsn: ""
+
+  # Secret containing the connection string / DSN
   dsnSecret:
     name: ""
     key: POSTGRES_DSN
+
+  # PostgreSQL user / role (e.g. managed identity name "id-ixs-rng-dev-em20-spl-02")
+  user: ""
+
+  # Secret containing the PostgreSQL username
+  userSecret:
+    name: ""
+    key: POSTGRES_USER
+
+  # Azure-specific settings (used when authType is "azure")
+  azure:
+    # Client ID of user-assigned managed identity (optional if set via AZURE_CLIENT_ID or Workload Identity)
+    clientId: ""
+    # OAuth2 resource scope (defaults to https://ossrdbms-aad.database.windows.net/.default)
+    scope: ""
+
+  # Maximum connection lifetime for pooled connections (e.g. "45m", defaults to 45m for Azure auth)
+  maxConnLifetime: ""
+
+  # Database schema migrations configuration
+  migrations:
+    # Whether to run migrations at startup
+    enabled: true
+    # Authentication method for migrations: "password" or "azure" (defaults to postgres.authType)
+    authType: ""
+    # DSN for migrations (defaults to postgres.dsn)
+    dsn: ""
+    # Secret containing DSN for migrations
+    dsnSecret:
+      name: ""
+      key: POSTGRES_MIGRATIONS_DSN
+    # User for migrations (defaults to postgres.user)
+    user: ""
+    # Secret containing username for migrations
+    userSecret:
+      name: ""
+      key: POSTGRES_MIGRATIONS_USER
+
+  # Backwards compatibility: secret for migrations DSN
   migrationsDsnSecret:
     name: ""
     key: POSTGRES_MIGRATIONS_DSN
@@ -120,6 +166,9 @@ persistence:
 
     # Optional reference to a Secret for controller volume expansion
     controllerExpandSecretRef: {}
+
+# Additional environment variables to pass to the container
+extraEnv: []
 
 # Additional volumes to mount on the pod
 extraVolumes: []

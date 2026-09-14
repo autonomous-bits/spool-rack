@@ -41,19 +41,78 @@ spec:
               value: "8080"
             - name: CAS_ROOT
               value: {{ .Values.persistence.mountPath | quote }}
-            {{- with .Values.postgres.dsnSecret.name }}
+            {{- if .Values.postgres.authType }}
+            - name: POSTGRES_AUTH_TYPE
+              value: {{ .Values.postgres.authType | quote }}
+            {{- end }}
+            {{- if .Values.postgres.dsn }}
+            - name: POSTGRES_DSN
+              value: {{ .Values.postgres.dsn | quote }}
+            {{- else if and .Values.postgres.dsnSecret .Values.postgres.dsnSecret.name }}
             - name: POSTGRES_DSN
               valueFrom:
                 secretKeyRef:
-                  name: {{ . }}
-                  key: {{ $.Values.postgres.dsnSecret.key }}
+                  name: {{ .Values.postgres.dsnSecret.name }}
+                  key: {{ .Values.postgres.dsnSecret.key }}
             {{- end }}
-            {{- with .Values.postgres.migrationsDsnSecret.name }}
+            {{- if .Values.postgres.user }}
+            - name: POSTGRES_USER
+              value: {{ .Values.postgres.user | quote }}
+            {{- else if and .Values.postgres.userSecret .Values.postgres.userSecret.name }}
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgres.userSecret.name }}
+                  key: {{ .Values.postgres.userSecret.key }}
+            {{- end }}
+            {{- if and .Values.postgres.azure .Values.postgres.azure.clientId }}
+            - name: POSTGRES_AZURE_CLIENT_ID
+              value: {{ .Values.postgres.azure.clientId | quote }}
+            {{- end }}
+            {{- if and .Values.postgres.azure .Values.postgres.azure.scope }}
+            - name: POSTGRES_AZURE_SCOPE
+              value: {{ .Values.postgres.azure.scope | quote }}
+            {{- end }}
+            {{- if .Values.postgres.maxConnLifetime }}
+            - name: POSTGRES_MAX_CONN_LIFETIME
+              value: {{ .Values.postgres.maxConnLifetime | quote }}
+            {{- end }}
+            {{- if and .Values.postgres.migrations (hasKey .Values.postgres.migrations "enabled") (not .Values.postgres.migrations.enabled) }}
+            - name: POSTGRES_RUN_MIGRATIONS
+              value: "false"
+            {{- end }}
+            {{- if and .Values.postgres.migrations .Values.postgres.migrations.authType }}
+            - name: POSTGRES_MIGRATIONS_AUTH_TYPE
+              value: {{ .Values.postgres.migrations.authType | quote }}
+            {{- end }}
+            {{- if and .Values.postgres.migrations .Values.postgres.migrations.dsn }}
+            - name: POSTGRES_MIGRATIONS_DSN
+              value: {{ .Values.postgres.migrations.dsn | quote }}
+            {{- else if and .Values.postgres.migrations .Values.postgres.migrations.dsnSecret .Values.postgres.migrations.dsnSecret.name }}
             - name: POSTGRES_MIGRATIONS_DSN
               valueFrom:
                 secretKeyRef:
-                  name: {{ . }}
-                  key: {{ $.Values.postgres.migrationsDsnSecret.key }}
+                  name: {{ .Values.postgres.migrations.dsnSecret.name }}
+                  key: {{ .Values.postgres.migrations.dsnSecret.key }}
+            {{- else if and .Values.postgres.migrationsDsnSecret .Values.postgres.migrationsDsnSecret.name }}
+            - name: POSTGRES_MIGRATIONS_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgres.migrationsDsnSecret.name }}
+                  key: {{ .Values.postgres.migrationsDsnSecret.key }}
+            {{- end }}
+            {{- if and .Values.postgres.migrations .Values.postgres.migrations.user }}
+            - name: POSTGRES_MIGRATIONS_USER
+              value: {{ .Values.postgres.migrations.user | quote }}
+            {{- else if and .Values.postgres.migrations .Values.postgres.migrations.userSecret .Values.postgres.migrations.userSecret.name }}
+            - name: POSTGRES_MIGRATIONS_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgres.migrations.userSecret.name }}
+                  key: {{ .Values.postgres.migrations.userSecret.key }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
             {{- end }}
           readinessProbe:
             httpGet:

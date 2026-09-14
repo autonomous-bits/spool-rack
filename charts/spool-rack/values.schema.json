@@ -51,6 +51,67 @@
       }
     },
     "extraVolumes": { "type": "array" },
-    "extraVolumeMounts": { "type": "array" }
+    "extraVolumeMounts": { "type": "array" },
+    "extraEnv": { "type": "array" },
+    "postgres": {
+      "type": "object",
+      "properties": {
+        "authType": { "type": "string" },
+        "dsn": { "type": "string" },
+        "dsnSecret": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "key": { "type": "string" }
+          }
+        },
+        "user": { "type": "string" },
+        "userSecret": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "key": { "type": "string" }
+          }
+        },
+        "azure": {
+          "type": "object",
+          "properties": {
+            "clientId": { "type": "string" },
+            "scope": { "type": "string" }
+          }
+        },
+        "maxConnLifetime": { "type": "string" },
+        "migrations": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "authType": { "type": "string" },
+            "dsn": { "type": "string" },
+            "dsnSecret": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "key": { "type": "string" }
+              }
+            },
+            "user": { "type": "string" },
+            "userSecret": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "key": { "type": "string" }
+              }
+            }
+          }
+        },
+        "migrationsDsnSecret": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "key": { "type": "string" }
+          }
+        }
+      }
+    }
   }
 }

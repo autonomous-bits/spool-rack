@@ -459,12 +459,54 @@ var _ Store = (*PGStore)(nil)
 
 // Open connects to PostgreSQL, verifies the connection is usable, and returns
 // a store backed by a pgx connection pool.
-func Open(ctx context.Context, dsn string) (*PGStore, error) {
+func Open(ctx context.Context, dsn string, opts ...Option) (*PGStore, error) {
 	if ctx == nil {
 		return nil, errNilContext
 	}
 
-	pool, err := pgxpool.New(ctx, dsn)
+	var options openOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	poolConfig, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse dsn: %w", err)
+	}
+
+	if options.user != "" {
+		poolConfig.ConnConfig.User = options.user
+	}
+
+	if options.maxConnLifetime > 0 {
+		poolConfig.MaxConnLifetime = options.maxConnLifetime
+	} else if options.tokenProvider != nil {
+		// Default to 45 minutes when dynamic tokens are used to ensure connections
+		// are recycled well before typical 60-90 minute token expiry.
+		poolConfig.MaxConnLifetime = 45 * time.Minute
+	}
+
+	if options.tokenProvider != nil {
+		token, err := options.tokenProvider.GetToken(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: initial token: %w", err)
+		}
+		poolConfig.ConnConfig.Password = token
+
+		poolConfig.BeforeConnect = func(bctx context.Context, cc *pgx.ConnConfig) error {
+			if options.user != "" {
+				cc.User = options.user
+			}
+			t, err := options.tokenProvider.GetToken(bctx)
+			if err != nil {
+				return fmt.Errorf("postgres: acquire connection token: %w", err)
+			}
+			cc.Password = t
+			return nil
+		}
+	}
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: connect: %w", err)
 	}
