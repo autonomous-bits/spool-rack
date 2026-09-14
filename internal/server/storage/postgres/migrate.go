@@ -208,7 +208,7 @@ type MigrationResult struct {
 // skipped, and a previously-applied file whose checksum has since changed is
 // reported as an error rather than silently reapplied or ignored, since that
 // would make forward migration non-deterministic.
-func Migrate(ctx context.Context, dsn string) (*MigrationResult, error) {
+func Migrate(ctx context.Context, dsn string, opts ...MigrateOption) (*MigrationResult, error) {
 	if ctx == nil {
 		return nil, errNilContext
 	}
@@ -216,7 +216,56 @@ func Migrate(ctx context.Context, dsn string) (*MigrationResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	return migrateWithMigrations(ctx, dsn, migrations)
+	return migrateWithMigrations(ctx, dsn, migrations, opts...)
+}
+
+// Connect establishes a single PostgreSQL connection using pgx, applying
+// any MigrateOption such as dynamic TokenProvider or user overrides.
+func Connect(ctx context.Context, dsn string, opts ...MigrateOption) (*pgx.Conn, error) {
+	if ctx == nil {
+		return nil, errNilContext
+	}
+
+	var options migrateOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	connConfig, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse dsn: %w", err)
+	}
+
+	if options.user != "" {
+		connConfig.User = options.user
+	}
+
+	if options.tokenProvider != nil {
+		token, err := options.tokenProvider.GetToken(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: acquire token: %w", err)
+		}
+		connConfig.Password = token
+	}
+
+	conn, err := pgx.ConnectConfig(ctx, connConfig)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: connect: %w", err)
+	}
+	return conn, nil
+}
+
+type prefixedError struct {
+	prefix string
+	err    error
+}
+
+func (e *prefixedError) Error() string {
+	return e.prefix + strings.TrimPrefix(e.err.Error(), "postgres: ")
+}
+
+func (e *prefixedError) Unwrap() error {
+	return e.err
 }
 
 // migrateWithMigrations is the connection/apply core behind Migrate, split
@@ -224,10 +273,10 @@ func Migrate(ctx context.Context, dsn string) (*MigrationResult, error) {
 // loadMigrationsFromFS against an fstest.MapFS) to exercise the destructive
 // lint, retirement gate, and checksum-drift detection against a real
 // database without needing to change the embedded migrations directory.
-func migrateWithMigrations(ctx context.Context, dsn string, migrations []migration) (*MigrationResult, error) {
-	conn, err := pgx.Connect(ctx, dsn)
+func migrateWithMigrations(ctx context.Context, dsn string, migrations []migration, opts ...MigrateOption) (*MigrationResult, error) {
+	conn, err := Connect(ctx, dsn, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("postgres: migrate: connect: %w", err)
+		return nil, &prefixedError{prefix: "postgres: migrate: ", err: err}
 	}
 	defer func() { _ = conn.Close(ctx) }()
 
@@ -330,16 +379,17 @@ func isRetirementConfirmed(ctx context.Context, conn *pgx.Conn, name string) (bo
 // confirmed retired, unblocking that migration's next Migrate call. name must
 // match the value declared by the migration's
 // "-- destructive: requires-retirement=<name>" directive.
-func ConfirmRetirement(ctx context.Context, dsn, name, note string) error {
+func ConfirmRetirement(ctx context.Context, dsn, name, note string, opts ...MigrateOption) error {
 	if ctx == nil {
 		return errNilContext
 	}
 	if name == "" {
 		return fmt.Errorf("postgres: confirm retirement: name is required")
 	}
-	conn, err := pgx.Connect(ctx, dsn)
+
+	conn, err := Connect(ctx, dsn, opts...)
 	if err != nil {
-		return fmt.Errorf("postgres: confirm retirement: connect: %w", err)
+		return &prefixedError{prefix: "postgres: confirm retirement: ", err: err}
 	}
 	defer func() { _ = conn.Close(ctx) }()
 

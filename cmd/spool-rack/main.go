@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/autonomous-bits/spool-rack/internal/server/auth"
@@ -17,7 +18,10 @@ import (
 
 const (
 	defaultPort = "8080"
-	version     = "0.1.0-mvp"
+)
+
+var (
+	version = "0.3.0"
 )
 
 func main() {
@@ -40,49 +44,179 @@ func main() {
 	}
 
 	postgresDSN := os.Getenv("POSTGRES_DSN")
-	if postgresDSN != "" {
-		// POSTGRES_MIGRATIONS_DSN lets operators point schema migrations at a
-		// privileged role while POSTGRES_DSN keeps the server itself on the
-		// restricted "spool_app" role (see migrations/0001_baseline.sql).
-		// Falling back to POSTGRES_DSN keeps single-DSN local/dev setups
-		// working unchanged.
-		migrationsDSN := os.Getenv("POSTGRES_MIGRATIONS_DSN")
+	migrationsDSN := os.Getenv("POSTGRES_MIGRATIONS_DSN")
+	if postgresDSN != "" || migrationsDSN != "" {
 		if migrationsDSN == "" {
 			migrationsDSN = postgresDSN
 		}
-		migrateCtx, migrateCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		result, err := postgres.Migrate(migrateCtx, migrationsDSN)
-		migrateCancel()
-		if err != nil {
-			log.Fatalf("Failed to apply Postgres migrations: %v", err)
-		}
-		if len(result.Applied) > 0 {
-			log.Printf("Applied %d Postgres migration(s): %v", len(result.Applied), result.Applied)
+
+		authType := os.Getenv("POSTGRES_AUTH_TYPE")
+		if authType == "" && (os.Getenv("POSTGRES_AZURE_AUTH") == "true" || os.Getenv("POSTGRES_AZURE_AUTH") == "1") {
+			authType = "azure"
 		}
 
-		openCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		store, err := postgres.Open(openCtx, postgresDSN)
-		cancel()
-		if err != nil {
-			log.Fatalf("Failed to open Postgres store: %v", err)
+		migrationsAuthType := os.Getenv("POSTGRES_MIGRATIONS_AUTH_TYPE")
+		if migrationsAuthType == "" {
+			if migrationsDSN != postgresDSN && hasPasswordInDSN(migrationsDSN) {
+				migrationsAuthType = "password"
+			} else {
+				migrationsAuthType = authType
+			}
 		}
-		// This simple main still uses blocking ListenAndServe without graceful
-		// shutdown; defer is sufficient for fatal/panic exit paths.
-		defer store.Close()
-		opts = append(opts, gateway.WithBranchStore(store), gateway.WithTenantWorkspaceStore(store))
+
+		var azureTokenProvider *postgres.AzureTokenProvider
+		if isAzureAuth(authType) || isAzureAuth(migrationsAuthType) {
+			azureClientID := os.Getenv("POSTGRES_AZURE_CLIENT_ID")
+			if azureClientID == "" {
+				azureClientID = os.Getenv("AZURE_CLIENT_ID")
+			}
+			azureScope := os.Getenv("POSTGRES_AZURE_SCOPE")
+			if azureScope == "" {
+				azureScope = postgres.DefaultAzurePostgresScope
+			}
+			tp, err := postgres.NewAzureTokenProvider(postgres.AzureTokenProviderOptions{
+				ClientID: azureClientID,
+				Scope:    azureScope,
+			})
+			if err != nil {
+				log.Fatalf("Failed to initialize Azure token provider: %v", err)
+			}
+			azureTokenProvider = tp
+		}
+
+		dbUser := os.Getenv("POSTGRES_USER")
+		if dbUser == "" {
+			dbUser = os.Getenv("POSTGRES_AZURE_USER")
+		}
+
+		var migrateOpts []postgres.MigrateOption
+		if isAzureAuth(migrationsAuthType) {
+			migrateOpts = append(migrateOpts, postgres.WithMigrateTokenProvider(azureTokenProvider))
+		}
+		migrationsUser := resolveMigrationUser(os.Getenv("POSTGRES_MIGRATIONS_USER"), dbUser, migrationsDSN, postgresDSN)
+		if migrationsUser != "" {
+			migrateOpts = append(migrateOpts, postgres.WithMigrateUser(migrationsUser))
+		}
+
+		runMigrations := true
+		if val := os.Getenv("POSTGRES_RUN_MIGRATIONS"); val == "false" || val == "0" || val == "no" {
+			runMigrations = false
+		}
+		if val := os.Getenv("POSTGRES_MIGRATIONS_ENABLED"); val == "false" || val == "0" || val == "no" {
+			runMigrations = false
+		}
+
+		if runMigrations && migrationsDSN != "" {
+			migrateCtx, migrateCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			result, err := postgres.Migrate(migrateCtx, migrationsDSN, migrateOpts...)
+			migrateCancel()
+			if err != nil {
+				log.Fatalf("Failed to apply Postgres migrations: %v", err)
+			}
+			if len(result.Applied) > 0 {
+				log.Printf("Applied %d Postgres migration(s): %v", len(result.Applied), result.Applied)
+			}
+		} else if !runMigrations {
+			log.Printf("Postgres startup migrations skipped (POSTGRES_RUN_MIGRATIONS=false)")
+		}
+
+		if os.Getenv("POSTGRES_MIGRATE_ONLY") == "true" || os.Getenv("POSTGRES_MIGRATE_ONLY") == "1" {
+			devTenantID := os.Getenv("DEV_TENANT_ID")
+			devRepoID := os.Getenv("DEV_REPO_ID")
+			if devTenantID != "" && devRepoID != "" && migrationsDSN != "" {
+				seedCtx, seedCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				if err := seedDevTenant(seedCtx, migrationsDSN, devTenantID, devRepoID, migrateOpts...); err != nil {
+					log.Printf("Warning: failed to seed dev tenant/repo: %v", err)
+				}
+				seedCancel()
+			}
+			log.Printf("POSTGRES_MIGRATE_ONLY completed successfully; exiting.")
+			return
+		}
+
+		if postgresDSN != "" {
+			var openOpts []postgres.Option
+			if isAzureAuth(authType) {
+				openOpts = append(openOpts, postgres.WithTokenProvider(azureTokenProvider))
+			}
+			if dbUser != "" {
+				openOpts = append(openOpts, postgres.WithUser(dbUser))
+			}
+			if lifetimeStr := os.Getenv("POSTGRES_MAX_CONN_LIFETIME"); lifetimeStr != "" {
+				d, err := time.ParseDuration(lifetimeStr)
+				if err != nil {
+					log.Fatalf("Invalid POSTGRES_MAX_CONN_LIFETIME %q: %v", lifetimeStr, err)
+				}
+				openOpts = append(openOpts, postgres.WithMaxConnLifetime(d))
+			}
+
+			openCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			store, err := postgres.Open(openCtx, postgresDSN, openOpts...)
+			cancel()
+			if err != nil {
+				log.Fatalf("Failed to open Postgres store: %v", err)
+			}
+			// This simple main still uses blocking ListenAndServe without graceful
+			// shutdown; defer is sufficient for fatal/panic exit paths.
+			defer store.Close()
+			opts = append(opts, gateway.WithBranchStore(store), gateway.WithTenantWorkspaceStore(store))
+		}
 	}
 
 	devTenantID := os.Getenv("DEV_TENANT_ID")
 	if devTenantID != "" {
 		opts = append(opts, gateway.WithVerifier(devTenantVerifier{tenantID: devTenantID}))
 		devRepoID := os.Getenv("DEV_REPO_ID")
-		if devRepoID != "" && postgresDSN != "" {
+		migrationsDSN := os.Getenv("POSTGRES_MIGRATIONS_DSN")
+		if migrationsDSN == "" {
+			migrationsDSN = postgresDSN
+		}
+		if devRepoID != "" && migrationsDSN != "" {
 			seedCtx, seedCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			migrationsDSN := os.Getenv("POSTGRES_MIGRATIONS_DSN")
-			if migrationsDSN == "" {
-				migrationsDSN = postgresDSN
+
+			authType := os.Getenv("POSTGRES_AUTH_TYPE")
+			if authType == "" && (os.Getenv("POSTGRES_AZURE_AUTH") == "true" || os.Getenv("POSTGRES_AZURE_AUTH") == "1") {
+				authType = "azure"
 			}
-			if err := seedDevTenant(seedCtx, migrationsDSN, devTenantID, devRepoID); err != nil {
+			migrationsAuthType := os.Getenv("POSTGRES_MIGRATIONS_AUTH_TYPE")
+			if migrationsAuthType == "" {
+				if migrationsDSN != postgresDSN && hasPasswordInDSN(migrationsDSN) {
+					migrationsAuthType = "password"
+				} else {
+					migrationsAuthType = authType
+				}
+			}
+
+			var seedOpts []postgres.MigrateOption
+			if isAzureAuth(migrationsAuthType) {
+				azureClientID := os.Getenv("POSTGRES_AZURE_CLIENT_ID")
+				if azureClientID == "" {
+					azureClientID = os.Getenv("AZURE_CLIENT_ID")
+				}
+				azureScope := os.Getenv("POSTGRES_AZURE_SCOPE")
+				if azureScope == "" {
+					azureScope = postgres.DefaultAzurePostgresScope
+				}
+				tp, err := postgres.NewAzureTokenProvider(postgres.AzureTokenProviderOptions{
+					ClientID: azureClientID,
+					Scope:    azureScope,
+				})
+				if err != nil {
+					log.Printf("Warning: failed to initialize Azure token provider for seeding: %v", err)
+				} else {
+					seedOpts = append(seedOpts, postgres.WithMigrateTokenProvider(tp))
+				}
+			}
+			appUser := os.Getenv("POSTGRES_USER")
+			if appUser == "" {
+				appUser = os.Getenv("POSTGRES_AZURE_USER")
+			}
+			seedUser := resolveMigrationUser(os.Getenv("POSTGRES_MIGRATIONS_USER"), appUser, migrationsDSN, postgresDSN)
+			if seedUser != "" {
+				seedOpts = append(seedOpts, postgres.WithMigrateUser(seedUser))
+			}
+
+			if err := seedDevTenant(seedCtx, migrationsDSN, devTenantID, devRepoID, seedOpts...); err != nil {
 				log.Printf("Warning: failed to seed dev tenant/repo: %v", err)
 			}
 			seedCancel()
@@ -103,6 +237,33 @@ func main() {
 	}
 }
 
+func resolveMigrationUser(migrationsUser, appUser, migrationsDSN, postgresDSN string) string {
+	if migrationsUser != "" {
+		return migrationsUser
+	}
+	if migrationsDSN == postgresDSN {
+		return appUser
+	}
+	return ""
+}
+
+func isAzureAuth(authType string) bool {
+	switch strings.ToLower(strings.TrimSpace(authType)) {
+	case "azure", "azure-identity", "azure-ad", "azure_ad", "entra", "workload-identity":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasPasswordInDSN(dsn string) bool {
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return false
+	}
+	return cfg.Password != ""
+}
+
 type devTenantVerifier struct {
 	tenantID string
 }
@@ -118,8 +279,8 @@ func (v devTenantVerifier) VerifyToken(_ context.Context, rawToken string) (*aut
 	}, nil
 }
 
-func seedDevTenant(ctx context.Context, dsn, tenantID, repoID string) error {
-	conn, err := pgx.Connect(ctx, dsn)
+func seedDevTenant(ctx context.Context, dsn, tenantID, repoID string, opts ...postgres.MigrateOption) error {
+	conn, err := postgres.Connect(ctx, dsn, opts...)
 	if err != nil {
 		return err
 	}
